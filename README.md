@@ -1,42 +1,201 @@
 # local-devops-agent
 
-A local AI agent that runs a full, read-only health check on a Kubernetes cluster and
-writes a report: what's wrong, the likely root cause, and suggested fixes.
-Everything runs on your machine. The LLM is served by [Ollama](https://ollama.com),
-so no cloud LLM APIs are used.
+A local AI agent that runs a full, read-only health check on a Kubernetes cluster. On
+each run it scans the cluster, decides what to dig into, investigates each problem with
+read-only tools, and writes a report: what's wrong, the likely root cause, and a suggested
+fix.
 
-> **Status: milestone 3 of 4.** The scan, rule-based detection, LLM triage, tool-based
-> investigation, report and a one-command demo cluster all work. The final README comes
-> next (see [Roadmap](#roadmap)).
+Everything runs on your machine. The LLM is served by [Ollama](https://ollama.com), so no
+cloud LLM APIs are used, and no cluster data leaves your machine.
+
+```text
+$ pnpm demo:check --verbose
+[11:09:46] scan: 2 nodes, 18 pods, 7 deployments, 28 warning events, 11 issues
+[11:11:22] triage: 4 problem(s) to investigate
+[11:11:46] investigate [3/4] Pod agent-test/web-7db8d69f68-7x2kz: crashloop
+[11:11:47]     → k8s_get_logs {"namespace":"agent-test","pod":"web-7db8d69f68-7x2kz","previous":true,"tailLines":50}
+[11:11:49]     → k8s_get_deployment {"name":"web","namespace":"agent-test"}
+[11:11:57]   done: 2 tool call(s), confidence high
+...
+### 3. [CRITICAL] Pods in the agent-test/web deployment are crashing due to the missing DATABASE_URL environment variable.
+**Root cause:** DATABASE_URL is not set, cannot connect to database
+```
 
 ## Features
 
 - **One command, no questions:** `pnpm check` scans the cluster and prints a report.
-- **Read-only by construction:** write, delete and exec operations are blocked in code,
-  not just by prompt instructions (see [Safety](#safety)).
-- **Detects common failures:** CrashLoopBackOff, image pull errors, OOMKilled containers,
-  unschedulable or stuck Pending pods, high restart counts, pods that never become ready,
-  NotReady or pressured nodes, unavailable deployments and stuck rollouts.
+- **Finds common failures with rules:** CrashLoopBackOff, image pull errors, OOMKilled
+  containers, unschedulable or stuck Pending pods, high restart counts, pods that never
+  become ready, NotReady or pressured nodes, unavailable deployments and stuck rollouts.
 - **Investigates like an SRE:** a local LLM groups related issues, then uses read-only
   tools (describe, logs, events, deployments) to find the root cause and suggest a fix.
-- **Works without the LLM:** if Ollama is down (or with `--no-llm`), you still get the
+- **Read-only by construction:** write, delete and exec operations are blocked in code,
+  not just by prompt instructions (see [Safety](#safety)).
+- **Works without the LLM:** if Ollama is down, or with `--no-llm`, you still get the
   rule-based report.
-- **CI/cron friendly:** exits non-zero when critical issues are found.
-- **Fully local:** Kubernetes access comes from your kubeconfig, and the LLM is served by Ollama.
+- **Cron/CI friendly:** exits with code `2` when critical issues are found.
+- **One-command demo:** a kind cluster with deliberately broken workloads to try it on.
 
-## Prerequisites
+## Quickstart (about 5 minutes)
+
+This runs the agent against a throwaway demo cluster, so you can see it work before
+pointing it at a real cluster. You need Node.js 20+, Docker and Ollama (see
+[Setup](#setup) for installing them).
+
+```bash
+pnpm install
+```
+
+```bash
+ollama pull qwen2.5:7b-instruct
+```
+
+```bash
+pnpm demo:up
+```
+
+```bash
+pnpm demo:check --verbose
+```
+
+`demo:up` creates a two-node [kind](https://kind.sigs.k8s.io/) cluster, deploys four
+broken workloads and one healthy one, and waits until each has actually failed. The first
+run downloads kind and its node image, so it takes a few minutes. `demo:check` runs the
+agent and prints the report. Delete the cluster with `pnpm demo:down`.
+
+## Architecture
+
+### Overview
+
+```mermaid
+flowchart LR
+    cli["pnpm check<br/>(cli.ts)"] --> lg["LangGraph agent<br/>(graph.ts)"]
+    lg --> guard["Read-only client<br/>(k8s/client.ts)<br/>list* / read* only"]
+    guard -->|"HTTPS, your kubeconfig"| k8s[("Kubernetes API")]
+    lg -->|"localhost:11434"| ollama["Ollama<br/>qwen2.5:7b-instruct"]
+    lg --> report["Markdown report<br/>stdout / --output"]
+    lg --> exitcode["Exit code<br/>0 / 1 / 2"]
+```
+
+The agent talks to two things: the Kubernetes API, only through a client that cannot
+write, and a local Ollama server. Nothing else leaves the machine.
+
+### Agent flow
+
+```mermaid
+flowchart TD
+    start((START)) --> scan["scan<br/><i>code</i>"]
+    start --> checkLlm["checkLlm<br/><i>code</i>"]
+    scan --> triage["triage<br/><i>LLM</i>"]
+    checkLlm --> triage
+    triage -->|"problems found"| investigate
+    triage -->|"LLM off or no issues"| report["report<br/><i>code</i>"]
+    investigate --> report
+    report --> done((END))
+
+    subgraph investigate["investigate: for each problem (LLM + tools)"]
+        direction TB
+        agent["agent<br/>chooses tool calls"] -->|"tool calls, budget left"| tools["tools<br/>run read-only tools"]
+        tools -->|"budget left"| agent
+        agent -->|"no more tool calls"| conclude["conclude<br/>root cause, evidence,<br/>fix, confidence"]
+        tools -->|"budget used up"| conclude
+    end
+```
+
+| Step | Uses the LLM | What it does |
+| --- | --- | --- |
+| **scan** | no | Lists nodes, namespaces, pods, deployments and recent warning events in parallel, summarizes them, and runs the rules. A failed call is recorded and the scan continues. |
+| **checkLlm** | no | Checks that Ollama is reachable and the model is pulled. Runs in parallel with the scan. |
+| **triage** | yes | Picks up to `MAX_PROBLEMS` problems and merges issues with one root cause (for example, a Deployment and its crashing pods). |
+| **investigate** | yes | For each problem, a tool-calling loop of at most `MAX_STEPS_PER_PROBLEM` calls, then a structured conclusion. |
+| **report** | no | Investigated problems first, then the remaining rule-based issues, recent warning events and notes. |
+
+The **scan is plain code**, so it finds the same issues every time. **Severity and the
+exit code come only from the rules**, so the LLM can explain a problem but can never hide
+one. If the LLM is unavailable, the graph skips straight to the report.
+
+### Tools
+
+The agent can call six tools. All are read-only and built on the guarded client:
+
+| Tool | Returns |
+| --- | --- |
+| `k8s_list_nodes` | Ready status, pressure conditions, allocatable CPU and memory |
+| `k8s_list_pods` | Phase, ready containers, restarts and waiting reason (optional namespace and problems-only filter) |
+| `k8s_describe_pod` | Conditions, container states and last termination, image, resources, env var **names**, probes, recent events |
+| `k8s_get_logs` | The last N lines of a container's logs. After a restart, it adds the previous (crashed) run, and falls back to the current run when the previous run's logs are gone |
+| `k8s_list_events` | Warning events, filtered by namespace, object name and kind |
+| `k8s_get_deployment` | Desired vs ready replicas, rollout conditions, images, and the status of its pods |
+
+### Design choices for a small local model
+
+A 7B model is capable but easily derailed. Testing against real broken workloads turned up
+several failure modes, and each fix moved responsibility from the prompt into code:
+
+- **IDs are constrained, not trusted.** Triage output uses a JSON-schema `enum` of the
+  real issue IDs, and Ollama constrains generation to that schema, so the model can't
+  invent or misspell an ID. Code also merges pods of the same Deployment and picks the
+  pod as the starting point, because the model did not do this reliably.
+- **Code does the arithmetic.** For an unschedulable pod, the rule compares its requests
+  with the largest node ("requests cpu=1000, largest node allocatable cpu=12") and passes
+  that, plus the rule's hint, to the model. Before this, the model read the same numbers
+  and suggested *raising* the CPU request.
+- **Exact arguments in the prompt.** The prompt gives `namespace="agent-test"
+  name="web-7db8d69f68-4f2n7"` rather than `agent-test/web-...`. The model used to put
+  the whole string into the name field.
+- **Tolerant inputs, strict names.** `null` for an optional argument is treated as
+  missing (small models send this often). A name like `agent-test/web` is rejected with a
+  message explaining the mistake, and a wrong namespace returns the list of real ones.
+- **Mistakes go back to the model as messages.** Invalid arguments, unknown tools,
+  repeated calls and API errors become tool messages the model can react to. They never
+  crash the run.
+- **Bounded output and context.** Tool output is truncated, keeping the head and the
+  tail, since errors are usually at the end. Env var values are never shown, and the
+  context window (`NUM_CTX`) is set explicitly.
+- **Graceful degradation.** Each LLM call is retried once, because local GPUs
+  occasionally fail a single request. If Ollama is down, triage fails or one
+  investigation fails, the report falls back to the rule-based findings for that part.
+
+### Project layout
+
+```text
+src/
+  cli.ts                CLI entry point: flags, output file, exit codes
+  config.ts             .env loading and validation (zod)
+  graph.ts              Main LangGraph: scan, checkLlm, triage, investigate, report
+  agent/triage.ts       LLM problem selection, plus a deterministic fallback
+  agent/investigate.ts  Tool-calling loop (subgraph) and structured conclusion
+  k8s/client.ts         Read-only Kubernetes client
+  llm/model.ts          LlmClient interface and Ollama implementation
+  llm/ollama.ts         Ollama connection check
+  tools/k8s-tools.ts    The six read-only tools
+  tools/truncate.ts     Output truncation
+  scan/                 Cluster overview, summaries, quantities and rules
+  report/markdown.ts    Markdown report renderer
+test/                   Unit tests (fake cluster and scripted fake LLM; no Ollama needed)
+test/e2e/               End-to-end tests against the demo cluster
+demo/workloads.yaml     Four deliberately broken deployments and one healthy one
+demo/kind-cluster.yaml  kind cluster definition (1 control plane + 1 worker)
+scripts/demo.sh         Demo cluster lifecycle: up, check, status, reset, down
+docs/                   Example report
+```
+
+## Setup
+
+### Prerequisites
 
 | Tool | Version | Notes |
 | --- | --- | --- |
 | Node.js | 20+ | Tested with 22 LTS |
-| pnpm | 10+ | `corepack enable` |
-| kubectl access | any | A working kubeconfig (minikube, kind, or a real cluster) |
-| Ollama | latest | Needed for LLM steps; the scan works without it |
-| Docker | any | Only for the [demo cluster](#demo-cluster-kind); kind itself is downloaded automatically |
+| pnpm | 10+ | Run `corepack enable` (corepack ships with Node) |
+| Ollama | latest | Needed for the LLM steps; the scan works without it |
+| Cluster access | any | A working kubeconfig (minikube, kind, or a real cluster) |
+| Docker | any | Only for the demo cluster; kind itself is downloaded automatically |
 
-### Installing Ollama (Linux / WSL)
+### 1. Install Ollama and the model
 
-The Ollama install script needs `zstd`, which a fresh Ubuntu does not include:
+On Linux and WSL, the Ollama install script needs `zstd`, which a fresh Ubuntu does not
+include:
 
 ```bash
 sudo apt-get install zstd
@@ -50,10 +209,11 @@ curl -fsSL https://ollama.com/install.sh | sh
 ollama pull qwen2.5:7b-instruct
 ```
 
-The 7B model is about 4.7 GB and runs well on a GPU with 8 GB or more of VRAM. It also
-runs on CPU, more slowly.
+On macOS and Windows, use the installer from [ollama.com](https://ollama.com). The 7B
+model is about 4.7 GB and runs well on a GPU with 8 GB or more of VRAM. It also runs on
+CPU, more slowly.
 
-## Setup
+### 2. Install the project
 
 ```bash
 pnpm install
@@ -63,17 +223,20 @@ pnpm install
 cp .env.example .env
 ```
 
-Then edit `.env` if the defaults don't fit:
+### 3. Configure (optional)
+
+The defaults work for a local Ollama and your current kubectl context. Edit `.env` to
+change them:
 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama server URL |
 | `MODEL` | `qwen2.5:7b-instruct` | Model used for triage and investigation |
 | `KUBECONFIG` | _(empty)_ | Kubeconfig path; empty uses `$KUBECONFIG` or `~/.kube/config` |
-| `MAX_STEPS_PER_PROBLEM` | `6` | Max tool calls per investigated problem |
 | `MAX_PROBLEMS` | `5` | Max problems the LLM investigates per run |
+| `MAX_STEPS_PER_PROBLEM` | `6` | Max tool calls per investigated problem |
 | `NUM_CTX` | `16384` | Ollama context window in tokens (see below) |
-| `TOOL_OUTPUT_MAX_CHARS` | `4000` | Tool outputs are truncated to this before reaching the LLM |
+| `TOOL_OUTPUT_MAX_CHARS` | `4000` | Tool output is truncated to this before reaching the LLM |
 | `RESTART_THRESHOLD` | `5` | Containers restarting at least this often are flagged |
 | `EVENT_WINDOW_MINUTES` | `60` | Only warning events newer than this are included |
 
@@ -84,6 +247,8 @@ Invalid values stop the run at startup with an error that names the variable.
 error. 16384 tokens fits a 7B model in about 6 GB of VRAM.
 
 ## Usage
+
+Check the cluster in your current kubectl context:
 
 ```bash
 pnpm check
@@ -97,124 +262,135 @@ pnpm check
 | `--no-llm` | Skip LLM triage and investigation (fast, rule-based report only) |
 | `-h, --help` | Show help |
 
-Examples:
-
-```bash
-pnpm check --namespace shop --verbose
-```
-
-```bash
-pnpm check --output reports/latest.md
-```
-
 The report goes to **stdout** and logs go to **stderr**, so `pnpm -s check > report.md`
 captures only the report.
 
-### Exit codes
-
-| Code | Meaning |
+| Exit code | Meaning |
 | --- | --- |
 | `0` | Healthy, or warnings only |
 | `2` | Critical issues found |
 | `1` | The check itself failed (bad config, cluster unreachable, unknown namespace) |
 
-## Architecture
+### Running on a schedule
 
-```
- pnpm check (cli.ts)
-      │
-      ▼
- ┌──────────────────────────── LangGraph (graph.ts) ─────────────────────────────┐
- │                                                                               │
- │  START ─┬─► scan ──────┬─► triage ──┬─► investigate ──► report ──► END        │
- │         └─► checkLlm ──┘            │   (per problem)     ▲                   │
- │                                     └── LLM off / no issues ┘                  │
- └───────────────────────────────────────────────────────────────────────────────┘
+The exit codes make the agent easy to run from cron or CI. For example, a crontab entry
+that checks the cluster every hour and keeps a timestamped report:
 
- investigate, for each problem (agent/investigate.ts):
-
-   START ─► agent ──(tool calls, budget left)──► tools ──(budget left)──► agent
-              │                                    │
-              └──(no tool calls)──► conclude ◄─────┴──(budget used up)
-                                       │
-                                      END   (root cause, evidence, fix, confidence)
+```cron
+0 * * * * cd /path/to/local-devops-agent && mkdir -p reports && pnpm -s check --output "reports/$(date +\%F-\%H).md" > /dev/null 2>> reports/cron.log || logger "cluster check failed or found critical issues"
 ```
 
-| Step | LLM? | What it does |
-| --- | --- | --- |
-| **scan** | no | Lists nodes, namespaces, pods, deployments and recent warning events in parallel, summarizes them, and runs the rules. A failed call is recorded and the scan continues. |
-| **checkLlm** | no | Checks that Ollama is reachable and the model is pulled (`GET /api/tags`). |
-| **triage** | yes | Picks up to `MAX_PROBLEMS` problems and merges issues with one root cause (a Deployment and its crashing pods). |
-| **investigate** | yes | For each problem, a tool-calling loop of at most `MAX_STEPS_PER_PROBLEM` calls, then a structured conclusion. |
-| **report** | no | Investigated problems first, then the remaining rule-based issues, events and notes. |
+Cron runs with a minimal `PATH`, so `pnpm` may not be found if Node was installed with
+nvm. Add a `PATH=...` line at the top of the crontab that includes the directory from
+`dirname "$(which pnpm)"`.
 
-### Design choices for a small local model
+In CI, run `pnpm -s check --no-llm` to fail a job on critical issues without needing a
+GPU. The rule-based report needs only cluster access.
 
-A 7B model is capable but easily derailed, so the code does what the prompt can't
-guarantee:
+## Example report
 
-- **The rules find the issues and the LLM explains them.** Detection is deterministic,
-  and severity and the exit code come only from the rules. The LLM can't hide a
-  critical issue.
-- **IDs are constrained, not trusted.** Triage output uses a JSON-schema `enum` of the
-  real issue IDs, and Ollama constrains generation to that schema, so the model can't
-  invent or misspell an ID. Pods of the same Deployment are merged in code even if the
-  model forgets to merge them.
-- **Tools do the obvious thing for the model.** `k8s_get_logs` automatically includes
-  the previous (crashed) run's logs for a restarted container. In testing, the model
-  asked for the current run's logs, which are often empty.
-- **Code does the arithmetic.** For an unschedulable pod, the rule compares its requests
-  with the largest node ("requests cpu=64, largest node allocatable cpu=12") and passes
-  that, plus the rule's hint, to the model. Before this, the model read the same
-  numbers and suggested *raising* the CPU request.
-- **Tolerant inputs, strict names.** `null` for an optional argument is treated as
-  missing (small models do this often). A name like `agent-test/web` is rejected with a
-  message explaining the mistake, and a wrong namespace returns the list of real ones.
-- **Mistakes go back to the model as messages.** Invalid arguments, unknown tools,
-  repeated calls and API errors become tool messages the model can react to. They never
-  crash the run.
-- **Bounded output and context.** Tool output is truncated (keeping the head and the
-  tail, since errors are usually at the end), env var values are never shown, and
-  `NUM_CTX` is set explicitly.
-- **Graceful degradation.** Each LLM call is retried once (local GPUs occasionally fail
-  a single request). If Ollama is down, the model isn't pulled, triage fails or
-  one investigation fails, you still get the rule-based report for that part.
+The full report from a run against the demo cluster is in
+[`docs/example-report.md`](docs/example-report.md). It was produced by
+`qwen2.5:7b-instruct` on an RTX 3060, took 189 seconds (97 of them loading the model
+cold), and exited with code `2`. An excerpt:
 
-### Tools
+```markdown
+# Kubernetes Health Report
 
-All six are read-only and built on the guarded client:
+**Status: CRITICAL**
+Context: `kind-devops-agent-demo`
+Scope: all namespaces
 
-| Tool | Returns |
+## Summary
+
+| Check | Result |
 | --- | --- |
-| `k8s_list_nodes` | Ready status, pressure conditions, allocatable CPU/memory |
-| `k8s_list_pods` | Phase, ready containers, restarts, waiting reason (optional namespace, problems-only filter) |
-| `k8s_describe_pod` | Conditions, container states and last termination, image, resources, env var **names**, probes, recent events |
-| `k8s_get_logs` | Last N lines of a container's logs; includes the previous run automatically after a restart |
-| `k8s_list_events` | Warning events, filtered by namespace, object name and kind |
-| `k8s_get_deployment` | Desired vs ready replicas, rollout conditions, images, and the status of its pods |
+| Nodes ready | 2/2 |
+| Pods running | 16/18 |
+| Deployments fully ready | 3/7 |
+| Warning events (recent) | 28 |
+| Issues | 11 critical, 0 warning, 0 info |
+| Investigated by LLM | 4 problem(s) |
 
-### Project layout
+## Investigated problems
 
+### 3. [CRITICAL] Pods in the agent-test/web deployment are crashing due to the missing DATABASE_URL environment variable.
+
+**Affected:** Pod agent-test/web-7db8d69f68-7x2kz, Pod agent-test/web-7db8d69f68-xmr99, Deployment agent-test/web
+
+**Root cause:** DATABASE_URL is not set, cannot connect to database
+
+**Evidence:**
+
+- Both pods web-7db8d69f68-7x2kz and web-7db8d69f68-xmr99 are in CrashLoopBackOff state.
+- Logs show 'FATAL: DATABASE_URL is not set, cannot connect to database'.
+- Deployment agent-test/web has 0/2 replicas ready.
+
+**Suggested fix** (not applied):
+
+1. Set the DATABASE_URL environment variable for the deployment using `kubectl set env deployment/agent-test/web DATABASE_URL=<your-database-url>`.
+2. Apply the updated deployment configuration using `kubectl apply -f <your-deployment-file.yaml>`.
+
+_Confidence: high · 2 tool call(s)_
+
+### 4. [CRITICAL] Pod `cache-5cc48794d-2lc5m` is OOMKilled due to excessive memory usage.
+
+**Affected:** Pod agent-test/cache-5cc48794d-2lc5m, Deployment agent-test/cache
+
+**Root cause:** The container `cache` is consuming more memory than its limit, leading to an OOMKilled error.
+
+**Evidence:**
+
+- Container `cache` was OOMKilled with exit code 137.
+- Container `cache` has a memory limit of 32Mi, but it is being OOMKilled.
+
+**Suggested fix** (not applied):
+
+1. Increase the memory limit for the container `cache` in the deployment's pod template.
+2. Apply the updated deployment configuration.
+
+_Confidence: high · 3 tool call(s)_
 ```
-src/
-  cli.ts                CLI entry point: flags, output file, exit codes
-  config.ts             .env loading and validation (zod)
-  graph.ts              Main LangGraph: scan, checkLlm, triage, investigate, report
-  agent/triage.ts       LLM problem selection, plus a deterministic fallback
-  agent/investigate.ts  Tool-calling loop (subgraph) and structured conclusion
-  k8s/client.ts         Read-only Kubernetes client
-  llm/model.ts          LlmClient interface and Ollama implementation
-  llm/ollama.ts         Ollama connection check
-  tools/k8s-tools.ts    The six read-only tools
-  tools/truncate.ts     Output truncation
-  scan/                 Overview collection, summaries, rules
-  report/markdown.ts    Markdown report renderer
-test/                   vitest unit tests (fake cluster and scripted fake LLM; no Ollama needed)
-test/e2e/               End-to-end tests against the demo cluster (`pnpm test:e2e`)
-demo/workloads.yaml     Four deliberately broken deployments and one healthy one
-demo/kind-cluster.yaml  kind cluster definition (1 control plane + 1 worker)
-scripts/demo.sh         Demo cluster lifecycle: up, check, status, reset, down
-```
+
+All four root causes in this run are correct. The details are not always right: the
+suggested `kubectl set env deployment/agent-test/web` is not valid syntax (it should be
+`-n agent-test deployment/web`), and the batch finding calls the 1000-CPU request "1000m".
+See [Limitations](#limitations).
+
+## Demo cluster
+
+[kind](https://kind.sigs.k8s.io/) ("Kubernetes in Docker") runs a throwaway cluster as
+Docker containers. The demo deploys these workloads:
+
+| Workload | Broken on purpose | Expected finding |
+| --- | --- | --- |
+| `web` | Exits because `DATABASE_URL` is not set | CrashLoopBackOff; the log line names the missing variable |
+| `payments` | Image tag `nginx:1.99.99-doesnotexist` | ImagePullBackOff: the image does not exist |
+| `cache` | Buffers `/dev/zero` under a 32Mi limit | OOMKilled (exit code 137) |
+| `batch` | Requests 1000 CPUs | Unschedulable; no node can ever fit it |
+| `frontend` | Nothing; it is healthy | No issue (shows that healthy workloads are ignored) |
+
+| Command | What it does |
+| --- | --- |
+| `pnpm demo:up` | Create the cluster (if needed), deploy the workloads, wait until they fail |
+| `pnpm demo:check` | Run the agent against the demo cluster; extra flags go to `pnpm check` |
+| `pnpm demo:status` | Show the demo nodes and pods |
+| `pnpm demo:reset` | Redeploy the workloads from scratch, for example after fixing some |
+| `pnpm demo:down` | Delete the cluster |
+| `pnpm test:e2e` | Run the end-to-end tests against the demo cluster |
+
+- **Your kubectl context is not changed.** `kind create cluster` normally switches your
+  current context to the new cluster. The script writes the demo kubeconfig to
+  `.demo/kubeconfig` instead. To use `kubectl` against the demo cluster, run
+  `export KUBECONFIG=$PWD/.demo/kubeconfig`.
+- **No install needed.** If `kind` is not on your `PATH`, the script downloads a pinned
+  version into `.demo/bin` and verifies its checksum.
+- **Learn by fixing.** Fix a workload, for example with
+  `kubectl set env deployment/web -n agent-test DATABASE_URL=postgres://db/app` (using the
+  demo `KUBECONFIG`). Run `pnpm demo:check` again and watch the problem disappear from the
+  report. `pnpm demo:reset` breaks everything again.
+- **Other clusters.** The workloads are plain manifests, so
+  `kubectl apply -f demo/workloads.yaml` works on minikube or any test cluster too.
 
 ## Safety
 
@@ -234,160 +410,49 @@ nothing runs.
 
 Suggested fixes in the report are only text. Nothing is ever applied.
 
-For defense in depth, you can also run the agent with a kubeconfig bound to the built-in
-`view` ClusterRole.
+For defense in depth, run the agent with a kubeconfig bound to the built-in `view`
+ClusterRole. Env var values are never sent to the model, but logs and event messages are,
+so treat reports as containing cluster data.
 
-## Example report
+## Limitations
 
-A real run against the deliberately broken workloads in
-[`demo/workloads.yaml`](demo/workloads.yaml) on a two-node minikube cluster, with
-`qwen2.5:7b-instruct` on an RTX 3060. It took 67 seconds and exited with code 2. Two of
-the four investigated problems are shown, and the event table is omitted:
-
-```markdown
-# Kubernetes Health Report
-
-**Status: CRITICAL**
-Context: `minikube`
-Scope: namespace `agent-test`
-
-## Summary
-
-| Check | Result |
-| --- | --- |
-| Nodes ready | 2/2 |
-| Pods running | 3/5 |
-| Deployments fully ready | 0/4 |
-| Issues | 11 critical, 0 warning, 0 info |
-| Investigated by LLM | 4 problem(s) |
-
-## Investigated problems
-
-### 1. [CRITICAL] Pod `batch-7684468b57-9xv2m` is unschedulable due to insufficient CPU resources.
-
-**Affected:** Pod agent-test/batch-7684468b57-9xv2m, Deployment agent-test/batch
-
-**Root cause:** Insufficient CPU: No node can ever fit this pod (requests cpu=64, largest node allocatable cpu=12).
-
-**Evidence:**
-
-- 0/2 nodes are available: 2 Insufficient cpu.
-- PodScheduled=False (Unschedulable): 0/2 nodes are available: 2 Insufficient cpu.
-
-**Suggested fix** (not applied):
-
-1. Lower the CPU request in the pod's resource limits.
-2. Add larger nodes to the cluster.
-
-_Confidence: high · 3 tool call(s)_
-
-### 3. [CRITICAL] Pods in the agent-test/web deployment are crashing due to the missing DATABASE_URL environment variable.
-
-**Affected:** Pod agent-test/web-7db8d69f68-4f2n7, Pod agent-test/web-7db8d69f68-q5rls, Deployment agent-test/web
-
-**Root cause:** The application is exiting with an error because the DATABASE_URL environment variable is not set.
-
-**Evidence:**
-
-- The logs show: `FATAL: DATABASE_URL is not set, cannot connect to database`.
-- The deployment `web` has 0/2 replicas ready, indicating issues with the pods.
-
-**Suggested fix** (not applied):
-
-1. Set the `DATABASE_URL` environment variable in the deployment's container specification.
-2. Apply the updated deployment configuration.
-
-_Confidence: high · 3 tool call(s)_
-
-## Other issues (rule-based)
-
-None; all issues are covered above.
-```
-
-The `--verbose` log shows every tool call the agent made:
-
-```
-[10:36:13] triage: 4 problem(s) to investigate (11265ms)
-[10:36:37] investigate [3/4] Pod agent-test/web-7db8d69f68-4f2n7: crashloop
-[10:36:39]     → k8s_get_logs {"namespace":"agent-test","pod":"web-7db8d69f68-4f2n7","previous":true,"tailLines":50} (161 chars, 49ms)
-[10:36:41]     → k8s_describe_pod {"name":"web-7db8d69f68-q5rls","namespace":"agent-test"} (2263 chars, 15ms)
-[10:36:43]     → k8s_get_deployment {"name":"web","namespace":"agent-test"} (533 chars, 17ms)
-[10:36:56]   done: 3 tool call(s), confidence high (18560ms)
-```
-
-**Known limitations of a 7B model:** suggested fixes can be generic or wrong (in another
-run, it proposed replacing a missing image tag with another made-up tag), and the
-self-reported confidence is almost always "high". Treat root causes as leads to verify.
-Changing `MODEL` to a larger model improves this.
-
-## Demo cluster (kind)
-
-[kind](https://kind.sigs.k8s.io/) ("Kubernetes in Docker") runs a throwaway cluster as
-Docker containers. One command creates a two-node cluster, deploys the demo workloads and
-waits until each one has actually failed:
-
-```bash
-pnpm demo:up
-```
-
-| Workload | Broken on purpose | Expected finding |
-| --- | --- | --- |
-| `web` | Exits because `DATABASE_URL` is not set | CrashLoopBackOff; the log line names the missing variable |
-| `payments` | Image tag `nginx:1.99.99-doesnotexist` | ImagePullBackOff: the image does not exist |
-| `cache` | Buffers `/dev/zero` under a 32Mi limit | OOMKilled (exit code 137) |
-| `batch` | Requests 1000 CPUs | Unschedulable; no node can ever fit it |
-| `frontend` | Nothing; it is healthy | No issue (shows that healthy workloads are ignored) |
-
-Then run the agent against it:
-
-```bash
-pnpm demo:check --verbose
-```
-
-`demo:check` passes extra flags on to `pnpm check`, so `--namespace agent-test`,
-`--no-llm` and `--output` work as usual. Other commands:
-
-| Command | What it does |
-| --- | --- |
-| `pnpm demo:status` | Show the demo nodes and pods |
-| `pnpm demo:reset` | Redeploy the workloads from scratch (for example, after fixing some) |
-| `pnpm demo:down` | Delete the cluster |
-| `pnpm test:e2e` | Run the end-to-end tests against the demo cluster |
-
-Details:
-
-- **Your kubectl context is not changed.** `kind create cluster` normally switches your
-  current context to the new cluster. The script writes the demo kubeconfig to
-  `.demo/kubeconfig` instead. To use `kubectl` against the demo cluster:
-  `export KUBECONFIG=$PWD/.demo/kubeconfig`.
-- **No install needed.** If `kind` is not on your `PATH`, the script downloads a pinned
-  version into `.demo/bin` and verifies its checksum.
-- **Learn by fixing.** Fix a workload (for example,
-  `kubectl set env deployment/web -n agent-test DATABASE_URL=postgres://db/app` with the
-  demo `KUBECONFIG`), run `pnpm demo:check` again, and watch the problem disappear from the report.
-  `pnpm demo:reset` breaks everything again.
-- **Other clusters.** The workloads are plain manifests, so `kubectl apply -f demo/workloads.yaml`
-  works on minikube or any test cluster too.
+- **A 7B model makes mistakes.** In testing, it found the right root cause for each demo
+  problem once the guardrails above were in place, but suggested fixes can be generic,
+  contain invalid commands, or invent values (it once proposed replacing a missing image
+  tag with another made-up tag). Treat root causes as leads to verify.
+- **Confidence is self-reported.** The model rates almost every finding "high", including
+  wrong ones.
+- **A larger model helps.** Setting `MODEL=qwen2.5:14b-instruct` (or another
+  tool-calling model) should improve the fixes, at the cost of speed and VRAM.
+- **Coverage:** the rules and tools cover pods, deployments, nodes and events.
+  StatefulSets, DaemonSets, Jobs, Services, Ingress and PVCs are not checked yet.
+- **Speed:** a run with four problems takes about a minute with the model already
+  loaded, plus 30 to 100 seconds the first time Ollama loads it.
 
 ## Development
 
 | Command | Description |
 | --- | --- |
 | `pnpm check` | Run the health check |
-| `pnpm test` | Run unit tests (vitest; no cluster or Ollama needed) |
-| `pnpm test:e2e` | Run end-to-end tests against the demo cluster (`pnpm demo:up` first) |
+| `pnpm test` | Unit tests (vitest; no cluster or Ollama needed) |
+| `pnpm test:e2e` | End-to-end tests against the demo cluster (`pnpm demo:up` first) |
 | `pnpm typecheck` | Type-check `src/` and `test/` |
 | `pnpm build` | Compile `src/` to `dist/` |
 
-The rules and summarizers are pure functions, and the tests feed them fake broken pods,
-nodes and deployments. Read [`test/rules.test.ts`](test/rules.test.ts) to see what each
-rule catches.
+The unit tests feed the rules fake broken pods, nodes and deployments, run the tools
+against a fake cluster, and drive the investigate loop with a scripted fake LLM.
+[`test/rules.test.ts`](test/rules.test.ts) is a good place to see what each rule catches.
+The end-to-end tests run the real scan and CLI against the demo cluster.
 
-### Troubleshooting (WSL)
+### Troubleshooting
 
-- **`corepack: /bin/sh^M: bad interpreter`:** the Windows Node install is ahead of the
-  Linux one on your `PATH`. Install Node inside WSL (for example, with
+- **`corepack: /bin/sh^M: bad interpreter` (WSL):** the Windows Node install is ahead of
+  the Linux one on your `PATH`. Install Node inside WSL (for example, with
   [nvm](https://github.com/nvm-sh/nvm)) and make sure its `bin` directory comes first.
+- **`Ignored build scripts: esbuild`:** pnpm 10+ blocks dependency install scripts by
+  default. This repo allows `esbuild` in `pnpm-workspace.yaml`. Run `pnpm install` again.
+- **`cannot reach Ollama` in the report:** start Ollama (`ollama serve`, or the system
+  service), or set `OLLAMA_URL`. The rule-based report is still produced.
 - **`kind create cluster` fails with `connection refused` on port 6443:** the API server
   could not start, usually because of the Linux inotify limit when other clusters (for
   example, minikube) are running too. `pnpm demo:up` warns about this. Raise the limit
@@ -395,15 +460,3 @@ rule catches.
   run `pnpm demo:up` again.
 - **`kubectl` says `current-context is not set` after `minikube stop`:** stopping minikube
   removes its context from `~/.kube/config`. `minikube start` restores it.
-- **`Ignored build scripts: esbuild`:** pnpm 10+ blocks dependency install scripts by
-  default. This repo allows `esbuild` in `pnpm-workspace.yaml`. Run `pnpm install` again.
-
-## Roadmap
-
-- [x] **Milestone 1:** scaffold, Ollama connection, scan step, rule-based report
-- [x] **Milestone 2:** LLM triage and investigation with read-only tools (`k8s_list_nodes`,
-  `k8s_list_pods`, `k8s_describe_pod`, `k8s_get_logs`, `k8s_list_events`,
-  `k8s_get_deployment`), a max-steps limit per problem, and truncation of large outputs
-- [x] **Milestone 3:** kind demo cluster with deliberately broken workloads (crashloop,
-  bad image, OOM, unschedulable)
-- [ ] **Milestone 4:** full README with architecture diagram and LLM-generated example report
