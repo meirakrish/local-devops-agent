@@ -14,6 +14,8 @@ const overview: ClusterOverview = {
   warningEvents: [
     { involvedKind: "Node", involvedName: "n1", reason: "Rebooted", message: "a | b", count: 1 },
   ],
+  controlPlane: { notVisible: [] },
+  webhooks: [],
   errors: ["list nodes: forbidden (check RBAC permissions)"],
 };
 
@@ -42,6 +44,45 @@ describe("report", () => {
     expect(md).toContain("| Node n1 |"); // cluster-scoped: no namespace prefix
     expect(md).toContain("a \\| b");
     expect(md).toContain("Scan error: list nodes: forbidden");
+  });
+});
+
+describe("report: cluster-level rows", () => {
+  it("shows control-plane, etcd, certificate and webhook rows", () => {
+    const md = renderMarkdownReport({
+      overview: {
+        ...overview,
+        controlPlane: {
+          serverVersion: "v1.37.0",
+          readyz: [
+            { name: "ping", ok: true },
+            { name: "etcd", ok: false, reason: "reason withheld" },
+          ],
+          certificate: { subject: "CN=kube-apiserver", issuer: "CN=kubernetes", notAfter: "2026-01-31T12:00:00.000Z" },
+          etcd: { dbSizeBytes: 1.5 * 1024 ** 3, quotaBytes: 2 * 1024 ** 3, quotaSource: "default", objectCounts: [] },
+          notVisible: [],
+        },
+        webhooks: [
+          { kind: "Validating", configName: "p", name: "w", failurePolicy: "Fail", status: "no-ready-endpoints" },
+          { kind: "Mutating", configName: "q", name: "v", failurePolicy: "Fail", status: "ok" },
+        ],
+      },
+      issues: [],
+    });
+    expect(md).toContain("| API server health checks | 1/2 passing (failing: etcd) |");
+    expect(md).toContain("| etcd database | 1.5 GiB of 2.0 GiB quota (75%), default quota assumed |");
+    expect(md).toContain("| API server certificate | expires in 30 days (2026-01-31) |");
+    expect(md).toContain("| Admission webhooks | 2, 1 unreachable |");
+  });
+
+  it("says what could not be checked instead of implying it is healthy", () => {
+    const md = renderMarkdownReport({
+      overview: { ...overview, controlPlane: { notVisible: ["etcd size and object counts: /metrics forbidden"] } },
+      issues: [],
+    });
+    expect(md).toContain("| API server health checks | not visible |");
+    expect(md).toContain("| etcd database | not visible |");
+    expect(md).toContain("- Not checked: etcd size and object counts: /metrics forbidden");
   });
 });
 

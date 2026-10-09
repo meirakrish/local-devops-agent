@@ -32,6 +32,31 @@ function renderIssue(issue: Issue): string {
   return lines.join("\n");
 }
 
+function controlPlaneRows(overview: ClusterOverview, now: Date): string[] {
+  const cp = overview.controlPlane;
+  const rows: string[] = [];
+  if (cp.readyz) {
+    const failing = cp.readyz.filter((c) => !c.ok);
+    rows.push(`| API server health checks | ${cp.readyz.length - failing.length}/${cp.readyz.length} passing${failing.length > 0 ? ` (failing: ${cell(failing.map((c) => c.name).join(", "), 80)})` : ""} |`);
+  } else {
+    rows.push("| API server health checks | not visible |");
+  }
+  if (cp.etcd?.dbSizeBytes !== undefined) {
+    const size = (b: number) => (b >= 1024 ** 3 ? `${(b / 1024 ** 3).toFixed(1)} GiB` : `${(b / 1024 ** 2).toFixed(1)} MiB`);
+    const ratio = Math.round((cp.etcd.dbSizeBytes / cp.etcd.quotaBytes) * 100);
+    rows.push(`| etcd database | ${size(cp.etcd.dbSizeBytes)} of ${size(cp.etcd.quotaBytes)} quota (${ratio}%)${cp.etcd.quotaSource === "default" ? ", default quota assumed" : ""} |`);
+  } else {
+    rows.push("| etcd database | not visible |");
+  }
+  if (cp.certificate) {
+    const days = Math.floor((Date.parse(cp.certificate.notAfter) - now.getTime()) / 86_400_000);
+    rows.push(`| API server certificate | ${days < 0 ? "expired" : `expires in ${days} days`} (${cp.certificate.notAfter.slice(0, 10)}) |`);
+  }
+  const unreachable = overview.webhooks.filter((w) => w.status === "service-missing" || w.status === "no-ready-endpoints");
+  rows.push(`| Admission webhooks | ${overview.webhooks.length}${unreachable.length > 0 ? `, ${unreachable.length} unreachable` : ""} |`);
+  return rows;
+}
+
 function resourceName(i: Issue): string {
   return `${i.resource.kind} ${i.resource.namespace ? `${i.resource.namespace}/` : ""}${i.resource.name}`;
 }
@@ -100,6 +125,7 @@ export function renderMarkdownReport({
     `| Pods running | ${runningPods}/${overview.pods.length} |`,
     `| Deployments fully ready | ${healthyDeployments}/${overview.deployments.length} |`,
     `| Warning events (recent) | ${overview.warningEvents.length} |`,
+    ...controlPlaneRows(overview, new Date(overview.scannedAt)),
     `| Issues | ${count("critical")} critical, ${count("warning")} warning, ${count("info")} info |`,
     `| Investigated by LLM | ${findings.length > 0 ? `${findings.length} problem(s)` : "none"} |`,
     "",
@@ -146,6 +172,7 @@ export function renderMarkdownReport({
 
   out.push("## Scan notes", "");
   for (const err of overview.errors) out.push(`- Scan error: ${err}`);
+  for (const note of overview.controlPlane.notVisible) out.push(`- Not checked: ${note}`);
   if (ollama) {
     if (!ollama.reachable) out.push(`- LLM: ${ollama.error}`);
     else if (!ollama.modelAvailable)

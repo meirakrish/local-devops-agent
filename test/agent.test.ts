@@ -34,6 +34,8 @@ const overview: ClusterOverview = {
   pods: [],
   deployments: [],
   warningEvents: [],
+  controlPlane: { notVisible: [] },
+  webhooks: [],
   errors: [],
 };
 

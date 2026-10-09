@@ -7,6 +7,7 @@ import type {
   PodSummary,
   Severity,
 } from "./types.js";
+import { controlPlaneIssues, nodeCapacityIssues, webhookIssues } from "./cluster-rules.js";
 import { formatCpu, formatMemory, parseQuantity } from "./quantity.js";
 
 /**
@@ -292,7 +293,10 @@ export function deploymentIssues(d: DeploymentSummary): Issue[] {
 
 export function detectIssues(overview: ClusterOverview, opts: RuleOptions): Issue[] {
   const issues = [
+    ...controlPlaneIssues(overview.controlPlane, opts.now),
+    ...overview.webhooks.flatMap(webhookIssues),
     ...overview.nodes.flatMap(nodeIssues),
+    ...overview.nodes.flatMap((n) => nodeCapacityIssues(n, opts.now, overview.controlPlane.serverVersion)),
     ...overview.pods.flatMap((p) => podIssues(p, { ...opts, nodes: opts.nodes ?? overview.nodes })),
     ...overview.deployments.flatMap(deploymentIssues),
   ];

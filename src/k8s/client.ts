@@ -1,4 +1,12 @@
-import { AppsV1Api, CoreV1Api, KubeConfig } from "@kubernetes/client-node";
+import {
+  AdmissionregistrationV1Api,
+  AppsV1Api,
+  CoordinationV1Api,
+  CoreV1Api,
+  DiscoveryV1Api,
+  KubeConfig,
+} from "@kubernetes/client-node";
+import { createRawReader, type RawReader } from "./raw.js";
 
 /**
  * Read-only access to the Kubernetes API, enforced in code (not just in prompts).
@@ -52,6 +60,11 @@ export interface K8sClients {
   context: string;
   core: ReadOnlyApi<CoreV1Api>;
   apps: ReadOnlyApi<AppsV1Api>;
+  admission: ReadOnlyApi<AdmissionregistrationV1Api>;
+  discovery: ReadOnlyApi<DiscoveryV1Api>;
+  coordination: ReadOnlyApi<CoordinationV1Api>;
+  /** GET-only access to /readyz, /livez, /version and /metrics (see raw.ts). */
+  raw: RawReader;
 }
 
 export function createK8sClients(kubeconfigPath?: string): K8sClients {
@@ -65,5 +78,9 @@ export function createK8sClients(kubeconfigPath?: string): K8sClients {
     context: kc.getCurrentContext(),
     core: readOnly(kc.makeApiClient(CoreV1Api), "CoreV1Api"),
     apps: readOnly(kc.makeApiClient(AppsV1Api), "AppsV1Api"),
+    admission: readOnly(kc.makeApiClient(AdmissionregistrationV1Api), "AdmissionregistrationV1Api"),
+    discovery: readOnly(kc.makeApiClient(DiscoveryV1Api), "DiscoveryV1Api"),
+    coordination: readOnly(kc.makeApiClient(CoordinationV1Api), "CoordinationV1Api"),
+    raw: createRawReader(kc),
   };
 }

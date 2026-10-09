@@ -1,11 +1,14 @@
-# Demo workloads for the agent: four deliberately broken deployments and one healthy one.
+# Demo workloads for the agent: four deliberately broken deployments, one healthy one,
+# and a broken admission webhook.
 # Used by `pnpm demo:up` (kind) and works on any cluster:
 #   kubectl apply -f demo/workloads.yaml
-#   kubectl delete namespace agent-test
+#   kubectl delete -f demo/workloads.yaml   (also removes the cluster-scoped webhook)
 apiVersion: v1
 kind: Namespace
 metadata:
   name: agent-test
+  labels:
+    devops-agent-demo/policy: enforced
 ---
 # CrashLoopBackOff: the app exits because a required env var is missing.
 apiVersion: apps/v1
@@ -120,3 +123,41 @@ spec:
           resources:
             requests: { cpu: 10m, memory: 16Mi }
             limits: { memory: 64Mi }
+---
+# Broken admission webhook: its Service has no pods behind it, and failurePolicy=Fail
+# means the API server rejects every request the webhook matches. Scoped narrowly so it
+# cannot break the demo cluster itself: only creating CronJobs in namespaces labeled
+# devops-agent-demo/policy=enforced (just agent-test), which nothing does on its own.
+apiVersion: v1
+kind: Service
+metadata:
+  name: policy-webhook
+  namespace: agent-test
+spec:
+  selector: { app: policy-webhook } # no pods have this label
+  ports:
+    - port: 443
+      targetPort: 8443
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: agent-demo-policy
+webhooks:
+  - name: cronjobs.policy.agent-demo.example.com
+    failurePolicy: Fail
+    sideEffects: None
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      service:
+        namespace: agent-test
+        name: policy-webhook
+        path: /validate
+    namespaceSelector:
+      matchLabels:
+        devops-agent-demo/policy: enforced
+    rules:
+      - apiGroups: ["batch"]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["cronjobs"]

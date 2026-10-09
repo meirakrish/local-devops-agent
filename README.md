@@ -10,23 +10,24 @@ cloud LLM APIs are used, and no cluster data leaves your machine.
 
 ```text
 $ pnpm demo:check --verbose
-[11:09:46] scan: 2 nodes, 18 pods, 7 deployments, 28 warning events, 11 issues
-[11:11:22] triage: 4 problem(s) to investigate
-[11:11:46] investigate [3/4] Pod agent-test/web-7db8d69f68-7x2kz: crashloop
-[11:11:47]     → k8s_get_logs {"namespace":"agent-test","pod":"web-7db8d69f68-7x2kz","previous":true,"tailLines":50}
-[11:11:49]     → k8s_get_deployment {"name":"web","namespace":"agent-test"}
-[11:11:57]   done: 2 tool call(s), confidence high
+[12:51:39] scan: 2 nodes, 18 pods, 7 deployments, 11 warning events, 12 issues
+[12:51:46] triage: 5 problem(s) to investigate (6611ms)
 ...
-### 3. [CRITICAL] Pods in the agent-test/web deployment are crashing due to the missing DATABASE_URL environment variable.
-**Root cause:** DATABASE_URL is not set, cannot connect to database
+[12:52:44] investigate [5/5] Validating webhook cronjobs.policy.agent-demo.example.com is unreachable and blocks the requests it matches
+[12:52:44]     → k8s_cluster_health {} (662 chars, 115ms)
+...
+### 5. [CRITICAL] The ValidatingWebhookConfiguration agent-demo-policy is unreachable due to a missing or failed Service agent-test/policy-webhook.
+**Root cause:** Service agent-test/policy-webhook has no ready endpoints
 ```
 
 ## Features
 
 - **One command, no questions:** `pnpm check` scans the cluster and prints a report.
-- **Finds common failures with rules:** CrashLoopBackOff, image pull errors, OOMKilled
-  containers, unschedulable or stuck Pending pods, high restart counts, pods that never
-  become ready, NotReady or pressured nodes, unavailable deployments and stuck rollouts.
+- **Finds common failures with rules:** crashlooping, OOMKilled, unschedulable and
+  image-pull failures in workloads, plus cluster-level risks: failing API server and etcd
+  health checks, etcd nearing its storage quota, expiring API server certificates, stale
+  kubelet heartbeats, full nodes, unsupported version skew, and admission webhooks that
+  block requests. See [What it checks](#what-it-checks).
 - **Investigates like an SRE:** a local LLM groups related issues, then uses read-only
   tools (describe, logs, events, deployments) to find the root cause and suggest a fix.
 - **Read-only by construction:** write, delete and exec operations are blocked in code,
@@ -59,7 +60,8 @@ pnpm demo:check --verbose
 ```
 
 `demo:up` creates a two-node [kind](https://kind.sigs.k8s.io/) cluster, deploys four
-broken workloads and one healthy one, and waits until each has actually failed. The first
+broken workloads, one healthy one and a broken admission webhook, and waits until each has
+actually failed. The first
 run downloads kind and its node image, so it takes a few minutes. `demo:check` runs the
 agent and prints the report. Delete the cluster with `pnpm demo:down`.
 
@@ -70,7 +72,7 @@ agent and prints the report. Delete the cluster with `pnpm demo:down`.
 ```mermaid
 flowchart LR
     cli["pnpm check<br/>(cli.ts)"] --> lg["LangGraph agent<br/>(graph.ts)"]
-    lg --> guard["Read-only client<br/>(k8s/client.ts)<br/>list* / read* only"]
+    lg --> guard["Read-only client<br/>(k8s/client.ts, raw.ts)<br/>list* / read* objects,<br/>GET /readyz /version /metrics"]
     guard -->|"HTTPS, your kubeconfig"| k8s[("Kubernetes API")]
     lg -->|"localhost:11434"| ollama["Ollama<br/>qwen2.5:7b-instruct"]
     lg --> report["Markdown report<br/>stdout / --output"]
@@ -114,18 +116,45 @@ The **scan is plain code**, so it finds the same issues every time. **Severity a
 exit code come only from the rules**, so the LLM can explain a problem but can never hide
 one. If the LLM is unavailable, the graph skips straight to the report.
 
+### What it checks
+
+The rules run on every scan, with or without the LLM. Severity decides the exit code.
+
+| Area | Check | Severity |
+| --- | --- | --- |
+| Control plane | `/readyz` check for etcd failing | critical |
+| Control plane | Other API server readiness checks failing | critical |
+| Control plane | API server certificate expires within 7 days / 30 days | critical / warning |
+| etcd | Database at 90% / 70% of its quota (a full etcd makes the cluster read-only) | critical / warning |
+| etcd | More than 100,000 objects of one resource | warning |
+| Nodes | NotReady | critical |
+| Nodes | Kubelet heartbeat (its Lease) not renewed for over 60 seconds | critical |
+| Nodes | Kubelet newer than, or more than 3 minor versions behind, the API server | critical |
+| Nodes | CPU, memory or pod requests at 90% of allocatable | warning |
+| Nodes | Memory, disk or PID pressure / cordoned | warning / info |
+| Webhooks | Service missing or without ready endpoints, `failurePolicy: Fail` (blocks requests) | critical |
+| Webhooks | Same, with `failurePolicy: Ignore` (policy silently skipped) | warning |
+| Pods | CrashLoopBackOff, image pull errors, config errors, OOMKilled, unschedulable | critical |
+| Pods | Pending too long, failed or evicted, not ready, high restart count | warning |
+| Deployments | No ready replicas or rollout stuck / some replicas unavailable | critical / warning |
+
+**When a check cannot run, the report says so.** Managed clusters (EKS, GKE, AKS) usually
+hide etcd, and a restricted kubeconfig may not be allowed to read `/metrics`. These show
+as "not visible" in the summary and "Not checked: ..." in the notes, never as healthy.
+
 ### Tools
 
-The agent can call six tools. All are read-only and built on the guarded client:
+The agent can call seven tools. All are read-only and built on the guarded client:
 
 | Tool | Returns |
 | --- | --- |
-| `k8s_list_nodes` | Ready status, pressure conditions, allocatable CPU and memory |
+| `k8s_list_nodes` | Ready status, pressure conditions, kubelet version, seconds since the last heartbeat, and requested vs allocatable CPU, memory and pods |
 | `k8s_list_pods` | Phase, ready containers, restarts and waiting reason (optional namespace and problems-only filter) |
 | `k8s_describe_pod` | Conditions, container states and last termination, image, resources, env var **names**, probes, recent events |
 | `k8s_get_logs` | The last N lines of a container's logs. After a restart, it adds the previous (crashed) run, and falls back to the current run when the previous run's logs are gone |
 | `k8s_list_events` | Warning events, filtered by namespace, object name and kind |
 | `k8s_get_deployment` | Desired vs ready replicas, rollout conditions, images, and the status of its pods |
+| `k8s_cluster_health` | API server version and certificate expiry, `/readyz` checks including etcd, etcd size vs quota and largest object counts, and admission webhooks with whether their service can answer |
 
 ### Design choices for a small local model
 
@@ -166,15 +195,17 @@ src/
   agent/triage.ts       LLM problem selection, plus a deterministic fallback
   agent/investigate.ts  Tool-calling loop (subgraph) and structured conclusion
   k8s/client.ts         Read-only Kubernetes client
+  k8s/raw.ts            GET-only reader for /readyz, /livez, /version and /metrics
   llm/model.ts          LlmClient interface and Ollama implementation
   llm/ollama.ts         Ollama connection check
-  tools/k8s-tools.ts    The six read-only tools
+  tools/k8s-tools.ts    The seven read-only tools
   tools/truncate.ts     Output truncation
   scan/                 Cluster overview, summaries, quantities and rules
+                        (rules.ts: workloads and nodes; cluster-rules.ts: control plane, etcd, webhooks)
   report/markdown.ts    Markdown report renderer
 test/                   Unit tests (fake cluster and scripted fake LLM; no Ollama needed)
 test/e2e/               End-to-end tests against the demo cluster
-demo/workloads.yaml     Four deliberately broken deployments and one healthy one
+demo/workloads.yaml     Four broken deployments, one healthy one, and a broken admission webhook
 demo/kind-cluster.yaml  kind cluster definition (1 control plane + 1 worker)
 scripts/demo.sh         Demo cluster lifecycle: up, check, status, reset, down
 docs/                   Example report
@@ -291,8 +322,8 @@ GPU. The rule-based report needs only cluster access.
 
 The full report from a run against the demo cluster is in
 [`docs/example-report.md`](docs/example-report.md). It was produced by
-`qwen2.5:7b-instruct` on an RTX 3060, took 189 seconds (97 of them loading the model
-cold), and exited with code `2`. An excerpt:
+`qwen2.5:7b-instruct` on an RTX 3060 with the model already loaded, took 77 seconds, and
+exited with code `2`. An excerpt:
 
 ```markdown
 # Kubernetes Health Report
@@ -308,54 +339,58 @@ Scope: all namespaces
 | Nodes ready | 2/2 |
 | Pods running | 16/18 |
 | Deployments fully ready | 3/7 |
-| Warning events (recent) | 28 |
-| Issues | 11 critical, 0 warning, 0 info |
-| Investigated by LLM | 4 problem(s) |
+| Warning events (recent) | 11 |
+| API server health checks | 37/37 passing |
+| etcd database | 3.7 MiB of 2.0 GiB quota (0%), default quota assumed |
+| API server certificate | expires in 364 days (2027-10-09) |
+| Admission webhooks | 1, 1 unreachable |
+| Issues | 12 critical, 0 warning, 0 info |
+| Investigated by LLM | 5 problem(s) |
 
 ## Investigated problems
 
-### 3. [CRITICAL] Pods in the agent-test/web deployment are crashing due to the missing DATABASE_URL environment variable.
+### 3. [CRITICAL] Pods in the `web` deployment are crashing due to missing `DATABASE_URL` environment variable.
 
 **Affected:** Pod agent-test/web-7db8d69f68-7x2kz, Pod agent-test/web-7db8d69f68-xmr99, Deployment agent-test/web
 
-**Root cause:** DATABASE_URL is not set, cannot connect to database
+**Root cause:** The `DATABASE_URL` environment variable is not set, causing the application to fail and enter a crash loop.
 
 **Evidence:**
 
-- Both pods web-7db8d69f68-7x2kz and web-7db8d69f68-xmr99 are in CrashLoopBackOff state.
-- Logs show 'FATAL: DATABASE_URL is not set, cannot connect to database'.
-- Deployment agent-test/web has 0/2 replicas ready.
+- Logs show: `FATAL: DATABASE_URL is not set, cannot connect to database`
+- Pods are in CrashLoopBackOff state with 27 restarts each
+- Deployment `web` has 0/2 replicas ready
 
 **Suggested fix** (not applied):
 
-1. Set the DATABASE_URL environment variable for the deployment using `kubectl set env deployment/agent-test/web DATABASE_URL=<your-database-url>`.
-2. Apply the updated deployment configuration using `kubectl apply -f <your-deployment-file.yaml>`.
-
-_Confidence: high · 2 tool call(s)_
-
-### 4. [CRITICAL] Pod `cache-5cc48794d-2lc5m` is OOMKilled due to excessive memory usage.
-
-**Affected:** Pod agent-test/cache-5cc48794d-2lc5m, Deployment agent-test/cache
-
-**Root cause:** The container `cache` is consuming more memory than its limit, leading to an OOMKilled error.
-
-**Evidence:**
-
-- Container `cache` was OOMKilled with exit code 137.
-- Container `cache` has a memory limit of 32Mi, but it is being OOMKilled.
-
-**Suggested fix** (not applied):
-
-1. Increase the memory limit for the container `cache` in the deployment's pod template.
-2. Apply the updated deployment configuration.
+1. Update the deployment configuration to include the `DATABASE_URL` environment variable.
+2. Apply the updated deployment configuration using `kubectl apply -f path/to/deployment.yaml`.
 
 _Confidence: high · 3 tool call(s)_
+
+### 5. [CRITICAL] The ValidatingWebhookConfiguration agent-demo-policy is unreachable due to a missing or failed Service agent-test/policy-webhook.
+
+**Affected:** ValidatingWebhookConfiguration agent-demo-policy
+
+**Root cause:** Service agent-test/policy-webhook has no ready endpoints
+
+**Evidence:**
+
+- Service agent-test/policy-webhook has no ready endpoints
+- failurePolicy=Fail: matching create/update requests are rejected
+- Pods in the agent-test namespace are failing due to ImagePullBackOff and BackOff errors
+
+**Suggested fix** (not applied):
+
+1. Restore the backend service for the webhook (Service agent-test/policy-webhook and its pods)
+2. Check the deployment or statefulset for the webhook to ensure it is running and properly configured
+
+_Confidence: high · 6 tool call(s)_
 ```
 
-All four root causes in this run are correct. The details are not always right: the
-suggested `kubectl set env deployment/agent-test/web` is not valid syntax (it should be
-`-n agent-test deployment/web`), and the batch finding calls the 1000-CPU request "1000m".
-See [Limitations](#limitations).
+All five root causes in this run are correct, but the details are not always right: the
+webhook finding's third evidence point is about other workloads in the namespace, not the
+webhook. See [Limitations](#limitations).
 
 ## Demo cluster
 
@@ -369,6 +404,7 @@ Docker containers. The demo deploys these workloads:
 | `cache` | Buffers `/dev/zero` under a 32Mi limit | OOMKilled (exit code 137) |
 | `batch` | Requests 1000 CPUs | Unschedulable; no node can ever fit it |
 | `frontend` | Nothing; it is healthy | No issue (shows that healthy workloads are ignored) |
+| `agent-demo-policy` | Validating webhook whose Service has no pods, `failurePolicy: Fail` | Webhook unreachable and blocking. It only matches creating CronJobs in `agent-test`, so it cannot break the demo cluster itself |
 
 | Command | What it does |
 | --- | --- |
@@ -403,6 +439,10 @@ The agent must never change the cluster. This is enforced in code, in two layers
    `ReadOnlyViolationError` for any other method. That includes `create*`, `patch*`,
    `replace*`, `delete*` and `connect*` (exec, attach, port-forward). This also catches
    type casts and any tool name the LLM chooses.
+3. **Non-resource endpoints:** health checks, version and metrics are not Kubernetes
+   objects, so they go through [`src/k8s/raw.ts`](src/k8s/raw.ts) instead. It can only
+   send GET, and only to `/readyz`, `/livez`, `/version` and `/metrics`. Paths are
+   normalized before the check, so tricks like `/readyz/../api/v1/secrets` are rejected.
 
 On top of that, the investigate loop only runs tools from its own registry of six
 read-only tools. If the model asks for any other tool, it gets an error message back and
@@ -411,7 +451,10 @@ nothing runs.
 Suggested fixes in the report are only text. Nothing is ever applied.
 
 For defense in depth, run the agent with a kubeconfig bound to the built-in `view`
-ClusterRole. Env var values are never sent to the model, but logs and event messages are,
+ClusterRole. `/readyz`, `/livez` and `/version` are readable by every user (the built-in
+`system:public-info-viewer` role), but `view` does not include `/metrics`, so etcd size and
+object counts will show as "Not checked". To allow them, also grant `get` on the
+non-resource URL `/metrics`. Env var values are never sent to the model, but logs and event messages are,
 so treat reports as containing cluster data.
 
 ## Limitations
@@ -424,8 +467,12 @@ so treat reports as containing cluster data.
   wrong ones.
 - **A larger model helps.** Setting `MODEL=qwen2.5:14b-instruct` (or another
   tool-calling model) should improve the fixes, at the cost of speed and VRAM.
-- **Coverage:** the rules and tools cover pods, deployments, nodes and events.
-  StatefulSets, DaemonSets, Jobs, Services, Ingress and PVCs are not checked yet.
+- **Coverage:** the rules cover the control plane, etcd, nodes, admission webhooks,
+  pods, deployments and events. StatefulSets, DaemonSets, Jobs, Services, PVCs,
+  APIServices and CoreDNS are not checked yet.
+- **etcd depth:** etcd is checked through the API server (health check, database size,
+  object counts). Leader changes and disk latency need etcd's own metrics endpoint, which
+  is only reachable from the control-plane nodes.
 - **Speed:** a run with four problems takes about a minute with the model already
   loaded, plus 30 to 100 seconds the first time Ollama loads it.
 

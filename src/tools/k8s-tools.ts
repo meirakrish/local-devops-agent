@@ -9,7 +9,9 @@ import {
   summarizeNode,
   summarizePod,
 } from "../scan/summarize.js";
-import type { EventSummary, PodSummary } from "../scan/types.js";
+import { addNodeUsage, collectControlPlane, collectWebhooks } from "../scan/collect-cluster.js";
+import { formatCpu, formatMemory, parseQuantity } from "../scan/quantity.js";
+import type { EventSummary, NodeSummary, PodSummary } from "../scan/types.js";
 import { truncateMiddle } from "./truncate.js";
 
 /**
@@ -52,6 +54,27 @@ function podLine(p: PodSummary): string {
   if (p.unschedulable) parts.push("unschedulable");
   if (p.nodeName) parts.push(`node=${p.nodeName}`);
   return parts.join(" ");
+}
+
+function nodeLine(n: NodeSummary, now: Date): string {
+  const usage = (used: number, total: string | undefined, fmt: (v: number) => string) => {
+    const t = parseQuantity(total);
+    return t ? `${fmt(used)}/${fmt(t)} (${Math.round((used / t) * 100)}%)` : `${fmt(used)}/?`;
+  };
+  return [
+    n.name,
+    n.ready ? "Ready" : `NotReady${n.readyMessage ? ` (${n.readyMessage})` : ""}`,
+    `roles=${n.roles.join(",")}`,
+    `kubelet=${n.kubeletVersion ?? "?"}`,
+    n.heartbeat ? `heartbeat=${Math.round((now.getTime() - Date.parse(n.heartbeat)) / 1000)}s ago` : "heartbeat=unknown",
+    `pressure=${n.pressures.join(",") || "none"}`,
+    n.unschedulable ? "cordoned" : "",
+    n.requested
+      ? `requested cpu=${usage(n.requested.cpu, n.allocatable.cpu, formatCpu)} memory=${usage(n.requested.memory, n.allocatable.memory, formatMemory)} pods=${usage(n.requested.pods, n.allocatable.pods, String)}`
+      : `allocatable(cpu=${n.allocatable.cpu ?? "?"},memory=${n.allocatable.memory ?? "?"},pods=${n.allocatable.pods ?? "?"})`,
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 
 function eventLine(e: EventSummary): string {
@@ -206,24 +229,14 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
   const listNodes = tool(
     safe(k8s, opts.maxChars, async () => {
       const nodes = (await k8s.core.listNode()).items.map(summarizeNode);
-      return nodes
-        .map((n) =>
-          [
-            n.name,
-            n.ready ? "Ready" : `NotReady${n.readyMessage ? ` (${n.readyMessage})` : ""}`,
-            `roles=${n.roles.join(",")}`,
-            `pressure=${n.pressures.join(",") || "none"}`,
-            n.unschedulable ? "cordoned" : "",
-            `allocatable(cpu=${n.allocatable.cpu ?? "?"},memory=${n.allocatable.memory ?? "?"},pods=${n.allocatable.pods ?? "?"})`,
-          ]
-            .filter(Boolean)
-            .join(" "),
-        )
-        .join("\n");
+      const errors: string[] = [];
+      await addNodeUsage(k8s, nodes, (await k8s.core.listPodForAllNamespaces()).items, errors);
+      return [...nodes.map((n) => nodeLine(n, new Date())), ...errors.map((e) => `(${e})`)].join("\n");
     }),
     {
       name: "k8s_list_nodes",
-      description: "List cluster nodes with Ready status, resource pressure conditions and allocatable CPU/memory.",
+      description:
+        "List cluster nodes: Ready status, pressure conditions, kubelet version, seconds since the last kubelet heartbeat, and requested vs allocatable CPU, memory and pods.",
       schema: z.object({}),
     },
   );
@@ -426,5 +439,46 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
     },
   );
 
-  return [listNodes, listPods, describePod, getLogs, listEvents, getDeployment];
+  const clusterHealth = tool(
+    safe(k8s, opts.maxChars, async () => {
+      const problems: string[] = [];
+      const [cp, webhooks] = await Promise.all([
+        collectControlPlane(k8s),
+        collectWebhooks(k8s).catch((err: unknown) => {
+          problems.push(`admission webhooks: ${k8sErrorMessage(err)}`);
+          return [];
+        }),
+      ]);
+      const lines = [`API server version: ${cp.serverVersion ?? "unknown"}`];
+      if (cp.certificate) lines.push(`API server certificate: ${cp.certificate.subject}, valid until ${cp.certificate.notAfter}`);
+      if (cp.readyz) {
+        const failing = cp.readyz.filter((c) => !c.ok);
+        lines.push(
+          `Readiness checks (/readyz): ${cp.readyz.length - failing.length}/${cp.readyz.length} passing`,
+          ...failing.map((c) => `- FAILING ${c.name}${c.reason ? `: ${c.reason}` : ""}`),
+        );
+      }
+      if (cp.etcd) {
+        const size = cp.etcd.dbSizeBytes;
+        lines.push(
+          `etcd database: ${size !== undefined ? `${formatMemory(size)} of ${formatMemory(cp.etcd.quotaBytes)} quota (${Math.round((size / cp.etcd.quotaBytes) * 100)}%)` : "size not exposed"}${cp.etcd.quotaSource === "default" ? ", default quota assumed" : ""}`,
+          `etcd largest object counts: ${cp.etcd.objectCounts.slice(0, 8).map((o) => `${o.resource}=${o.count}`).join(", ") || "unknown"}`,
+        );
+      }
+      lines.push(`Admission webhooks: ${webhooks.length}`);
+      for (const w of webhooks) {
+        lines.push(`- ${w.kind} ${w.configName}/${w.name} failurePolicy=${w.failurePolicy} status=${w.status}${w.detail ? ` (${w.detail})` : ""}`);
+      }
+      for (const n of [...cp.notVisible, ...problems]) lines.push(`Not visible: ${n}`);
+      return lines.join("\n");
+    }),
+    {
+      name: "k8s_cluster_health",
+      description:
+        "Control-plane health: API server version and certificate expiry, /readyz checks (including etcd), etcd database size vs quota and largest object counts, and admission webhooks with whether their service can answer.",
+      schema: z.object({}),
+    },
+  );
+
+  return [listNodes, listPods, describePod, getLogs, listEvents, getDeployment, clusterHealth];
 }

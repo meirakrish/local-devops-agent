@@ -62,7 +62,10 @@ export interface InvestigateDeps {
 export function toolTarget(issue: Issue): string {
   const { kind, namespace, name } = issue.resource;
   if (kind === "Pod") return `namespace="${namespace}" name="${name}" (for k8s_get_logs: pod="${name}")`;
-  if (kind === "Node") return `name="${name}"`;
+  if (kind === "Node") return `name="${name}" (k8s_list_nodes shows heartbeat, versions and requests)`;
+  if (kind === "ControlPlane" || kind.endsWith("WebhookConfiguration")) {
+    return "none; call k8s_cluster_health (no arguments) for control-plane, etcd and webhook details";
+  }
   return `namespace="${namespace}" name="${name}"`;
 }
 
