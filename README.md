@@ -5,9 +5,9 @@ writes a report: what's wrong, the likely root cause, and suggested fixes.
 Everything runs on your machine. The LLM is served by [Ollama](https://ollama.com),
 so no cloud LLM APIs are used.
 
-> **Status: milestone 2 of 4.** The scan, rule-based detection, LLM triage, tool-based
-> investigation and report all work. A kind demo cluster and the final README come next
-> (see [Roadmap](#roadmap)).
+> **Status: milestone 3 of 4.** The scan, rule-based detection, LLM triage, tool-based
+> investigation, report and a one-command demo cluster all work. The final README comes
+> next (see [Roadmap](#roadmap)).
 
 ## Features
 
@@ -32,6 +32,7 @@ so no cloud LLM APIs are used.
 | pnpm | 10+ | `corepack enable` |
 | kubectl access | any | A working kubeconfig (minikube, kind, or a real cluster) |
 | Ollama | latest | Needed for LLM steps; the scan works without it |
+| Docker | any | Only for the [demo cluster](#demo-cluster-kind); kind itself is downloaded automatically |
 
 ### Installing Ollama (Linux / WSL)
 
@@ -209,7 +210,10 @@ src/
   scan/                 Overview collection, summaries, rules
   report/markdown.ts    Markdown report renderer
 test/                   vitest unit tests (fake cluster and scripted fake LLM; no Ollama needed)
-dev/test-workloads.yaml Deliberately broken workloads for manual testing
+test/e2e/               End-to-end tests against the demo cluster (`pnpm test:e2e`)
+demo/workloads.yaml     Four deliberately broken deployments and one healthy one
+demo/kind-cluster.yaml  kind cluster definition (1 control plane + 1 worker)
+scripts/demo.sh         Demo cluster lifecycle: up, check, status, reset, down
 ```
 
 ## Safety
@@ -236,7 +240,7 @@ For defense in depth, you can also run the agent with a kubeconfig bound to the 
 ## Example report
 
 A real run against the deliberately broken workloads in
-[`dev/test-workloads.yaml`](dev/test-workloads.yaml) on a two-node minikube cluster, with
+[`demo/workloads.yaml`](demo/workloads.yaml) on a two-node minikube cluster, with
 `qwen2.5:7b-instruct` on an RTX 3060. It took 67 seconds and exited with code 2. Two of
 the four investigated problems are shown, and the event table is omitted:
 
@@ -316,32 +320,62 @@ run, it proposed replacing a missing image tag with another made-up tag), and th
 self-reported confidence is almost always "high". Treat root causes as leads to verify.
 Changing `MODEL` to a larger model improves this.
 
-### Try it yourself
+## Demo cluster (kind)
 
-Deploy the broken workloads, which create the `agent-test` namespace:
-
-```bash
-kubectl apply -f dev/test-workloads.yaml
-```
-
-Wait a minute for them to start failing, then run:
+[kind](https://kind.sigs.k8s.io/) ("Kubernetes in Docker") runs a throwaway cluster as
+Docker containers. One command creates a two-node cluster, deploys the demo workloads and
+waits until each one has actually failed:
 
 ```bash
-pnpm check --namespace agent-test --verbose
+pnpm demo:up
 ```
 
-Remove them with:
+| Workload | Broken on purpose | Expected finding |
+| --- | --- | --- |
+| `web` | Exits because `DATABASE_URL` is not set | CrashLoopBackOff; the log line names the missing variable |
+| `payments` | Image tag `nginx:1.99.99-doesnotexist` | ImagePullBackOff: the image does not exist |
+| `cache` | Buffers `/dev/zero` under a 32Mi limit | OOMKilled (exit code 137) |
+| `batch` | Requests 1000 CPUs | Unschedulable; no node can ever fit it |
+| `frontend` | Nothing; it is healthy | No issue (shows that healthy workloads are ignored) |
+
+Then run the agent against it:
 
 ```bash
-kubectl delete namespace agent-test
+pnpm demo:check --verbose
 ```
+
+`demo:check` passes extra flags on to `pnpm check`, so `--namespace agent-test`,
+`--no-llm` and `--output` work as usual. Other commands:
+
+| Command | What it does |
+| --- | --- |
+| `pnpm demo:status` | Show the demo nodes and pods |
+| `pnpm demo:reset` | Redeploy the workloads from scratch (for example, after fixing some) |
+| `pnpm demo:down` | Delete the cluster |
+| `pnpm test:e2e` | Run the end-to-end tests against the demo cluster |
+
+Details:
+
+- **Your kubectl context is not changed.** `kind create cluster` normally switches your
+  current context to the new cluster. The script writes the demo kubeconfig to
+  `.demo/kubeconfig` instead. To use `kubectl` against the demo cluster:
+  `export KUBECONFIG=$PWD/.demo/kubeconfig`.
+- **No install needed.** If `kind` is not on your `PATH`, the script downloads a pinned
+  version into `.demo/bin` and verifies its checksum.
+- **Learn by fixing.** Fix a workload (for example,
+  `kubectl set env deployment/web -n agent-test DATABASE_URL=postgres://db/app` with the
+  demo `KUBECONFIG`), run `pnpm demo:check` again, and watch the problem disappear from the report.
+  `pnpm demo:reset` breaks everything again.
+- **Other clusters.** The workloads are plain manifests, so `kubectl apply -f demo/workloads.yaml`
+  works on minikube or any test cluster too.
 
 ## Development
 
 | Command | Description |
 | --- | --- |
 | `pnpm check` | Run the health check |
-| `pnpm test` | Run unit tests (vitest) |
+| `pnpm test` | Run unit tests (vitest; no cluster or Ollama needed) |
+| `pnpm test:e2e` | Run end-to-end tests against the demo cluster (`pnpm demo:up` first) |
 | `pnpm typecheck` | Type-check `src/` and `test/` |
 | `pnpm build` | Compile `src/` to `dist/` |
 
@@ -354,6 +388,13 @@ rule catches.
 - **`corepack: /bin/sh^M: bad interpreter`:** the Windows Node install is ahead of the
   Linux one on your `PATH`. Install Node inside WSL (for example, with
   [nvm](https://github.com/nvm-sh/nvm)) and make sure its `bin` directory comes first.
+- **`kind create cluster` fails with `connection refused` on port 6443:** the API server
+  could not start, usually because of the Linux inotify limit when other clusters (for
+  example, minikube) are running too. `pnpm demo:up` warns about this. Raise the limit
+  with `sudo sysctl fs.inotify.max_user_instances=512`, or stop the other cluster, then
+  run `pnpm demo:up` again.
+- **`kubectl` says `current-context is not set` after `minikube stop`:** stopping minikube
+  removes its context from `~/.kube/config`. `minikube start` restores it.
 - **`Ignored build scripts: esbuild`:** pnpm 10+ blocks dependency install scripts by
   default. This repo allows `esbuild` in `pnpm-workspace.yaml`. Run `pnpm install` again.
 
@@ -363,6 +404,6 @@ rule catches.
 - [x] **Milestone 2:** LLM triage and investigation with read-only tools (`k8s_list_nodes`,
   `k8s_list_pods`, `k8s_describe_pod`, `k8s_get_logs`, `k8s_list_events`,
   `k8s_get_deployment`), a max-steps limit per problem, and truncation of large outputs
-- [ ] **Milestone 3:** kind demo cluster with deliberately broken workloads (crashloop,
+- [x] **Milestone 3:** kind demo cluster with deliberately broken workloads (crashloop,
   bad image, OOM, unschedulable)
 - [ ] **Milestone 4:** full README with architecture diagram and LLM-generated example report

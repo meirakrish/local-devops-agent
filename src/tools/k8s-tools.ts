@@ -145,6 +145,11 @@ export function describePodText(pod: V1Pod, events: EventSummary[]): string {
   return lines.join("\n");
 }
 
+/** The log text the kubelet returns when a run's logs are gone, or our own placeholders. */
+function isUnavailableLog(text: string): boolean {
+  return text === "(empty)" || text.startsWith("(no logs") || text.startsWith("unable to retrieve container logs");
+}
+
 /** Explains a missing namespace (and lists real ones) so the model can correct itself. */
 async function missingNamespaceHint(k8s: K8sClients, namespace: string): Promise<string | undefined> {
   try {
@@ -325,8 +330,20 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
         // the crash is in the previous run. Include it unless the caller said otherwise.
         const wantPrevious = previous ?? target.restarts > 0;
         const sections = [...notes];
-        if (wantPrevious) sections.push(`=== previous run of ${target.name} (last ${lines} lines) ===`, await read(true));
-        if (previous !== true) sections.push(`=== current run of ${target.name} (last ${lines} lines) ===`, await read(false));
+        let previousUnavailable = false;
+        if (wantPrevious) {
+          const text = await read(true);
+          previousUnavailable = isUnavailableLog(text);
+          sections.push(`=== previous run of ${target.name} (last ${lines} lines) ===`, text);
+        }
+        // Between restarts the crashed run is the *current* one (state: terminated) and the
+        // run before it may already be garbage-collected, so fall back to the current run.
+        if (previous !== true || previousUnavailable) {
+          const exited =
+            target.state === "terminated" ? `, already exited with code ${target.exitCode ?? "?"}` : "";
+          const why = previous === true ? " (previous run's logs are not available)" : "";
+          sections.push(`=== current run of ${target.name}${exited} (last ${lines} lines)${why} ===`, await read(false));
+        }
         return sections.join("\n");
       },
     ),

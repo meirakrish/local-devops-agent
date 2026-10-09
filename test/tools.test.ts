@@ -122,6 +122,44 @@ describe("k8s tools", () => {
     expect(out).toContain("(empty)");
   });
 
+  it("falls back to the current run when the previous run's logs are gone", async () => {
+    // Between restarts the crashed run is the current one, and the run before it has
+    // already been garbage-collected; the kubelet answers with this text.
+    const k8s = fakeK8s();
+    const core = k8s.core as unknown as Record<string, unknown>;
+    core["readNamespacedPodLog"] = async (args: { previous?: boolean }) =>
+      args.previous ? "unable to retrieve container logs for containerd://abc" : "FATAL: DATABASE_URL is not set\n";
+    core["readNamespacedPod"] = async () => ({
+      ...crashingPod,
+      status: {
+        phase: "Running",
+        containerStatuses: [
+          {
+            name: "app",
+            image: "busybox:1.36",
+            imageID: "",
+            ready: false,
+            restartCount: 4,
+            state: { terminated: { reason: "Error", exitCode: 1 } },
+          },
+        ],
+      },
+    });
+    const out = String(
+      await getTool(k8s, "k8s_get_logs").invoke({ namespace: "shop", pod: "web-1", previous: true }),
+    );
+    expect(out).toContain("unable to retrieve container logs");
+    expect(out).toContain("current run of app, already exited with code 1");
+    expect(out).toContain("previous run's logs are not available");
+    expect(out).toContain("FATAL: DATABASE_URL is not set");
+  });
+
+  it("returns only the previous run when asked and it is available", async () => {
+    const logCalls: { previous?: boolean }[] = [];
+    await getTool(fakeK8s(logCalls), "k8s_get_logs").invoke({ namespace: "shop", pod: "web-1", previous: true });
+    expect(logCalls.map((c) => c.previous)).toEqual([true]);
+  });
+
   it("returns API errors as text instead of throwing", async () => {
     const out = await getTool(fakeK8s(), "k8s_describe_pod").invoke({ namespace: "shop", name: "nope" });
     expect(out).toBe('Error: "nope" not found in namespace "shop". Check the exact name with a list tool.');
