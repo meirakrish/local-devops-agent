@@ -7,6 +7,7 @@ import type {
   PodSummary,
   Severity,
 } from "./types.js";
+import { formatCpu, formatMemory, parseQuantity } from "./quantity.js";
 
 /**
  * Deterministic, rule-based problem detection. In milestone 1 this is the whole
@@ -18,6 +19,8 @@ export interface RuleOptions {
   now: Date;
   /** Pending / not-ready pods younger than this are treated as still starting. */
   gracePeriodMinutes?: number;
+  /** Nodes, used to compare an unschedulable pod's requests with node capacity. */
+  nodes?: NodeSummary[];
 }
 
 const SEVERITY_RANK: Record<Severity, number> = { critical: 0, warning: 1, info: 2 };
@@ -84,14 +87,30 @@ function containerFindings(c: ContainerSummary, restartThreshold: number): Findi
   const findings: Finding[] = [];
   const detail = c.message ? `: ${c.message}` : "";
 
-  if (c.state === "waiting" && c.reason === "CrashLoopBackOff") {
+  // Checked first: "oom" explains a crash better than "crashloop".
+  if (c.lastTerminationReason === "OOMKilled" || c.reason === "OOMKilled") {
+    findings.push({
+      severity: "critical",
+      category: "oom",
+      evidence: `${label} was OOMKilled`,
+      hint: "Raise the container memory limit or reduce the app's memory usage.",
+    });
+  }
+
+  // A crashlooping container cycles waiting(CrashLoopBackOff) -> running -> terminated(Error),
+  // so a scan can catch it in the terminated phase too.
+  const crashedAfterRestarts =
+    c.state === "terminated" && !c.init && c.restarts > 0 && (c.exitCode ?? 0) !== 0;
+
+  if ((c.state === "waiting" && c.reason === "CrashLoopBackOff") || crashedAfterRestarts) {
     const last = c.lastTerminationReason
       ? ` (last exit: ${c.lastTerminationReason}, code ${c.lastExitCode ?? "?"})`
       : "";
+    const status = crashedAfterRestarts ? `exited with code ${c.exitCode} (crash loop)` : "is in CrashLoopBackOff";
     findings.push({
       severity: "critical",
       category: "crashloop",
-      evidence: `${label} is in CrashLoopBackOff${last}, ${c.restarts} restarts`,
+      evidence: `${label} ${status}${last}, ${c.restarts} restarts`,
       hint: "Read the previous container logs (`kubectl logs --previous`) to see why it exits.",
     });
   } else if (c.state === "waiting" && c.reason && IMAGE_ERRORS.has(c.reason)) {
@@ -110,15 +129,6 @@ function containerFindings(c: ContainerSummary, restartThreshold: number): Findi
     });
   }
 
-  if (c.lastTerminationReason === "OOMKilled" || c.reason === "OOMKilled") {
-    findings.push({
-      severity: "critical",
-      category: "oom",
-      evidence: `${label} was OOMKilled`,
-      hint: "Raise the container memory limit or reduce the app's memory usage.",
-    });
-  }
-
   if (c.restarts >= restartThreshold && !findings.some((f) => f.category === "crashloop")) {
     findings.push({
       severity: "warning",
@@ -128,6 +138,45 @@ function containerFindings(c: ContainerSummary, restartThreshold: number): Findi
     });
   }
   return findings;
+}
+
+/**
+ * Compares an unschedulable pod's requests with the largest node's allocatable
+ * resources. Done in code because a small model reads the numbers but does not
+ * reliably compare them (it once suggested *raising* a 64-CPU request on 12-CPU nodes).
+ */
+export function capacityFinding(pod: PodSummary, nodes: NodeSummary[]): { evidence: string; hint: string } | undefined {
+  const usable = nodes.filter((n) => n.ready && !n.unschedulable);
+  const pool = usable.length > 0 ? usable : nodes;
+  if (pool.length === 0) return undefined;
+
+  const checks = [
+    { name: "cpu", requested: pod.requests.cpu, fmt: formatCpu, key: "cpu" as const },
+    { name: "memory", requested: pod.requests.memory, fmt: formatMemory, key: "memory" as const },
+  ];
+  const tooBig: string[] = [];
+  const fits: string[] = [];
+  for (const c of checks) {
+    if (c.requested === undefined) continue;
+    const largest = Math.max(...pool.map((n) => parseQuantity(n.allocatable[c.key]) ?? 0));
+    if (largest <= 0) continue;
+    const text = `requests ${c.name}=${c.fmt(c.requested)}, largest node allocatable ${c.name}=${c.fmt(largest)}`;
+    (c.requested > largest ? tooBig : fits).push(text);
+  }
+
+  if (tooBig.length > 0) {
+    return {
+      evidence: `No node can ever fit this pod: ${tooBig.join("; ")}`,
+      hint: "Lower the pod's resource requests so they fit on a node, or add larger nodes. More nodes of the same size will not help.",
+    };
+  }
+  if (fits.length > 0) {
+    return {
+      evidence: `Pod would fit an empty node (${fits.join("; ")}), so other pods are using the capacity`,
+      hint: "Free capacity (scale down or right-size other workloads), add nodes, or lower this pod's requests.",
+    };
+  }
+  return undefined;
 }
 
 function ageMinutes(createdAt: string | undefined, now: Date): number {
@@ -146,12 +195,20 @@ export function podIssues(pod: PodSummary, opts: RuleOptions): Issue[] {
   );
 
   if (pod.phase === "Pending" && pod.unschedulable) {
+    const message = pod.unschedulable.message ?? pod.unschedulable.reason ?? "unknown reason";
+    // Only add capacity numbers when the scheduler says resources are the problem.
+    const capacity = /Insufficient (cpu|memory)/i.test(message) ? capacityFinding(pod, opts.nodes ?? []) : undefined;
     findings.push({
       severity: "critical",
       category: "unschedulable",
-      evidence: `Pod cannot be scheduled: ${pod.unschedulable.message ?? pod.unschedulable.reason ?? "unknown reason"}`,
-      hint: "Compare the pod's resource requests, nodeSelector/affinity and tolerations with available nodes.",
+      evidence: `Pod cannot be scheduled: ${message}`,
+      hint:
+        capacity?.hint ??
+        "Compare the pod's resource requests, nodeSelector/affinity and tolerations with available nodes.",
     });
+    if (capacity) {
+      findings.push({ severity: "critical", category: "unschedulable", evidence: capacity.evidence });
+    }
   } else if (pod.phase === "Pending" && oldEnough && findings.length === 0) {
     findings.push({
       severity: "warning",
@@ -236,7 +293,7 @@ export function deploymentIssues(d: DeploymentSummary): Issue[] {
 export function detectIssues(overview: ClusterOverview, opts: RuleOptions): Issue[] {
   const issues = [
     ...overview.nodes.flatMap(nodeIssues),
-    ...overview.pods.flatMap((p) => podIssues(p, opts)),
+    ...overview.pods.flatMap((p) => podIssues(p, { ...opts, nodes: opts.nodes ?? overview.nodes })),
     ...overview.deployments.flatMap(deploymentIssues),
   ];
   return issues.sort(

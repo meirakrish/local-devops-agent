@@ -47,6 +47,40 @@ describe("pod rules", () => {
     expect(issue?.evidence).toHaveLength(1);
   });
 
+  it("flags a crashloop caught in its terminated phase", () => {
+    const [issue] = issuesFor(
+      pod({
+        phase: "Running",
+        containerStatuses: [
+          container({
+            restartCount: 3,
+            state: { terminated: { reason: "Error", exitCode: 1 } },
+            lastState: { terminated: { reason: "Error", exitCode: 1 } },
+          }),
+        ],
+      }),
+    );
+    expect(issue?.category).toBe("crashloop");
+    expect(issue?.evidence[0]).toContain("exited with code 1 (crash loop)");
+  });
+
+  it("prefers oom over crashloop when a container is OOMKilled in a loop", () => {
+    const [issue] = issuesFor(
+      pod({
+        phase: "Running",
+        containerStatuses: [
+          container({
+            restartCount: 4,
+            state: { waiting: { reason: "CrashLoopBackOff" } },
+            lastState: { terminated: { reason: "OOMKilled", exitCode: 137 } },
+          }),
+        ],
+      }),
+    );
+    expect(issue?.category).toBe("oom");
+    expect(issue?.evidence).toHaveLength(2);
+  });
+
   it("flags image pull errors", () => {
     const [issue] = issuesFor(
       pod({
@@ -94,6 +128,40 @@ describe("pod rules", () => {
     );
     expect(issue?.category).toBe("unschedulable");
     expect(issue?.evidence[0]).toContain("Insufficient memory");
+  });
+
+  describe("unschedulable capacity check", () => {
+    const nodes = [
+      { name: "n1", ready: true, roles: ["worker"], pressures: [], unschedulable: false, allocatable: { cpu: "12", memory: "16Gi" } },
+      { name: "n2", ready: true, roles: ["worker"], pressures: [], unschedulable: false, allocatable: { cpu: "8", memory: "8Gi" } },
+    ];
+    const pendingPod = (cpu: string) =>
+      summarizePod({
+        ...pod({
+          phase: "Pending",
+          conditions: [{ type: "PodScheduled", status: "False", reason: "Unschedulable", message: "0/2 nodes are available: 2 Insufficient cpu." }],
+        }),
+        spec: { containers: [{ name: "app", resources: { requests: { cpu } } }] },
+      });
+
+    it("says no node can ever fit a pod bigger than the largest node", () => {
+      const [issue] = podIssues(pendingPod("64"), { ...OPTS, nodes });
+      expect(issue?.evidence).toContain(
+        "No node can ever fit this pod: requests cpu=64, largest node allocatable cpu=12",
+      );
+      expect(issue?.hint).toContain("Lower the pod's resource requests");
+    });
+
+    it("says capacity is used by other pods when the pod would fit an empty node", () => {
+      const [issue] = podIssues(pendingPod("4"), { ...OPTS, nodes });
+      expect(issue?.evidence[1]).toContain("would fit an empty node");
+      expect(issue?.hint).toContain("Free capacity");
+    });
+
+    it("adds nothing when node data is unavailable", () => {
+      const [issue] = podIssues(pendingPod("64"), OPTS);
+      expect(issue?.evidence).toHaveLength(1);
+    });
   });
 
   it("ignores young Pending pods but flags old ones", () => {

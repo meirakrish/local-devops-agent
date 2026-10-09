@@ -4,6 +4,7 @@ import { parseArgs } from "node:util";
 import { loadConfig } from "./config.js";
 import { buildGraph } from "./graph.js";
 import { createK8sClients } from "./k8s/client.js";
+import { createOllamaLlm } from "./llm/model.js";
 import { overallStatus } from "./report/markdown.js";
 
 /** Exit codes: 0 = healthy or warnings only, 2 = critical issues, 1 = the check itself failed. */
@@ -18,7 +19,8 @@ Runs a read-only health check of the current Kubernetes cluster.
 Options:
   -n, --namespace <name>  Only check this namespace (nodes are always checked)
   -o, --output <file>     Also save the report as markdown to <file>
-  -v, --verbose           Log each step to stderr
+  -v, --verbose           Log each step and tool call to stderr
+      --no-llm            Skip LLM triage/investigation (rule-based report only)
   -h, --help              Show this help
 
 Exit codes: 0 healthy/warnings, 2 critical issues found, 1 error`;
@@ -31,6 +33,7 @@ async function main(): Promise<number> {
       namespace: { type: "string", short: "n" },
       output: { type: "string", short: "o" },
       verbose: { type: "boolean", short: "v", default: false },
+      "no-llm": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
     strict: true,
@@ -49,7 +52,8 @@ async function main(): Promise<number> {
   const k8s = createK8sClients(config.kubeconfigPath);
   log?.(`using kube context "${k8s.context}", model "${config.model}" at ${config.ollamaUrl}`);
 
-  const graph = buildGraph({ config, k8s, namespace: values.namespace, log });
+  const llm = values["no-llm"] ? undefined : createOllamaLlm(config);
+  const graph = buildGraph({ config, k8s, namespace: values.namespace, llm, log });
   const result = await graph.invoke({});
 
   console.log(result.markdown);

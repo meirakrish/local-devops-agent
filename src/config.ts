@@ -8,6 +8,9 @@ const ConfigSchema = z.object({
   MAX_STEPS_PER_PROBLEM: z.coerce.number().int().positive().default(6),
   RESTART_THRESHOLD: z.coerce.number().int().positive().default(5),
   EVENT_WINDOW_MINUTES: z.coerce.number().int().positive().default(60),
+  MAX_PROBLEMS: z.coerce.number().int().positive().default(5),
+  NUM_CTX: z.coerce.number().int().min(2048).default(16384),
+  TOOL_OUTPUT_MAX_CHARS: z.coerce.number().int().min(500).default(4000),
 });
 
 export interface Config {
@@ -17,6 +20,12 @@ export interface Config {
   maxStepsPerProblem: number;
   restartThreshold: number;
   eventWindowMinutes: number;
+  /** Max problems the LLM investigates per run. */
+  maxProblems: number;
+  /** Ollama context window. Ollama's default is small and silently truncates prompts. */
+  numCtx: number;
+  /** Tool outputs longer than this are truncated before they reach the LLM. */
+  toolOutputMaxChars: number;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -36,5 +45,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     maxStepsPerProblem: c.MAX_STEPS_PER_PROBLEM,
     restartThreshold: c.RESTART_THRESHOLD,
     eventWindowMinutes: c.EVENT_WINDOW_MINUTES,
+    maxProblems: c.MAX_PROBLEMS,
+    numCtx: c.NUM_CTX,
+    toolOutputMaxChars: c.TOOL_OUTPUT_MAX_CHARS,
   };
 }

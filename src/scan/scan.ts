@@ -1,4 +1,5 @@
 import type { K8sClients } from "../k8s/client.js";
+import { k8sErrorMessage } from "../k8s/errors.js";
 import {
   summarizeDeployment,
   summarizeEvent,
@@ -12,16 +13,6 @@ export interface ScanOptions {
   eventWindowMinutes: number;
   maxEvents?: number;
   now?: Date;
-}
-
-function errorMessage(err: unknown): string {
-  if (err && typeof err === "object") {
-    const e = err as { code?: number; message?: string };
-    if (e.code === 403) return "forbidden (check RBAC permissions)";
-    if (e.code === 404) return "not found";
-    if (e.message) return e.message.split("\n")[0]!;
-  }
-  return String(err);
 }
 
 /** Keeps warning events inside the time window, newest first. */
@@ -53,7 +44,7 @@ export async function scanCluster(k8s: K8sClients, opts: ScanOptions): Promise<C
     try {
       await k8s.core.readNamespace({ name: ns });
     } catch (err) {
-      throw new Error(`Cannot read namespace "${ns}": ${errorMessage(err)}`);
+      throw new Error(`Cannot read namespace "${ns}": ${k8sErrorMessage(err)}`);
     }
   }
 
@@ -72,7 +63,7 @@ export async function scanCluster(k8s: K8sClients, opts: ScanOptions): Promise<C
 
   function items<T>(label: string, result: PromiseSettledResult<{ items: T[] }>): T[] {
     if (result.status === "fulfilled") return result.value.items;
-    errors.push(`list ${label}: ${errorMessage(result.reason)}`);
+    errors.push(`list ${label}: ${k8sErrorMessage(result.reason)}`);
     return [];
   }
 
