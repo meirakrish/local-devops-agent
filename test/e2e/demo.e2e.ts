@@ -1,0 +1,90 @@
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
+import { beforeAll, describe, expect, it } from "vitest";
+import { createK8sClients } from "../../src/k8s/client.js";
+import { detectIssues } from "../../src/scan/rules.js";
+import { scanCluster } from "../../src/scan/scan.js";
+import type { ClusterOverview, Issue } from "../../src/scan/types.js";
+
+/**
+ * Runs the real scan and rules against the kind demo cluster (no LLM, so results are
+ * deterministic). Start the cluster first with `pnpm demo:up`, which waits until every
+ * workload has reached its broken state.
+ */
+const KUBECONFIG = resolve(process.env["DEMO_KUBECONFIG"] ?? ".demo/kubeconfig");
+const NAMESPACE = "agent-test";
+
+let overview: ClusterOverview;
+let issues: Issue[];
+
+/** Issues for the pods of one demo deployment (pod names start with "<deployment>-"). */
+const podIssuesOf = (deployment: string) =>
+  issues.filter((i) => i.resource.kind === "Pod" && i.resource.name.startsWith(`${deployment}-`));
+
+beforeAll(async () => {
+  if (!existsSync(KUBECONFIG)) {
+    throw new Error(`No demo kubeconfig at ${KUBECONFIG}. Start the demo cluster with: pnpm demo:up`);
+  }
+  const now = new Date();
+  overview = await scanCluster(createK8sClients(KUBECONFIG), {
+    namespace: NAMESPACE,
+    eventWindowMinutes: 60,
+    now,
+  });
+  issues = detectIssues(overview, { restartThreshold: 5, now });
+});
+
+describe("demo cluster scan", () => {
+  it("scans both nodes and the demo namespace without errors", () => {
+    expect(overview.context).toBe("kind-devops-agent-demo");
+    expect(overview.errors).toEqual([]);
+    expect(overview.nodes).toHaveLength(2);
+    expect(overview.nodes.every((n) => n.ready)).toBe(true);
+    expect(overview.deployments.map((d) => d.name).sort()).toEqual(
+      ["batch", "cache", "frontend", "payments", "web"],
+    );
+  });
+
+  it("detects the crashloop in web", () => {
+    expect(podIssuesOf("web").map((i) => i.category)).toContain("crashloop");
+  });
+
+  it("detects the bad image in payments", () => {
+    expect(podIssuesOf("payments").map((i) => i.category)).toEqual(["image-pull"]);
+  });
+
+  it("detects the OOM kill in cache", () => {
+    expect(podIssuesOf("cache").map((i) => i.category)).toEqual(["oom"]);
+  });
+
+  it("detects the unschedulable batch pod and explains that no node can fit it", () => {
+    const [issue] = podIssuesOf("batch");
+    expect(issue?.category).toBe("unschedulable");
+    expect(issue?.evidence.join("\n")).toMatch(/No node can ever fit this pod: requests cpu=1000/);
+  });
+
+  it("reports no issues for the healthy frontend", () => {
+    expect(issues.filter((i) => i.resource.name.startsWith("frontend"))).toEqual([]);
+  });
+
+  it("marks the broken deployments as critical", () => {
+    const unavailable = issues
+      .filter((i) => i.resource.kind === "Deployment" && i.category === "replicas-unavailable")
+      .map((i) => i.resource.name)
+      .sort();
+    expect(unavailable).toEqual(["batch", "cache", "payments", "web"]);
+  });
+});
+
+describe("CLI against the demo cluster", () => {
+  it("exits with code 2 (critical issues) and prints the report", () => {
+    const result = spawnSync("pnpm", ["-s", "check", "--namespace", NAMESPACE, "--no-llm"], {
+      env: { ...process.env, KUBECONFIG },
+      encoding: "utf8",
+    });
+    expect(result.status).toBe(2);
+    expect(result.stdout).toContain("**Status: CRITICAL**");
+    expect(result.stdout).toContain("Context: `kind-devops-agent-demo`");
+  });
+});

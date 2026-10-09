@@ -1,0 +1,10 @@
+# kind cluster for the demo: one control-plane node and one worker, like a minimal
+# real cluster (and like the minikube setup the agent was developed against).
+# The Kubernetes version comes from the node image that the pinned kind version
+# (KIND_VERSION in scripts/demo.sh) uses by default.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: devops-agent-demo
+nodes:
+  - role: control-plane
+  - role: worker
