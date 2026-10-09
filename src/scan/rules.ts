@@ -1,0 +1,245 @@
+import type {
+  ClusterOverview,
+  ContainerSummary,
+  DeploymentSummary,
+  Issue,
+  NodeSummary,
+  PodSummary,
+  Severity,
+} from "./types.js";
+
+/**
+ * Deterministic, rule-based problem detection. In milestone 1 this is the whole
+ * "analysis"; later it gives the LLM triage step a list of candidate problems.
+ */
+
+export interface RuleOptions {
+  restartThreshold: number;
+  now: Date;
+  /** Pending / not-ready pods younger than this are treated as still starting. */
+  gracePeriodMinutes?: number;
+}
+
+const SEVERITY_RANK: Record<Severity, number> = { critical: 0, warning: 1, info: 2 };
+
+export function compareSeverity(a: Severity, b: Severity): number {
+  return SEVERITY_RANK[a] - SEVERITY_RANK[b];
+}
+
+function worst(severities: Severity[]): Severity {
+  return [...severities].sort(compareSeverity)[0] ?? "info";
+}
+
+const IMAGE_ERRORS = new Set(["ImagePullBackOff", "ErrImagePull", "InvalidImageName", "ErrImageNeverPull"]);
+const CONFIG_ERRORS = new Set(["CreateContainerConfigError", "CreateContainerError", "RunContainerError"]);
+
+export function nodeIssues(node: NodeSummary): Issue[] {
+  const issues: Issue[] = [];
+  const resource = { kind: "Node", name: node.name };
+  if (!node.ready) {
+    issues.push({
+      id: `node/${node.name}:not-ready`,
+      severity: "critical",
+      category: "node-not-ready",
+      resource,
+      title: `Node ${node.name} is NotReady`,
+      evidence: [node.readyMessage ?? "Ready condition is not True"],
+      hint: "Check kubelet / container runtime on the node and its conditions (`kubectl describe node`).",
+    });
+  }
+  if (node.pressures.length > 0) {
+    issues.push({
+      id: `node/${node.name}:pressure`,
+      severity: "warning",
+      category: "node-pressure",
+      resource,
+      title: `Node ${node.name} reports ${node.pressures.join(", ")}`,
+      evidence: node.pressures.map((p) => `${p}=True`),
+      hint: "Look for pods using excessive memory/disk on this node; pods may be evicted.",
+    });
+  }
+  if (node.unschedulable) {
+    issues.push({
+      id: `node/${node.name}:cordoned`,
+      severity: "info",
+      category: "node-cordoned",
+      resource,
+      title: `Node ${node.name} is cordoned (unschedulable)`,
+      evidence: ["spec.unschedulable=true"],
+      hint: "Expected during maintenance; uncordon when done.",
+    });
+  }
+  return issues;
+}
+
+interface Finding {
+  severity: Severity;
+  category: string;
+  evidence: string;
+  hint?: string;
+}
+
+function containerFindings(c: ContainerSummary, restartThreshold: number): Finding[] {
+  const label = `${c.init ? "init container" : "container"} ${c.name}`;
+  const findings: Finding[] = [];
+  const detail = c.message ? `: ${c.message}` : "";
+
+  if (c.state === "waiting" && c.reason === "CrashLoopBackOff") {
+    const last = c.lastTerminationReason
+      ? ` (last exit: ${c.lastTerminationReason}, code ${c.lastExitCode ?? "?"})`
+      : "";
+    findings.push({
+      severity: "critical",
+      category: "crashloop",
+      evidence: `${label} is in CrashLoopBackOff${last}, ${c.restarts} restarts`,
+      hint: "Read the previous container logs (`kubectl logs --previous`) to see why it exits.",
+    });
+  } else if (c.state === "waiting" && c.reason && IMAGE_ERRORS.has(c.reason)) {
+    findings.push({
+      severity: "critical",
+      category: "image-pull",
+      evidence: `${label} is waiting: ${c.reason}${detail}`,
+      hint: "Check the image name/tag exists and that pull credentials (imagePullSecrets) are set.",
+    });
+  } else if (c.state === "waiting" && c.reason && CONFIG_ERRORS.has(c.reason)) {
+    findings.push({
+      severity: "critical",
+      category: "container-config",
+      evidence: `${label} is waiting: ${c.reason}${detail}`,
+      hint: "Usually a missing ConfigMap/Secret or bad env/volume reference; check pod events.",
+    });
+  }
+
+  if (c.lastTerminationReason === "OOMKilled" || c.reason === "OOMKilled") {
+    findings.push({
+      severity: "critical",
+      category: "oom",
+      evidence: `${label} was OOMKilled`,
+      hint: "Raise the container memory limit or reduce the app's memory usage.",
+    });
+  }
+
+  if (c.restarts >= restartThreshold && !findings.some((f) => f.category === "crashloop")) {
+    findings.push({
+      severity: "warning",
+      category: "high-restarts",
+      evidence: `${label} restarted ${c.restarts} times`,
+      hint: "Check previous logs and liveness probe settings.",
+    });
+  }
+  return findings;
+}
+
+function ageMinutes(createdAt: string | undefined, now: Date): number {
+  if (!createdAt) return Number.POSITIVE_INFINITY;
+  return (now.getTime() - new Date(createdAt).getTime()) / 60_000;
+}
+
+export function podIssues(pod: PodSummary, opts: RuleOptions): Issue[] {
+  // Completed Job pods are healthy.
+  if (pod.phase === "Succeeded") return [];
+
+  const grace = opts.gracePeriodMinutes ?? 5;
+  const oldEnough = ageMinutes(pod.createdAt, opts.now) >= grace;
+  const findings: Finding[] = pod.containers.flatMap((c) =>
+    containerFindings(c, opts.restartThreshold),
+  );
+
+  if (pod.phase === "Pending" && pod.unschedulable) {
+    findings.push({
+      severity: "critical",
+      category: "unschedulable",
+      evidence: `Pod cannot be scheduled: ${pod.unschedulable.message ?? pod.unschedulable.reason ?? "unknown reason"}`,
+      hint: "Compare the pod's resource requests, nodeSelector/affinity and tolerations with available nodes.",
+    });
+  } else if (pod.phase === "Pending" && oldEnough && findings.length === 0) {
+    findings.push({
+      severity: "warning",
+      category: "pending",
+      evidence: "Pod has been Pending longer than the grace period",
+      hint: "Check pod events for volume, image or scheduling problems.",
+    });
+  }
+
+  if (pod.phase === "Failed") {
+    findings.push({
+      severity: "warning",
+      category: pod.reason === "Evicted" ? "evicted" : "pod-failed",
+      evidence: `Pod phase is Failed${pod.reason ? ` (${pod.reason})` : ""}${pod.message ? `: ${pod.message}` : ""}`,
+      hint:
+        pod.reason === "Evicted"
+          ? "The node ran short on resources; check node pressure and pod requests/limits."
+          : "Inspect container exit codes and logs.",
+    });
+  }
+
+  if (
+    pod.phase === "Running" &&
+    oldEnough &&
+    findings.length === 0 &&
+    pod.readyContainers < pod.totalContainers
+  ) {
+    findings.push({
+      severity: "warning",
+      category: "not-ready",
+      evidence: `Only ${pod.readyContainers}/${pod.totalContainers} containers ready`,
+      hint: "Usually a failing readiness probe; check pod events and the probe endpoint.",
+    });
+  }
+
+  if (findings.length === 0) return [];
+  const primary = [...findings].sort((a, b) => compareSeverity(a.severity, b.severity))[0]!;
+  return [
+    {
+      id: `pod/${pod.namespace}/${pod.name}:${primary.category}`,
+      severity: worst(findings.map((f) => f.severity)),
+      category: primary.category,
+      resource: { kind: "Pod", namespace: pod.namespace, name: pod.name },
+      title: `Pod ${pod.namespace}/${pod.name}: ${primary.category}`,
+      evidence: findings.map((f) => f.evidence),
+      hint: primary.hint,
+    },
+  ];
+}
+
+export function deploymentIssues(d: DeploymentSummary): Issue[] {
+  const resource = { kind: "Deployment", namespace: d.namespace, name: d.name };
+  const progressing = d.conditions.find((c) => c.type === "Progressing");
+  const issues: Issue[] = [];
+
+  if (progressing?.status === "False" && progressing.reason === "ProgressDeadlineExceeded") {
+    issues.push({
+      id: `deployment/${d.namespace}/${d.name}:rollout-stuck`,
+      severity: "critical",
+      category: "rollout-stuck",
+      resource,
+      title: `Deployment ${d.namespace}/${d.name} rollout exceeded its progress deadline`,
+      evidence: [progressing.message ?? "Progressing=False (ProgressDeadlineExceeded)"],
+      hint: "Inspect the new ReplicaSet's pods; consider `kubectl rollout undo` after finding the cause.",
+    });
+  }
+
+  if (d.desired > 0 && d.ready < d.desired) {
+    issues.push({
+      id: `deployment/${d.namespace}/${d.name}:unavailable`,
+      severity: d.ready === 0 ? "critical" : "warning",
+      category: "replicas-unavailable",
+      resource,
+      title: `Deployment ${d.namespace}/${d.name} has ${d.ready}/${d.desired} replicas ready`,
+      evidence: [`desired=${d.desired} ready=${d.ready} available=${d.available} updated=${d.updated}`],
+      hint: "See the pod issues for this deployment for the underlying cause.",
+    });
+  }
+  return issues;
+}
+
+export function detectIssues(overview: ClusterOverview, opts: RuleOptions): Issue[] {
+  const issues = [
+    ...overview.nodes.flatMap(nodeIssues),
+    ...overview.pods.flatMap((p) => podIssues(p, opts)),
+    ...overview.deployments.flatMap(deploymentIssues),
+  ];
+  return issues.sort(
+    (a, b) => compareSeverity(a.severity, b.severity) || a.id.localeCompare(b.id),
+  );
+}
