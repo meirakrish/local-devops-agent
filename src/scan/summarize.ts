@@ -1,5 +1,6 @@
 import type {
   CoreV1Event,
+  V1Container,
   V1ContainerStatus,
   V1Deployment,
   V1Node,
@@ -12,6 +13,7 @@ import type {
   NodeSummary,
   PodSummary,
 } from "./types.js";
+import { parseQuantity } from "./quantity.js";
 
 const PRESSURE_CONDITIONS = ["MemoryPressure", "DiskPressure", "PIDPressure", "NetworkUnavailable"];
 
@@ -60,6 +62,23 @@ function summarizeContainer(cs: V1ContainerStatus, init: boolean): ContainerSumm
   };
 }
 
+/**
+ * Requests the scheduler uses for a pod: the sum over app containers, or the largest
+ * init container if that is bigger (init containers run one at a time, before the app).
+ */
+export function podRequests(containers: V1Container[], initContainers: V1Container[] = []) {
+  const total = (resource: "cpu" | "memory") => {
+    const values = (list: V1Container[]) =>
+      list.map((c) => parseQuantity(c.resources?.requests?.[resource]));
+    const app = values(containers);
+    const init = values(initContainers);
+    if ([...app, ...init].every((v) => v === undefined)) return undefined;
+    const sum = app.reduce<number>((a, v) => a + (v ?? 0), 0);
+    return Math.max(sum, ...init.map((v) => v ?? 0));
+  };
+  return { cpu: total("cpu"), memory: total("memory") };
+}
+
 export function summarizePod(pod: V1Pod): PodSummary {
   const status = pod.status ?? {};
   const containers = [
@@ -83,6 +102,7 @@ export function summarizePod(pod: V1Pod): PodSummary {
     totalContainers: Math.max(appContainers.length, pod.spec?.containers.length ?? 0),
     restarts: containers.reduce((sum, c) => sum + c.restarts, 0),
     containers,
+    requests: podRequests(pod.spec?.containers ?? [], pod.spec?.initContainers ?? []),
     unschedulable:
       scheduled?.status === "False"
         ? { reason: scheduled.reason, message: scheduled.message }

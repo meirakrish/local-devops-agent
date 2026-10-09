@@ -1,3 +1,4 @@
+import type { Finding } from "../agent/types.js";
 import type { OllamaStatus } from "../llm/ollama.js";
 import type { ClusterOverview, Issue, Severity } from "../scan/types.js";
 
@@ -31,13 +32,52 @@ function renderIssue(issue: Issue): string {
   return lines.join("\n");
 }
 
+function resourceName(i: Issue): string {
+  return `${i.resource.kind} ${i.resource.namespace ? `${i.resource.namespace}/` : ""}${i.resource.name}`;
+}
+
+function renderFinding(f: Finding, index: number): string {
+  const { problem } = f;
+  const affected = [problem.primary, ...problem.related].map(resourceName);
+  const lines = [
+    `### ${index}. [${problem.severity.toUpperCase()}] ${f.error ? problem.primary.title : truncate(f.summary, 160)}`,
+    "",
+    `**Affected:** ${[...new Set(affected)].join(", ")}`,
+    "",
+  ];
+  if (f.error) {
+    lines.push(`_LLM investigation failed: ${truncate(f.error, 200)}. Rule-based evidence:_`, "");
+    for (const e of problem.primary.evidence) lines.push(`- ${truncate(e, 300)}`);
+    if (problem.primary.hint) lines.push("", `_Suggested next step:_ ${problem.primary.hint}`);
+    return lines.join("\n");
+  }
+  lines.push(`**Root cause:** ${f.rootCause}`, "");
+  if (f.evidence.length > 0) {
+    lines.push("**Evidence:**", "", ...f.evidence.map((e) => `- ${truncate(e, 300)}`), "");
+  }
+  if (f.suggestedFix.length > 0) {
+    lines.push("**Suggested fix** (not applied):", "", ...f.suggestedFix.map((s, i) => `${i + 1}. ${s}`), "");
+  }
+  lines.push(`_Confidence: ${f.confidence} · ${f.toolCalls} tool call(s)_`);
+  return lines.join("\n");
+}
+
 export interface ReportInput {
   overview: ClusterOverview;
   issues: Issue[];
   ollama?: OllamaStatus;
+  findings?: Finding[];
+  /** Why the LLM steps did not run, if they did not. */
+  llmSkipped?: string;
 }
 
-export function renderMarkdownReport({ overview, issues, ollama }: ReportInput): string {
+export function renderMarkdownReport({
+  overview,
+  issues,
+  ollama,
+  findings = [],
+  llmSkipped,
+}: ReportInput): string {
   const status = overallStatus(issues);
   const count = (s: Severity) => issues.filter((i) => i.severity === s).length;
   const readyNodes = overview.nodes.filter((n) => n.ready).length;
@@ -61,16 +101,27 @@ export function renderMarkdownReport({ overview, issues, ollama }: ReportInput):
     `| Deployments fully ready | ${healthyDeployments}/${overview.deployments.length} |`,
     `| Warning events (recent) | ${overview.warningEvents.length} |`,
     `| Issues | ${count("critical")} critical, ${count("warning")} warning, ${count("info")} info |`,
-    "",
-    "## Issues",
+    `| Investigated by LLM | ${findings.length > 0 ? `${findings.length} problem(s)` : "none"} |`,
     "",
   ];
 
+  if (findings.length > 0) {
+    out.push("## Investigated problems", "");
+    findings.forEach((f, i) => out.push(renderFinding(f, i + 1), ""));
+  }
+
+  // Issues already covered by an investigated problem are not repeated.
+  const covered = new Set(findings.flatMap((f) => [f.problem.primary, ...f.problem.related].map((i) => i.id)));
+  const remaining = issues.filter((i) => !covered.has(i.id));
+  out.push(findings.length > 0 ? "## Other issues (rule-based)" : "## Issues", "");
+
   if (issues.length === 0) {
     out.push("No issues detected.", "");
+  } else if (remaining.length === 0) {
+    out.push("None; all issues are covered above.", "");
   } else {
     for (const severity of ["critical", "warning", "info"] as const) {
-      const group = issues.filter((i) => i.severity === severity);
+      const group = remaining.filter((i) => i.severity === severity);
       if (group.length === 0) continue;
       out.push(`### ${SECTION_TITLES[severity]} (${group.length})`, "");
       for (const issue of group) out.push(renderIssue(issue), "");
@@ -99,10 +150,12 @@ export function renderMarkdownReport({ overview, issues, ollama }: ReportInput):
     if (!ollama.reachable) out.push(`- LLM: ${ollama.error}`);
     else if (!ollama.modelAvailable)
       out.push(`- LLM: Ollama reachable, but model \`${ollama.model}\` is not pulled (\`ollama pull ${ollama.model}\`)`);
-    else out.push(`- LLM: \`${ollama.model}\` available at ${ollama.url}`);
+    else out.push(`- LLM: \`${ollama.model}\` at ${ollama.url}`);
   }
+  if (llmSkipped) out.push(`- LLM investigation skipped: ${llmSkipped}.`);
   out.push(
-    "- Findings are rule-based (milestone 1). Suggestions are never applied automatically.",
+    "- Issues are detected by rules; root causes in \"Investigated problems\" come from the local LLM and may be wrong.",
+    "- Suggested fixes are never applied automatically.",
     "",
   );
   return out.join("\n");

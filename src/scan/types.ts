@@ -45,6 +45,8 @@ export interface PodSummary {
   totalContainers: number;
   restarts: number;
   containers: ContainerSummary[];
+  /** Effective resource requests: CPU in cores, memory in bytes (what the scheduler uses). */
+  requests: { cpu?: number; memory?: number };
   /** Set when the scheduler could not place the pod (PodScheduled=False). */
   unschedulable?: { reason?: string; message?: string };
 }
