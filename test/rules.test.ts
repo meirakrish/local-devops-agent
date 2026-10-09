@@ -270,6 +270,8 @@ describe("detectIssues", () => {
       ],
       deployments: [],
       warningEvents: [],
+      controlPlane: { notVisible: [] },
+      webhooks: [],
       errors: [],
     };
     expect(detectIssues(overview, OPTS).map((i) => i.severity)).toEqual(["critical", "warning"]);

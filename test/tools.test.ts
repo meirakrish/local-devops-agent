@@ -91,7 +91,7 @@ function getTool(k8s: K8sClients, name: string) {
 }
 
 describe("k8s tools", () => {
-  it("exposes exactly the six read-only tools", () => {
+  it("exposes exactly the seven read-only tools", () => {
     expect(createK8sTools(fakeK8s(), { maxChars: 4000 }).map((t) => t.name)).toEqual([
       "k8s_list_nodes",
       "k8s_list_pods",
@@ -99,6 +99,7 @@ describe("k8s tools", () => {
       "k8s_get_logs",
       "k8s_list_events",
       "k8s_get_deployment",
+      "k8s_cluster_health",
     ]);
   });
 

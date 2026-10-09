@@ -1,5 +1,6 @@
 import type { K8sClients } from "../k8s/client.js";
 import { k8sErrorMessage } from "../k8s/errors.js";
+import { addNodeUsage, collectControlPlane, collectWebhooks } from "./collect-cluster.js";
 import {
   summarizeDeployment,
   summarizeEvent,
@@ -49,7 +50,8 @@ export async function scanCluster(k8s: K8sClients, opts: ScanOptions): Promise<C
   }
 
   const warningOnly = { fieldSelector: "type=Warning" };
-  const [nodes, namespaces, pods, deployments, events] = await Promise.allSettled([
+  // Cluster-level checks (control plane, etcd, webhooks) run regardless of --namespace.
+  const [nodes, namespaces, pods, deployments, events, controlPlane, webhooks] = await Promise.allSettled([
     k8s.core.listNode(),
     ns ? Promise.resolve({ items: [{ metadata: { name: ns } }] }) : k8s.core.listNamespace(),
     ns ? k8s.core.listNamespacedPod({ namespace: ns }) : k8s.core.listPodForAllNamespaces(),
@@ -59,6 +61,8 @@ export async function scanCluster(k8s: K8sClients, opts: ScanOptions): Promise<C
     ns
       ? k8s.core.listNamespacedEvent({ namespace: ns, ...warningOnly })
       : k8s.core.listEventForAllNamespaces(warningOnly),
+    collectControlPlane(k8s),
+    collectWebhooks(k8s),
   ]);
 
   function items<T>(label: string, result: PromiseSettledResult<{ items: T[] }>): T[] {
@@ -66,6 +70,21 @@ export async function scanCluster(k8s: K8sClients, opts: ScanOptions): Promise<C
     errors.push(`list ${label}: ${k8sErrorMessage(result.reason)}`);
     return [];
   }
+
+  // Node usage needs the pods of every namespace, even when --namespace limits the scan.
+  const nodeSummaries = items("nodes", nodes).map(summarizeNode);
+  let allPods = items("pods", pods);
+  if (ns) {
+    try {
+      allPods = (await k8s.core.listPodForAllNamespaces()).items;
+    } catch (err) {
+      errors.push(`list pods of all namespaces (node usage): ${k8sErrorMessage(err)}`);
+      allPods = [];
+    }
+  }
+  await addNodeUsage(k8s, nodeSummaries, allPods, errors);
+
+  if (webhooks.status === "rejected") errors.push(`list admission webhooks: ${k8sErrorMessage(webhooks.reason)}`);
 
   return {
     context: k8s.context,
@@ -75,7 +94,7 @@ export async function scanCluster(k8s: K8sClients, opts: ScanOptions): Promise<C
       .map((n) => n.metadata?.name ?? "")
       .filter(Boolean)
       .sort(),
-    nodes: items("nodes", nodes).map(summarizeNode),
+    nodes: nodeSummaries,
     pods: items("pods", pods).map(summarizePod),
     deployments: items("deployments", deployments).map(summarizeDeployment),
     warningEvents: recentEvents(
@@ -84,6 +103,11 @@ export async function scanCluster(k8s: K8sClients, opts: ScanOptions): Promise<C
       opts.eventWindowMinutes,
       opts.maxEvents ?? 50,
     ),
+    controlPlane:
+      controlPlane.status === "fulfilled"
+        ? controlPlane.value
+        : { notVisible: [`control plane: ${k8sErrorMessage(controlPlane.reason)}`] },
+    webhooks: webhooks.status === "fulfilled" ? webhooks.value : [],
     errors,
   };
 }

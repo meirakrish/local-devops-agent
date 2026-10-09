@@ -1,0 +1,17 @@
+# HELP apiserver_resource_objects [ALPHA] Number of stored objects at the time of last check split by kind. In case of a fetching error, the value will be -1.
+# TYPE apiserver_resource_objects gauge
+# HELP apiserver_storage_size_bytes [STABLE] Size of the storage database file physically allocated in bytes.
+# TYPE apiserver_storage_size_bytes gauge
+apiserver_storage_size_bytes{storage_cluster_id="etcd-0"} 3.923968e+06
+apiserver_resource_objects{group="",resource="configmaps"} 14
+apiserver_resource_objects{group="",resource="endpoints"} 2
+apiserver_resource_objects{group="",resource="events"} 10
+apiserver_resource_objects{group="",resource="limitranges"} 0
+apiserver_resource_objects{group="",resource="namespaces"} 6
+apiserver_resource_objects{group="",resource="nodes"} 2
+apiserver_request_total{code="200",component="",dry_run="",group="",resource="",scope="",subresource="/healthz",verb="GET",version=""} 2
+apiserver_request_total{code="200",component="",dry_run="",group="",resource="",scope="",subresource="/livez",verb="GET",version=""} 652
+apiserver_request_total{code="200",component="",dry_run="",group="",resource="",scope="",subresource="/readyz",verb="GET",version=""} 6505
+# HELP go_goroutines Number of goroutines that currently exist.
+# TYPE go_goroutines gauge
+go_goroutines 2621

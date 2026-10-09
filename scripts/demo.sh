@@ -102,13 +102,14 @@ wait_for_failures() {
   info "Waiting for the workloads to reach their broken state (up to ${WAIT_SECONDS}s)"
   local deadline=$((SECONDS + WAIT_SECONDS))
   declare -A reached=()
-  local names=(web payments cache batch frontend)
+  local names=(web payments cache batch frontend webhook)
   declare -A labels=(
     [web]="web: CrashLoopBackOff (missing DATABASE_URL)"
     [payments]="payments: ImagePullBackOff (image tag does not exist)"
     [cache]="cache: OOMKilled (32Mi memory limit)"
     [batch]="batch: Unschedulable (requests 1000 CPUs)"
     [frontend]="frontend: healthy (2/2 ready)"
+    [webhook]="agent-demo-policy: webhook with no ready endpoints (failurePolicy=Fail)"
   )
 
   while ((SECONDS < deadline)); do
@@ -121,6 +122,8 @@ wait_for_failures() {
         cache) [[ "$(pods_of cache '{.items[*].status.containerStatuses[*].lastState.terminated.reason} {.items[*].status.containerStatuses[*].state.terminated.reason}')" =~ OOMKilled ]] && hit=1 ;;
         batch) [[ "$(pods_of batch '{.items[*].status.conditions[?(@.type=="PodScheduled")].reason}')" =~ Unschedulable ]] && hit=1 ;;
         frontend) [[ "$(kubectl get deployment frontend -n "$NAMESPACE" -o 'jsonpath={.status.readyReplicas}' 2>/dev/null)" == "2" ]] && hit=1 ;;
+        webhook) kubectl get validatingwebhookconfiguration agent-demo-policy >/dev/null 2>&1 &&
+          kubectl get service policy-webhook -n "$NAMESPACE" >/dev/null 2>&1 && hit=1 ;;
       esac
       if [[ -n "$hit" ]]; then
         reached[$name]=1

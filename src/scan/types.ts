@@ -1,3 +1,6 @@
+import type { PeerCertificate } from "../k8s/raw.js";
+import type { HealthCheck } from "./cluster.js";
+
 /**
  * Compact summaries of cluster objects. Raw Kubernetes objects are large; these
  * keep only what is useful for spotting problems (and what fits an LLM context).
@@ -13,6 +16,10 @@ export interface NodeSummary {
   pressures: string[];
   unschedulable: boolean;
   allocatable: { cpu?: string; memory?: string; pods?: string };
+  /** Last kubelet heartbeat: renewTime of the node's Lease in kube-node-lease. */
+  heartbeat?: string;
+  /** Sum over non-terminated pods on the node (CPU in cores, memory in bytes). */
+  requested?: { cpu: number; memory: number; pods: number };
 }
 
 export type ContainerStateName = "running" | "waiting" | "terminated" | "unknown";
@@ -79,6 +86,37 @@ export interface EventSummary {
   lastSeen?: string;
 }
 
+export interface EtcdSummary {
+  dbSizeBytes?: number;
+  quotaBytes: number;
+  /** "flag" when read from etcd's --quota-backend-bytes, "default" when assumed (2 GiB). */
+  quotaSource: "flag" | "default";
+  /** Largest object counts per resource. */
+  objectCounts: { resource: string; count: number }[];
+}
+
+export interface ControlPlaneSummary {
+  serverVersion?: string;
+  /** API server readiness checks (includes etcd); undefined when not visible. */
+  readyz?: HealthCheck[];
+  certificate?: PeerCertificate;
+  etcd?: EtcdSummary;
+  /** Checks that could not run and why, e.g. "etcd size: /metrics forbidden". */
+  notVisible: string[];
+}
+
+export interface WebhookSummary {
+  kind: "Validating" | "Mutating";
+  configName: string;
+  name: string;
+  /** "Fail" (the v1 default) blocks matching requests when the webhook is unreachable. */
+  failurePolicy: string;
+  service?: { namespace: string; name: string };
+  /** For service-backed webhooks: whether anything can answer. URL webhooks are "external". */
+  status: "ok" | "service-missing" | "no-ready-endpoints" | "external" | "unknown";
+  detail?: string;
+}
+
 export interface ClusterOverview {
   context: string;
   scannedAt: string;
@@ -88,6 +126,8 @@ export interface ClusterOverview {
   pods: PodSummary[];
   deployments: DeploymentSummary[];
   warningEvents: EventSummary[];
+  controlPlane: ControlPlaneSummary;
+  webhooks: WebhookSummary[];
   /** Partial failures (e.g. RBAC forbids listing nodes); the scan continues. */
   errors: string[];
 }

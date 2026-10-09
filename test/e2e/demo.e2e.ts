@@ -77,6 +77,31 @@ describe("demo cluster scan", () => {
   });
 });
 
+describe("demo cluster: cluster-level checks", () => {
+  it("reads the control plane: readiness checks, etcd size and API server certificate", () => {
+    const cp = overview.controlPlane;
+    expect(cp.notVisible).toEqual([]);
+    expect(cp.serverVersion).toMatch(/^v1\.\d+/);
+    expect(cp.readyz?.find((c) => c.name === "etcd")?.ok).toBe(true);
+    expect(cp.etcd?.dbSizeBytes).toBeGreaterThan(0);
+    expect(cp.etcd?.quotaSource).toBe("default");
+    expect(Date.parse(cp.certificate?.notAfter ?? "")).toBeGreaterThan(Date.now());
+  });
+
+  it("reports no control-plane, etcd or node-capacity issues on the healthy kind cluster", () => {
+    const clusterLevel = issues.filter((i) => i.resource.kind === "ControlPlane" || i.resource.kind === "Node");
+    expect(clusterLevel).toEqual([]);
+    expect(overview.nodes.every((n) => n.heartbeat !== undefined && n.requested !== undefined)).toBe(true);
+  });
+
+  it("flags the demo webhook whose service has no endpoints as critical", () => {
+    const webhook = issues.find((i) => i.category === "webhook-unavailable");
+    expect(webhook?.severity).toBe("critical");
+    expect(webhook?.resource).toEqual({ kind: "ValidatingWebhookConfiguration", name: "agent-demo-policy" });
+    expect(webhook?.evidence[0]).toContain("no ready endpoints");
+  });
+});
+
 describe("CLI against the demo cluster", () => {
   it("exits with code 2 (critical issues) and prints the report", () => {
     const result = spawnSync("pnpm", ["-s", "check", "--namespace", NAMESPACE, "--no-llm"], {
