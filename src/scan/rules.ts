@@ -7,7 +7,7 @@ import type {
   PodSummary,
   Severity,
 } from "./types.js";
-import { controlPlaneIssues, nodeCapacityIssues, webhookIssues } from "./cluster-rules.js";
+import { controlPlaneIssues, controlPlanePodIssues, nodeCapacityIssues, webhookIssues } from "./cluster-rules.js";
 import { formatCpu, formatMemory, parseQuantity } from "./quantity.js";
 
 /**
@@ -22,6 +22,8 @@ export interface RuleOptions {
   gracePeriodMinutes?: number;
   /** Nodes, used to compare an unschedulable pod's requests with node capacity. */
   nodes?: NodeSummary[];
+  /** How far back restarts and probe failures count as recent (default 60). */
+  windowMinutes?: number;
 }
 
 const SEVERITY_RANK: Record<Severity, number> = { critical: 0, warning: 1, info: 2 };
@@ -292,12 +294,21 @@ export function deploymentIssues(d: DeploymentSummary): Issue[] {
 }
 
 export function detectIssues(overview: ClusterOverview, opts: RuleOptions): Issue[] {
+  const cpPodIssues = controlPlanePodIssues(overview.controlPlane.pods ?? [], opts.now, opts.windowMinutes ?? 60);
+  // A control-plane pod gets one issue from the control-plane rule, which includes its
+  // current state, instead of a second one from the generic pod rules.
+  const covered = new Set(cpPodIssues.map((i) => i.resource.name));
+  const coveredByControlPlane = (i: Issue) =>
+    i.resource.kind === "Pod" && i.resource.namespace === "kube-system" && covered.has(i.resource.name);
   const issues = [
     ...controlPlaneIssues(overview.controlPlane, opts.now),
+    ...cpPodIssues,
     ...overview.webhooks.flatMap(webhookIssues),
     ...overview.nodes.flatMap(nodeIssues),
     ...overview.nodes.flatMap((n) => nodeCapacityIssues(n, opts.now, overview.controlPlane.serverVersion)),
-    ...overview.pods.flatMap((p) => podIssues(p, { ...opts, nodes: opts.nodes ?? overview.nodes })),
+    ...overview.pods
+      .flatMap((p) => podIssues(p, { ...opts, nodes: opts.nodes ?? overview.nodes }))
+      .filter((i) => !coveredByControlPlane(i)),
     ...overview.deployments.flatMap(deploymentIssues),
   ];
   return issues.sort(

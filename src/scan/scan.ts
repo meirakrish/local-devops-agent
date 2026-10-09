@@ -61,7 +61,7 @@ export async function scanCluster(k8s: K8sClients, opts: ScanOptions): Promise<C
     ns
       ? k8s.core.listNamespacedEvent({ namespace: ns, ...warningOnly })
       : k8s.core.listEventForAllNamespaces(warningOnly),
-    collectControlPlane(k8s),
+    collectControlPlane(k8s, opts.eventWindowMinutes, now),
     collectWebhooks(k8s),
   ]);
 

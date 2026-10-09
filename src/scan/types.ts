@@ -95,12 +95,31 @@ export interface EtcdSummary {
   objectCounts: { resource: string; count: number }[];
 }
 
+/** A control-plane component pod (kube-system, label tier=control-plane). */
+export interface ControlPlanePod {
+  name: string;
+  /** Value of the "component" label, e.g. kube-apiserver, etcd, kube-scheduler. */
+  component: string;
+  nodeName?: string;
+  phase: string;
+  ready: boolean;
+  /** Waiting/terminated reason of the current container, e.g. CrashLoopBackOff. */
+  stateReason?: string;
+  restarts: number;
+  /** How the previous container ended, when it has restarted. */
+  lastRestart?: { finishedAt: string; reason?: string; exitCode?: number };
+  /** Liveness/readiness/startup probe failures from Unhealthy events in the event window. */
+  probeFailures?: { count: number; lastSeen: string; kinds: string[]; lastMessage: string };
+}
+
 export interface ControlPlaneSummary {
   serverVersion?: string;
   /** API server readiness checks (includes etcd); undefined when not visible. */
   readyz?: HealthCheck[];
   certificate?: PeerCertificate;
   etcd?: EtcdSummary;
+  /** Control-plane pods; undefined when not visible (managed control planes hide them). */
+  pods?: ControlPlanePod[];
   /** Checks that could not run and why, e.g. "etcd size: /metrics forbidden". */
   notVisible: string[];
 }

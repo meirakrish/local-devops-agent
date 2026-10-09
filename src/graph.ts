@@ -60,7 +60,11 @@ export function buildGraph(deps: GraphDeps) {
       eventWindowMinutes: deps.config.eventWindowMinutes,
       now,
     });
-    const issues = detectIssues(overview, { restartThreshold: deps.config.restartThreshold, now });
+    const issues = detectIssues(overview, {
+      restartThreshold: deps.config.restartThreshold,
+      now,
+      windowMinutes: deps.config.eventWindowMinutes,
+    });
     log(
       `scan: ${overview.nodes.length} nodes, ${overview.pods.length} pods, ` +
         `${overview.deployments.length} deployments, ${overview.warningEvents.length} warning events, ` +
@@ -98,7 +102,10 @@ export function buildGraph(deps: GraphDeps) {
   }
 
   async function investigateNode(state: HealthCheckStateType): Promise<Partial<HealthCheckStateType>> {
-    const tools = createK8sTools(deps.k8s, { maxChars: deps.config.toolOutputMaxChars });
+    const tools = createK8sTools(deps.k8s, {
+      maxChars: deps.config.toolOutputMaxChars,
+      windowMinutes: deps.config.eventWindowMinutes,
+    });
     const findings: Finding[] = [];
     // Sequential on purpose: a local GPU serves one request at a time anyway,
     // and sequential logs are easier to follow.

@@ -2,7 +2,7 @@ import { AIMessage, type BaseMessage, ToolMessage } from "@langchain/core/messag
 import { tool } from "@langchain/core/tools";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { investigate, problemPrompt } from "../src/agent/investigate.js";
+import { investigate, problemPrompt, seedCall } from "../src/agent/investigate.js";
 import { buildProblems, fallbackTriage, triage } from "../src/agent/triage.js";
 import type { Problem } from "../src/agent/types.js";
 import type { LlmClient } from "../src/llm/model.js";
@@ -99,6 +99,26 @@ describe("triage", () => {
     const [problem] = await triage(llm, overview, ALL, 5);
     expect(problem?.primary.id).toBe(webPod1.id);
     expect(problem?.related.map((i) => i.id).sort()).toEqual([webDeploy.id, webPod2.id].sort());
+  });
+
+  it("groups a control-plane incident into one problem, starting from the API server", async () => {
+    const cp = (component: string, category: string, severity: Issue["severity"] = "warning"): Issue => ({
+      ...issue(`pod/kube-system/${component}-cp:${category}`, "Pod", `${component}-cp`, severity),
+      category,
+      resource: { kind: "Pod", namespace: "kube-system", name: `${component}-cp` },
+    });
+    const scheduler = cp("kube-scheduler", "controlplane-restart");
+    const cm = cp("kube-controller-manager", "controlplane-restart");
+    const apiserver = cp("kube-apiserver", "controlplane-probe-failures");
+    // The LLM picks the scheduler and forgets the rest; code merges them and re-ranks.
+    const { llm } = fakeLlm([], { problems: [{ issueId: scheduler.id, relatedIssueIds: [], reason: "restarts" }] });
+    const [problem, ...rest] = await triage(llm, overview, [scheduler, cm, apiserver, payPod], 5);
+    expect(problem?.primary.id).toBe(apiserver.id);
+    expect(problem?.related.map((i) => i.id).sort()).toEqual([cm.id, scheduler.id].sort());
+    expect(rest).toEqual([]);
+    // etcd outranks the API server when both are involved.
+    const etcd = cp("etcd", "controlplane-pod-down", "critical");
+    expect(fallbackTriage([apiserver, etcd, scheduler], 5)[0]?.primary.id).toBe(etcd.id);
   });
 
   it("respects maxProblems", () => {
@@ -207,10 +227,48 @@ describe("investigate loop", () => {
     expect(prompt).not.toContain("shop/web");
   });
 
+  it("points cluster-level problems at the relevant k8s_cluster_health section", () => {
+    const prompt = (i: Issue) => problemPrompt({ primary: i, related: [], reason: "", severity: i.severity }, 6);
+    expect(prompt({ ...webDeploy, resource: { kind: "ValidatingWebhookConfiguration", name: "policy" } })).toContain('section="webhooks"');
+    expect(prompt({ ...webDeploy, resource: { kind: "ControlPlane", name: "etcd" } })).toContain('section="etcd"');
+    expect(prompt({ ...webDeploy, resource: { kind: "ControlPlane", name: "kube-apiserver" } })).toContain('section="control-plane"');
+    const cpPod = { ...webPod1, category: "controlplane-restart", resource: { kind: "Pod", namespace: "kube-system", name: "kube-scheduler-cp" } };
+    expect(prompt(cpPod)).toContain('pod="kube-scheduler-cp"');
+    expect(prompt(cpPod)).toContain('section="control-plane"');
+  });
+
   it("includes the rule's hint in the problem prompt", () => {
     const withHint = { ...webPod1, hint: "Read the previous container logs." };
     const prompt = problemPrompt({ primary: withHint, related: [], reason: "", severity: "critical" }, 6);
     expect(prompt).toContain("hint from rule: Read the previous container logs.");
+  });
+
+  it("makes the obvious first tool call in code before the model's first turn", async () => {
+    const described: unknown[] = [];
+    const describe = tool(
+      async (args: { namespace: string; name: string }) => {
+        described.push(args);
+        return "state: waiting CrashLoopBackOff";
+      },
+      { name: "k8s_describe_pod", description: "describe", schema: z.object({ namespace: z.string(), name: z.string() }) },
+    );
+    const { llm, seen } = fakeLlm([
+      call("k8s_describe_pod", { namespace: "shop", name: "web-7db8d69f68-4f2n7" }, "c1"), // repeat of the seed
+      new AIMessage("done"),
+    ]);
+    const finding = await investigate(problem, { llm, tools: [describe], maxSteps: 5 });
+    expect(described).toEqual([{ namespace: "shop", name: "web-7db8d69f68-4f2n7" }]); // only the seed ran
+    expect(String(seen[0]?.find((m) => m instanceof ToolMessage)?.content)).toContain("CrashLoopBackOff");
+    expect(finding.toolCalls).toBe(2); // seed + the blocked repeat
+  });
+
+  it("chooses seed calls by resource kind", () => {
+    expect(seedCall(webPod1)).toEqual({ name: "k8s_describe_pod", args: { namespace: "shop", name: "web-7db8d69f68-4f2n7" } });
+    expect(seedCall({ ...webDeploy, resource: { kind: "ValidatingWebhookConfiguration", name: "p" } })).toEqual({
+      name: "k8s_cluster_health",
+      args: { section: "webhooks" },
+    });
+    expect(seedCall({ ...webDeploy, resource: { kind: "ControlPlane", name: "etcd" } })?.args).toEqual({ section: "etcd" });
   });
 
   it("reports a failed investigation instead of throwing", async () => {

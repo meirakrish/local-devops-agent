@@ -1,5 +1,5 @@
 import {
-  type AIMessage,
+  AIMessage,
   type BaseMessage,
   HumanMessage,
   SystemMessage,
@@ -61,10 +61,15 @@ export interface InvestigateDeps {
 /** Exact tool arguments for a resource, so the model does not have to split "ns/name". */
 export function toolTarget(issue: Issue): string {
   const { kind, namespace, name } = issue.resource;
+  if (kind === "Pod" && namespace === "kube-system" && issue.category.startsWith("controlplane-")) {
+    return `namespace="kube-system" name="${name}" (for k8s_get_logs: pod="${name}"); k8s_cluster_health with section="control-plane" shows all control-plane components`;
+  }
   if (kind === "Pod") return `namespace="${namespace}" name="${name}" (for k8s_get_logs: pod="${name}")`;
   if (kind === "Node") return `name="${name}" (k8s_list_nodes shows heartbeat, versions and requests)`;
-  if (kind === "ControlPlane" || kind.endsWith("WebhookConfiguration")) {
-    return "none; call k8s_cluster_health (no arguments) for control-plane, etcd and webhook details";
+  // Name the health section, so a small model gets only the relevant part of the output.
+  if (kind.endsWith("WebhookConfiguration")) return 'call k8s_cluster_health with section="webhooks"';
+  if (kind === "ControlPlane") {
+    return `call k8s_cluster_health with section="${name === "etcd" ? "etcd" : "control-plane"}"`;
   }
   return `namespace="${namespace}" name="${name}"`;
 }
@@ -98,6 +103,23 @@ export function problemPrompt(problem: Problem, maxSteps: number): string {
  */
 export function dropNullArgs(args: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(args).filter(([, v]) => v !== null));
+}
+
+/**
+ * The obvious first tool call for a problem, made in code before the model's first turn,
+ * so the investigation always starts from the right evidence. In testing, a small model
+ * sometimes skipped it and wandered (for example, into the logs of an unrelated pod).
+ */
+export function seedCall(issue: Issue): { name: string; args: Record<string, unknown> } | undefined {
+  const { kind, namespace, name } = issue.resource;
+  if (kind === "Pod" && namespace) return { name: "k8s_describe_pod", args: { namespace, name } };
+  if (kind === "Deployment" && namespace) return { name: "k8s_get_deployment", args: { namespace, name } };
+  if (kind === "Node") return { name: "k8s_list_nodes", args: {} };
+  if (kind.endsWith("WebhookConfiguration")) return { name: "k8s_cluster_health", args: { section: "webhooks" } };
+  if (kind === "ControlPlane") {
+    return { name: "k8s_cluster_health", args: { section: name === "etcd" ? "etcd" : "control-plane" } };
+  }
+  return undefined;
 }
 
 function callSignature(name: string, args: unknown): string {
@@ -205,8 +227,30 @@ export async function investigate(problem: Problem, deps: InvestigateDeps): Prom
     new HumanMessage(problemPrompt(problem, deps.maxSteps)),
   ];
   try {
+    // Run the seed call as if the model had made it: an AI message with the tool call,
+    // then its result. It counts as one step and as a "seen" call.
+    const seed = seedCall(problem.primary);
+    const seedTool = seed ? deps.tools.find((t) => t.name === seed.name) : undefined;
+    const initial: { messages: BaseMessage[]; steps: number; seenCalls: string[] } = { messages, steps: 0, seenCalls: [] };
+    if (seed && seedTool && deps.maxSteps > 0) {
+      const signature = callSignature(seed.name, seed.args);
+      const started = Date.now();
+      let output: string;
+      try {
+        output = String(await seedTool.invoke(seed.args));
+      } catch (err) {
+        output = `Error: ${(err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ").slice(0, 500)}`;
+      }
+      (deps.log ?? (() => {}))(`    → ${signature} (${output.length} chars, ${Date.now() - started}ms, seed)`);
+      messages.push(
+        new AIMessage({ content: "", tool_calls: [{ id: "seed-0", name: seed.name, args: seed.args, type: "tool_call" }] }),
+        new ToolMessage({ content: output, tool_call_id: "seed-0", name: seed.name }),
+      );
+      initial.steps = 1;
+      initial.seenCalls = [signature];
+    }
     // Each agent/tools round is 2 graph steps; leave room for the rest.
-    const result = await graph.invoke({ messages }, { recursionLimit: deps.maxSteps * 2 + 10 });
+    const result = await graph.invoke(initial, { recursionLimit: deps.maxSteps * 2 + 10 });
     return { problem, ...result.conclusion, toolCalls: result.steps };
   } catch (err) {
     return {

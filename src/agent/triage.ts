@@ -30,13 +30,38 @@ function worstSeverity(issues: Issue[]): Severity {
 }
 
 /**
- * Builds a Problem, making a Pod issue the primary when there is one: pods have logs
- * and events, so they are the best starting point. Decided in code because the model
- * did not follow this rule reliably.
+ * Control-plane failures cascade (slow etcd -> API server errors -> scheduler and
+ * controller-manager lose leader election and restart), so all control-plane health
+ * issues form one problem. Done in code because the model grouped them only sometimes.
  */
+const CONTROL_PLANE_CATEGORIES = new Set([
+  "etcd-unhealthy",
+  "apiserver-not-ready",
+  "controlplane-pod-down",
+  "controlplane-restart",
+  "controlplane-probe-failures",
+]);
+
+/**
+ * Lower is a better starting point. Within a control-plane incident, follow the
+ * dependencies upward: etcd, then the API server, then the rest. Otherwise prefer pods,
+ * which have logs and events.
+ */
+function primaryRank(i: Issue): number {
+  const notPod = i.resource.kind === "Pod" ? 0 : 1;
+  if (CONTROL_PLANE_CATEGORIES.has(i.category)) {
+    const name = i.resource.name;
+    if (name === "etcd" || name.startsWith("etcd-")) return 0 + notPod;
+    if (name === "kube-apiserver" || name.startsWith("kube-apiserver-")) return 2 + notPod;
+    return 4 + notPod;
+  }
+  return 10 + notPod;
+}
+
+/** Builds a Problem, picking the primary issue by primaryRank (ties keep the given order). */
 function makeProblem(chosen: Issue, others: Issue[], reason: string): Problem {
   const all = [chosen, ...others];
-  const primary = chosen.resource.kind === "Pod" ? chosen : (others.find((i) => i.resource.kind === "Pod") ?? chosen);
+  const primary = all.reduce((best, i) => (primaryRank(i) < primaryRank(best) ? i : best));
   const related = all.filter((i) => i !== primary);
   return { primary, related, reason, severity: worstSeverity(all) };
 }
@@ -49,6 +74,7 @@ function deploymentOfPod(podName: string): string | undefined {
 
 /** Issues with the same key belong to the same workload (a Deployment and its pods). */
 export function groupKey(i: Issue): string {
+  if (CONTROL_PLANE_CATEGORIES.has(i.category)) return "control-plane";
   if (i.resource.kind === "Pod") {
     return `${i.resource.namespace}/${deploymentOfPod(i.resource.name) ?? i.resource.name}`;
   }
