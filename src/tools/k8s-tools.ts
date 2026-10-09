@@ -20,8 +20,13 @@ import { truncateMiddle } from "./truncate.js";
  * Errors are returned as text so the model can correct itself instead of crashing.
  */
 
+const HEALTH_SECTIONS = ["control-plane", "etcd", "webhooks", "all"] as const;
+type HealthSection = (typeof HEALTH_SECTIONS)[number];
+
 export interface ToolOptions {
   maxChars: number;
+  /** Window for "recent" control-plane restarts and probe failures (EVENT_WINDOW_MINUTES). */
+  windowMinutes?: number;
   defaultTailLines?: number;
   maxListItems?: number;
 }
@@ -191,20 +196,17 @@ async function missingNamespaceHint(k8s: K8sClients, namespace: string): Promise
  * Wraps a tool body: truncates the output and returns errors as text. A 404 also
  * checks whether the namespace exists, since a wrong namespace is the usual cause.
  */
-function safe<A extends { namespace?: string; name?: string; pod?: string }>(
-  k8s: K8sClients,
-  maxChars: number,
-  fn: (args: A) => Promise<string>,
-) {
+function safe<A extends object>(k8s: K8sClients, maxChars: number, fn: (args: A) => Promise<string>) {
   return async (args: A): Promise<string> => {
     try {
       return truncateMiddle(await fn(args), maxChars);
     } catch (err) {
       if ((err as { code?: number }).code === 404) {
-        const hint = args.namespace ? await missingNamespaceHint(k8s, args.namespace) : undefined;
+        const target = args as { namespace?: string; name?: string; pod?: string };
+        const hint = target.namespace ? await missingNamespaceHint(k8s, target.namespace) : undefined;
         if (hint) return `Error: ${hint}`;
-        const what = args.name ?? args.pod;
-        return `Error: ${what ? `"${what}" ` : ""}not found${args.namespace ? ` in namespace "${args.namespace}"` : ""}. Check the exact name with a list tool.`;
+        const what = target.name ?? target.pod;
+        return `Error: ${what ? `"${what}" ` : ""}not found${target.namespace ? ` in namespace "${target.namespace}"` : ""}. Check the exact name with a list tool.`;
       }
       return `Error: ${k8sErrorMessage(err)}`;
     }
@@ -440,34 +442,60 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
   );
 
   const clusterHealth = tool(
-    safe(k8s, opts.maxChars, async () => {
+    safe(k8s, opts.maxChars, async ({ section = "all" }: { section?: HealthSection }) => {
+      const want = (s: HealthSection) => section === "all" || section === s;
       const problems: string[] = [];
       const [cp, webhooks] = await Promise.all([
-        collectControlPlane(k8s),
-        collectWebhooks(k8s).catch((err: unknown) => {
-          problems.push(`admission webhooks: ${k8sErrorMessage(err)}`);
-          return [];
-        }),
+        collectControlPlane(k8s, opts.windowMinutes ?? 60),
+        want("webhooks")
+          ? collectWebhooks(k8s).catch((err: unknown) => {
+              problems.push(`admission webhooks: ${k8sErrorMessage(err)}`);
+              return [];
+            })
+          : Promise.resolve([]),
       ]);
-      const lines = [`API server version: ${cp.serverVersion ?? "unknown"}`];
-      if (cp.certificate) lines.push(`API server certificate: ${cp.certificate.subject}, valid until ${cp.certificate.notAfter}`);
-      if (cp.readyz) {
-        const failing = cp.readyz.filter((c) => !c.ok);
-        lines.push(
-          `Readiness checks (/readyz): ${cp.readyz.length - failing.length}/${cp.readyz.length} passing`,
-          ...failing.map((c) => `- FAILING ${c.name}${c.reason ? `: ${c.reason}` : ""}`),
-        );
+
+      const lines: string[] = [];
+      if (want("control-plane")) {
+        lines.push(`API server version: ${cp.serverVersion ?? "unknown"}`);
+        if (cp.certificate) lines.push(`API server certificate: ${cp.certificate.subject}, valid until ${cp.certificate.notAfter}`);
+        if (cp.readyz) {
+          const failing = cp.readyz.filter((c) => !c.ok);
+          lines.push(
+            `Readiness checks (/readyz): ${cp.readyz.length - failing.length}/${cp.readyz.length} passing`,
+            ...failing.map((c) => `- FAILING ${c.name}${c.reason ? `: ${c.reason}` : ""}`),
+          );
+        }
+        if (cp.pods) {
+          lines.push(`Control-plane pods (restarts and probe failures within the last ${opts.windowMinutes ?? 60} min):`);
+          for (const p of cp.pods) {
+            const parts = [`- ${p.component} (${p.name})`, p.ready ? "ready" : `NOT READY${p.stateReason ? ` (${p.stateReason})` : ""}`, `restarts=${p.restarts}`];
+            if (p.lastRestart) {
+              parts.push(`last restart ${p.lastRestart.finishedAt}${p.lastRestart.reason ? ` ${p.lastRestart.reason}` : ""}${p.lastRestart.exitCode !== undefined ? ` exit ${p.lastRestart.exitCode}` : ""}`);
+            }
+            if (p.probeFailures) {
+              parts.push(`probe failures (up to)=${p.probeFailures.count} last ${p.probeFailures.lastSeen}: ${p.probeFailures.lastMessage}`);
+            }
+            lines.push(parts.join(" "));
+          }
+        }
       }
-      if (cp.etcd) {
-        const size = cp.etcd.dbSizeBytes;
-        lines.push(
-          `etcd database: ${size !== undefined ? `${formatMemory(size)} of ${formatMemory(cp.etcd.quotaBytes)} quota (${Math.round((size / cp.etcd.quotaBytes) * 100)}%)` : "size not exposed"}${cp.etcd.quotaSource === "default" ? ", default quota assumed" : ""}`,
-          `etcd largest object counts: ${cp.etcd.objectCounts.slice(0, 8).map((o) => `${o.resource}=${o.count}`).join(", ") || "unknown"}`,
-        );
+      if (want("etcd")) {
+        const etcdCheck = cp.readyz?.find((c) => c.name === "etcd");
+        if (etcdCheck) lines.push(`etcd health check (/readyz): ${etcdCheck.ok ? "ok" : `FAILING${etcdCheck.reason ? `: ${etcdCheck.reason}` : ""}`}`);
+        if (cp.etcd) {
+          const size = cp.etcd.dbSizeBytes;
+          lines.push(
+            `etcd database: ${size !== undefined ? `${formatMemory(size)} of ${formatMemory(cp.etcd.quotaBytes)} quota (${Math.round((size / cp.etcd.quotaBytes) * 100)}%)` : "size not exposed"}${cp.etcd.quotaSource === "default" ? ", default quota assumed" : ""}`,
+            `etcd largest object counts: ${cp.etcd.objectCounts.slice(0, 8).map((o) => `${o.resource}=${o.count}`).join(", ") || "unknown"}`,
+          );
+        }
       }
-      lines.push(`Admission webhooks: ${webhooks.length}`);
-      for (const w of webhooks) {
-        lines.push(`- ${w.kind} ${w.configName}/${w.name} failurePolicy=${w.failurePolicy} status=${w.status}${w.detail ? ` (${w.detail})` : ""}`);
+      if (want("webhooks")) {
+        lines.push(`Admission webhooks: ${webhooks.length}`);
+        for (const w of webhooks) {
+          lines.push(`- ${w.kind} ${w.configName}/${w.name} failurePolicy=${w.failurePolicy} status=${w.status}${w.detail ? ` (${w.detail})` : ""}`);
+        }
       }
       for (const n of [...cp.notVisible, ...problems]) lines.push(`Not visible: ${n}`);
       return lines.join("\n");
@@ -475,8 +503,13 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
     {
       name: "k8s_cluster_health",
       description:
-        "Control-plane health: API server version and certificate expiry, /readyz checks (including etcd), etcd database size vs quota and largest object counts, and admission webhooks with whether their service can answer.",
-      schema: z.object({}),
+        "Cluster health by section. control-plane: API server version, certificate expiry, /readyz checks, and control-plane pods (kube-apiserver, etcd, scheduler, controller-manager) with recent restarts and probe failures. etcd: etcd health check, database size vs quota, largest object counts. webhooks: admission webhooks and whether their service can answer.",
+      schema: z.object({
+        section: z
+          .enum(HEALTH_SECTIONS)
+          .optional()
+          .describe('Which part to show; use the section named in the problem description (default "all")'),
+      }),
     },
   );
 

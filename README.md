@@ -25,9 +25,10 @@ $ pnpm demo:check --verbose
 - **One command, no questions:** `pnpm check` scans the cluster and prints a report.
 - **Finds common failures with rules:** crashlooping, OOMKilled, unschedulable and
   image-pull failures in workloads, plus cluster-level risks: failing API server and etcd
-  health checks, etcd nearing its storage quota, expiring API server certificates, stale
-  kubelet heartbeats, full nodes, unsupported version skew, and admission webhooks that
-  block requests. See [What it checks](#what-it-checks).
+  health checks, control-plane components that are down or recently restarted or failing
+  probes, etcd nearing its storage quota, expiring API server certificates, stale kubelet
+  heartbeats, full nodes, unsupported version skew, and admission webhooks that block
+  requests. See [What it checks](#what-it-checks).
 - **Investigates like an SRE:** a local LLM groups related issues, then uses read-only
   tools (describe, logs, events, deployments) to find the root cause and suggest a fix.
 - **Read-only by construction:** write, delete and exec operations are blocked in code,
@@ -125,6 +126,8 @@ The rules run on every scan, with or without the LLM. Severity decides the exit 
 | Control plane | `/readyz` check for etcd failing | critical |
 | Control plane | Other API server readiness checks failing | critical |
 | Control plane | API server certificate expires within 7 days / 30 days | critical / warning |
+| Control plane | Component pod (etcd, kube-apiserver, scheduler, controller-manager) not ready | critical |
+| Control plane | Component restarted, or failed 3+ health probes, within `EVENT_WINDOW_MINUTES` | warning |
 | etcd | Database at 90% / 70% of its quota (a full etcd makes the cluster read-only) | critical / warning |
 | etcd | More than 100,000 objects of one resource | warning |
 | Nodes | NotReady | critical |
@@ -154,7 +157,7 @@ The agent can call seven tools. All are read-only and built on the guarded clien
 | `k8s_get_logs` | The last N lines of a container's logs. After a restart, it adds the previous (crashed) run, and falls back to the current run when the previous run's logs are gone |
 | `k8s_list_events` | Warning events, filtered by namespace, object name and kind |
 | `k8s_get_deployment` | Desired vs ready replicas, rollout conditions, images, and the status of its pods |
-| `k8s_cluster_health` | API server version and certificate expiry, `/readyz` checks including etcd, etcd size vs quota and largest object counts, and admission webhooks with whether their service can answer |
+| `k8s_cluster_health` | By section. `control-plane`: API server version, certificate expiry, `/readyz` checks, and control-plane pods with recent restarts and probe failures. `etcd`: health check, database size vs quota, largest object counts. `webhooks`: admission webhooks and whether their service can answer |
 
 ### Design choices for a small local model
 
@@ -169,6 +172,17 @@ several failure modes, and each fix moved responsibility from the prompt into co
   with the largest node ("requests cpu=1000, largest node allocatable cpu=12") and passes
   that, plus the rule's hint, to the model. Before this, the model read the same numbers
   and suggested *raising* the CPU request.
+- **The first tool call is made in code.** Each investigation starts with the obvious
+  call already done: `k8s_describe_pod` for a pod, `k8s_cluster_health` with the matching
+  section for a webhook or control-plane issue. The model used to skip it sometimes and
+  wander, for example into the logs of an unrelated pod.
+- **Control-plane incidents are grouped in code.** Failures cascade: a slow etcd makes
+  the API server time out, so the scheduler and controller-manager lose leader election
+  and restart. All control-plane health issues become one problem, investigated from the
+  top of the chain (etcd, then the API server).
+- **Focused tool output.** `k8s_cluster_health` returns only the requested section. With
+  everything in one answer, the model blamed a webhook outage on unrelated control-plane
+  problems.
 - **Exact arguments in the prompt.** The prompt gives `namespace="agent-test"
   name="web-7db8d69f68-4f2n7"` rather than `agent-test/web-...`. The model used to put
   the whole string into the name field.
@@ -467,9 +481,13 @@ so treat reports as containing cluster data.
   wrong ones.
 - **A larger model helps.** Setting `MODEL=qwen2.5:14b-instruct` (or another
   tool-calling model) should improve the fixes, at the cost of speed and VRAM.
-- **Coverage:** the rules cover the control plane, etcd, nodes, admission webhooks,
-  pods, deployments and events. StatefulSets, DaemonSets, Jobs, Services, PVCs,
-  APIServices and CoreDNS are not checked yet.
+- **Coverage:** the rules cover the control plane and its components, etcd, nodes,
+  admission webhooks, pods, deployments and events. StatefulSets, DaemonSets, Jobs,
+  Services, PVCs, APIServices and CoreDNS are not checked yet.
+- **Control-plane pods must be visible.** Restart and probe checks need the static pods in
+  `kube-system` (kubeadm, kind, minikube). Managed control planes hide them, and the
+  report says "not visible". Probe-failure counts come from aggregated events, so they
+  are an upper bound.
 - **etcd depth:** etcd is checked through the API server (health check, database size,
   object counts). Leader changes and disk latency need etcd's own metrics endpoint, which
   is only reachable from the control-plane nodes.

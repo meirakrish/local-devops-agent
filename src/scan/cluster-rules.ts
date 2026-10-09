@@ -1,6 +1,6 @@
 import { parseMinorVersion } from "./cluster.js";
 import { formatCpu, formatMemory, parseQuantity } from "./quantity.js";
-import type { ControlPlaneSummary, Issue, NodeSummary, WebhookSummary } from "./types.js";
+import type { ControlPlanePod, ControlPlaneSummary, Issue, NodeSummary, WebhookSummary } from "./types.js";
 
 /** Rules for cluster-level health: control plane, etcd, node capacity and webhooks. */
 
@@ -17,6 +17,8 @@ export const THRESHOLDS = {
   nodeRequestRatio: 0.9,
   /** Supported skew: kubelet may be up to 3 minor versions older, never newer. */
   maxKubeletMinorsBehind: 3,
+  /** Probe failures of a control-plane pod within the event window before warning. */
+  probeFailureWarning: 3,
 };
 
 const pct = (ratio: number) => `${Math.round(ratio * 100)}%`;
@@ -191,3 +193,68 @@ export function webhookIssues(w: WebhookSummary): Issue[] {
     },
   ];
 }
+
+/** Where to look first, per component. */
+const COMPONENT_HINTS: Record<string, string> = {
+  "kube-apiserver":
+    "Check the kube-apiserver logs and etcd health (k8s_cluster_health). A readiness probe answering HTTP 500 means one of its /readyz checks failed, often etcd. Also check CPU and memory pressure on the control-plane node.",
+  etcd: "Check the etcd logs for slow disk warnings (\"apply request took too long\"), leader elections or a NOSPACE alarm. etcd needs fast, uncontended disks.",
+  "kube-scheduler":
+    "The scheduler exits when it loses leader election, usually because the API server or etcd was slow or unavailable. Check its previous logs for \"leaderelection lost\", then check kube-apiserver health first.",
+  "kube-controller-manager":
+    "The controller-manager exits when it loses leader election, usually because the API server or etcd was slow or unavailable. Check its previous logs for \"leaderelection lost\", then check kube-apiserver health first.",
+};
+
+function minutesAgo(iso: string, now: Date): number {
+  return Math.round((now.getTime() - Date.parse(iso)) / 60_000);
+}
+
+/**
+ * One issue per control-plane pod: critical while it is down, a warning when it restarted
+ * or failed probes within the window but has recovered (the incident is over, but the
+ * cause usually is not).
+ */
+export function controlPlanePodIssues(pods: ControlPlanePod[], now: Date, windowMinutes: number): Issue[] {
+  const issues: Issue[] = [];
+  for (const pod of pods) {
+    const down = !pod.ready || pod.phase !== "Running";
+    const recentRestart =
+      pod.lastRestart && minutesAgo(pod.lastRestart.finishedAt, now) <= windowMinutes ? pod.lastRestart : undefined;
+    const probes =
+      pod.probeFailures && pod.probeFailures.count >= THRESHOLDS.probeFailureWarning ? pod.probeFailures : undefined;
+    if (!down && !recentRestart && !probes) continue;
+
+    const evidence: string[] = [];
+    if (down) evidence.push(`${pod.component} is ${pod.phase}${pod.stateReason ? ` (${pod.stateReason})` : ""} and not ready on node ${pod.nodeName ?? "?"}`);
+    if (recentRestart) {
+      const how = [recentRestart.reason, recentRestart.exitCode !== undefined ? `exit code ${recentRestart.exitCode}` : undefined].filter(Boolean).join(", ");
+      evidence.push(`last restart ${minutesAgo(recentRestart.finishedAt, now)} min ago${how ? ` (${how})` : ""}; ${pod.restarts} restart(s) in total`);
+    }
+    if (probes) {
+      evidence.push(
+        `up to ${probes.count} ${probes.kinds.join("/") || "probe"} probe failure(s) in the last ${windowMinutes} min, last ${minutesAgo(probes.lastSeen, now)} min ago: ${probes.lastMessage}`,
+      );
+    }
+
+    const category = down ? "controlplane-pod-down" : recentRestart ? "controlplane-restart" : "controlplane-probe-failures";
+    const title = down
+      ? `Control-plane component ${pod.component} is not ready${pod.stateReason ? ` (${pod.stateReason})` : ""}`
+      : recentRestart
+        ? `Control-plane component ${pod.component} restarted ${minutesAgo(recentRestart.finishedAt, now)} min ago`
+        : `Control-plane component ${pod.component} failed health probes ${probes!.count} time(s) recently`;
+
+    issues.push({
+      id: `pod/kube-system/${pod.name}:${category}`,
+      severity: down ? "critical" : "warning",
+      category,
+      resource: { kind: "Pod", namespace: "kube-system", name: pod.name },
+      title,
+      evidence,
+      hint:
+        COMPONENT_HINTS[pod.component] ??
+        "Check this component's previous logs and the health of the API server and etcd it depends on.",
+    });
+  }
+  return issues;
+}
+

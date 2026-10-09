@@ -1,4 +1,4 @@
-import type { V1Pod } from "@kubernetes/client-node";
+import type { CoreV1Event, V1Pod } from "@kubernetes/client-node";
 import type { K8sClients } from "../k8s/client.js";
 import { k8sErrorMessage } from "../k8s/errors.js";
 import {
@@ -7,8 +7,8 @@ import {
   etcdStorageFromMetrics,
   parseHealthChecks,
 } from "./cluster.js";
-import { podRequests } from "./summarize.js";
-import type { ControlPlaneSummary, NodeSummary, WebhookSummary } from "./types.js";
+import { eventLastSeen, podRequests } from "./summarize.js";
+import type { ControlPlanePod, ControlPlaneSummary, NodeSummary, WebhookSummary } from "./types.js";
 
 /** Why a raw endpoint could not be read, phrased for the report. */
 function rawProblem(status: number): string {
@@ -18,19 +18,95 @@ function rawProblem(status: number): string {
 }
 
 /**
+ * Summarizes control-plane pods with their recent restarts and probe failures.
+ * `events` should be the Unhealthy warning events of kube-system; only those seen within
+ * the window count. An aggregated event's count can include occurrences from before the
+ * window, so the probe-failure count is an upper bound.
+ */
+export function summarizeControlPlanePods(
+  pods: V1Pod[],
+  events: CoreV1Event[],
+  now: Date,
+  windowMinutes: number,
+): ControlPlanePod[] {
+  const cutoff = now.getTime() - windowMinutes * 60_000;
+  return pods
+    .map((pod): ControlPlanePod => {
+      const name = pod.metadata?.name ?? "?";
+      const statuses = pod.status?.containerStatuses ?? [];
+      const restarted = statuses
+        .map((c) => c.lastState?.terminated)
+        .filter((t) => t?.finishedAt)
+        .sort((a, b) => Date.parse(String(b!.finishedAt)) - Date.parse(String(a!.finishedAt)))[0];
+      const current = statuses.find((c) => c.state?.waiting || c.state?.terminated)?.state;
+
+      const recent = events.filter((e) => {
+        const seen = eventLastSeen(e);
+        return e.involvedObject.name === name && seen !== undefined && Date.parse(seen) >= cutoff;
+      });
+      const latest = [...recent].sort((a, b) => (eventLastSeen(b) ?? "").localeCompare(eventLastSeen(a) ?? ""))[0];
+      const kinds = [...new Set(recent.map((e) => /^(\w+) probe failed/.exec(e.message ?? "")?.[1]).filter((k): k is string => !!k))];
+
+      return {
+        name,
+        component: pod.metadata?.labels?.["component"] ?? name,
+        nodeName: pod.spec?.nodeName,
+        phase: pod.status?.phase ?? "Unknown",
+        ready: statuses.length > 0 && statuses.every((c) => c.ready),
+        stateReason: current?.waiting?.reason ?? current?.terminated?.reason,
+        restarts: statuses.reduce((sum, c) => sum + (c.restartCount ?? 0), 0),
+        lastRestart: restarted
+          ? { finishedAt: new Date(restarted.finishedAt!).toISOString(), reason: restarted.reason, exitCode: restarted.exitCode }
+          : undefined,
+        probeFailures: latest
+          ? {
+              count: recent.reduce((sum, e) => sum + (e.series?.count ?? e.count ?? 1), 0),
+              lastSeen: eventLastSeen(latest)!,
+              kinds,
+              lastMessage: latest.message ?? "",
+            }
+          : undefined,
+      };
+    })
+    .sort((a, b) => a.component.localeCompare(b.component) || a.name.localeCompare(b.name));
+}
+
+/**
  * API server version and certificate, readiness checks (which include etcd), and etcd
  * storage from /metrics. Anything that cannot be read goes to `notVisible`, so the report
  * says "not checked" instead of implying it is healthy (managed clusters hide etcd).
  */
-export async function collectControlPlane(k8s: K8sClients): Promise<ControlPlaneSummary> {
+export async function collectControlPlane(
+  k8s: K8sClients,
+  windowMinutes = 60,
+  now: Date = new Date(),
+): Promise<ControlPlaneSummary> {
   const notVisible: string[] = [];
-  const [version, readyz, metrics, etcdPods] = await Promise.allSettled([
+  const [version, readyz, metrics, cpPods, unhealthy] = await Promise.allSettled([
     k8s.raw.get("/version"),
     k8s.raw.get("/readyz?verbose"),
     k8s.raw.get("/metrics"),
-    k8s.core.listNamespacedPod({ namespace: "kube-system", labelSelector: "component=etcd" }),
+    // kubeadm, kind and minikube label their static control-plane pods tier=control-plane.
+    k8s.core.listNamespacedPod({ namespace: "kube-system", labelSelector: "tier=control-plane" }),
+    k8s.core.listNamespacedEvent({ namespace: "kube-system", fieldSelector: "type=Warning,reason=Unhealthy" }),
   ]);
   const summary: ControlPlaneSummary = { notVisible };
+
+  if (cpPods.status === "fulfilled" && cpPods.value.items.length > 0) {
+    summary.pods = summarizeControlPlanePods(
+      cpPods.value.items,
+      unhealthy.status === "fulfilled" ? unhealthy.value.items : [],
+      now,
+      windowMinutes,
+    );
+    if (unhealthy.status === "rejected") {
+      notVisible.push(`control-plane probe failures: ${k8sErrorMessage(unhealthy.reason)}`);
+    }
+  } else {
+    notVisible.push(
+      `control-plane pods: ${cpPods.status === "rejected" ? k8sErrorMessage(cpPods.reason) : "none found in kube-system (managed control plane?)"}`,
+    );
+  }
 
   if (version.status === "fulfilled" && version.value.status === 200) {
     try {
@@ -58,8 +134,10 @@ export async function collectControlPlane(k8s: K8sClients): Promise<ControlPlane
   if (metrics.status === "fulfilled" && metrics.value.status === 200) {
     const storage = etcdStorageFromMetrics(metrics.value.body);
     const args =
-      etcdPods.status === "fulfilled"
-        ? etcdPods.value.items.flatMap((p) => [...(p.spec?.containers[0]?.command ?? []), ...(p.spec?.containers[0]?.args ?? [])])
+      cpPods.status === "fulfilled"
+        ? cpPods.value.items
+            .filter((p) => p.metadata?.labels?.["component"] === "etcd")
+            .flatMap((p) => [...(p.spec?.containers[0]?.command ?? []), ...(p.spec?.containers[0]?.args ?? [])])
         : [];
     const quotaFromFlag = etcdQuotaFromArgs(args);
     summary.etcd = {

@@ -94,6 +94,15 @@ describe("demo cluster: cluster-level checks", () => {
     expect(overview.nodes.every((n) => n.heartbeat !== undefined && n.requested !== undefined)).toBe(true);
   });
 
+  it("finds the four control-plane components and sees that they are running", () => {
+    const pods = overview.controlPlane.pods ?? [];
+    expect(pods.map((p) => p.component)).toEqual(["etcd", "kube-apiserver", "kube-controller-manager", "kube-scheduler"]);
+    expect(pods.every((p) => p.ready)).toBe(true);
+    // Restarts and probe failures depend on the cluster's recent history, so they are
+    // covered by unit tests rather than asserted here.
+    expect(issues.filter((i) => i.category === "controlplane-pod-down")).toEqual([]);
+  });
+
   it("flags the demo webhook whose service has no endpoints as critical", () => {
     const webhook = issues.find((i) => i.category === "webhook-unavailable");
     expect(webhook?.severity).toBe("critical");

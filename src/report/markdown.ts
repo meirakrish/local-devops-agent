@@ -32,9 +32,18 @@ function renderIssue(issue: Issue): string {
   return lines.join("\n");
 }
 
-function controlPlaneRows(overview: ClusterOverview, now: Date): string[] {
+function controlPlaneRows(overview: ClusterOverview, issues: Issue[], now: Date): string[] {
   const cp = overview.controlPlane;
   const rows: string[] = [];
+  if (cp.pods) {
+    const ready = cp.pods.filter((p) => p.ready).length;
+    const recent = issues
+      .filter((i) => i.category === "controlplane-restart" || i.category === "controlplane-probe-failures")
+      .map((i) => cp.pods!.find((p) => p.name === i.resource.name)?.component ?? i.resource.name);
+    rows.push(`| Control-plane pods | ${ready}/${cp.pods.length} ready${recent.length > 0 ? `; recently restarted or failing probes: ${recent.join(", ")}` : ""} |`);
+  } else {
+    rows.push("| Control-plane pods | not visible |");
+  }
   if (cp.readyz) {
     const failing = cp.readyz.filter((c) => !c.ok);
     rows.push(`| API server health checks | ${cp.readyz.length - failing.length}/${cp.readyz.length} passing${failing.length > 0 ? ` (failing: ${cell(failing.map((c) => c.name).join(", "), 80)})` : ""} |`);
@@ -125,7 +134,7 @@ export function renderMarkdownReport({
     `| Pods running | ${runningPods}/${overview.pods.length} |`,
     `| Deployments fully ready | ${healthyDeployments}/${overview.deployments.length} |`,
     `| Warning events (recent) | ${overview.warningEvents.length} |`,
-    ...controlPlaneRows(overview, new Date(overview.scannedAt)),
+    ...controlPlaneRows(overview, issues, new Date(overview.scannedAt)),
     `| Issues | ${count("critical")} critical, ${count("warning")} warning, ${count("info")} info |`,
     `| Investigated by LLM | ${findings.length > 0 ? `${findings.length} problem(s)` : "none"} |`,
     "",
