@@ -12,8 +12,8 @@ import { formatCpu, formatMemory, parseQuantity } from "./quantity.js";
 import { dnsIssues, podCreateFailureIssues, serviceIssues, workloadIssues } from "./workload-rules.js";
 
 /**
- * Deterministic, rule-based problem detection. In milestone 1 this is the whole
- * "analysis"; later it gives the LLM triage step a list of candidate problems.
+ * Deterministic, rule-based problem detection. The issues found here decide severity
+ * and the exit code, and are the candidates the LLM triage step chooses from.
  */
 
 export interface RuleOptions {

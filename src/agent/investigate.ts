@@ -18,7 +18,7 @@ Use the tools to gather evidence, then stop calling tools once you know the root
 Guidelines:
 - Tools are read-only. You can never change the cluster; only suggest fixes.
 - For a failing pod, start with k8s_describe_pod, then k8s_get_logs.
-- For a Deployment, k8s_get_deployment shows its pods.
+- For a Deployment, StatefulSet or DaemonSet, k8s_get_workload shows its pods and controller events.
 - Copy namespace and name exactly from "tool arguments" or from tool results. Never put
   "namespace/name" in one field, and never guess names.
 - Do not repeat a tool call with the same arguments.
