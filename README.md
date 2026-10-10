@@ -37,8 +37,10 @@ $ pnpm demo:check --verbose
   not just by prompt instructions (see [Safety](#safety)).
 - **Works without the LLM:** if Ollama is down, or with `--no-llm`, you still get the
   rule-based report.
-- **Cron/CI friendly:** exits with code `2` when critical issues are found, writes a JSON
-  report, and with `--compare` shows what is new, escalated or resolved since the last run.
+- **Cron/CI friendly:** exits with code `2` when critical issues are found (or, with
+  `--fail-on new`, only new ones), writes a JSON report, shows what is new, escalated or
+  resolved since the last run (`--compare`), and checks several clusters in one run
+  (`--context`).
 - **One-command demo:** a kind cluster with deliberately broken workloads to try it on.
 
 ## Quickstart (about 5 minutes)
@@ -224,7 +226,8 @@ several failure modes, and each fix moved responsibility from the prompt into co
 
 ```text
 src/
-  cli.ts                CLI entry point: flags, output file, exit codes
+  cli.ts                CLI entry point: flags, contexts, output files, exit codes
+  cli-support.ts        Context list, {context} paths and the --fail-on decision
   config.ts             .env loading and validation (zod)
   graph.ts              Main LangGraph: scan, checkLlm, triage, investigate, report
   agent/triage.ts       LLM problem selection, plus a deterministic fallback
@@ -308,7 +311,7 @@ change them:
 | --- | --- | --- |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama server URL |
 | `MODEL` | `qwen2.5:7b-instruct` | Model used for triage and investigation |
-| `KUBECONFIG` | _(empty)_ | Kubeconfig path; empty uses `$KUBECONFIG` or `~/.kube/config` |
+| `KUBECONFIG` | _(empty)_ | Kubeconfig path, or several separated by `:` (merged like kubectl); empty uses `$KUBECONFIG` or `~/.kube/config` |
 | `MAX_PROBLEMS` | `5` | Max problems the LLM investigates per run |
 | `MAX_STEPS_PER_PROBLEM` | `6` | Max tool calls per investigated problem |
 | `NUM_CTX` | `16384` | Ollama context window in tokens (see below) |
@@ -343,6 +346,8 @@ pnpm check
 | `-f, --format <format>` | Report format on stdout: `markdown` (default) or `json` |
 | `-o, --output <file>` | Also save the report to a file: JSON if the name ends in `.json`, markdown otherwise. Can be given more than once |
 | `-c, --compare <file>` | Compare with a previous JSON report and mark issues as new, escalated or resolved |
+| `--fail-on <when>` | Exit with `2` on any critical issue (`critical`, the default), or only on critical issues that are new or escalated since the `--compare` report (`new`) |
+| `--context <names>` | Check these kube contexts instead of the current one: comma-separated or repeated. With several, `--output` and `--compare` paths must contain `{context}` |
 | `-v, --verbose` | Log each step and every tool call to stderr |
 | `--no-llm` | Skip LLM triage and investigation (fast, rule-based report only) |
 | `-h, --help` | Show help |
@@ -353,8 +358,11 @@ captures only the report.
 | Exit code | Meaning |
 | --- | --- |
 | `0` | Healthy, or warnings only |
-| `2` | Critical issues found |
+| `2` | Critical issues found (with `--fail-on new`: new or escalated critical issues) |
 | `1` | The check itself failed (bad config, cluster unreachable, unknown namespace) |
+
+With several contexts, the exit code is `2` if any context meets `--fail-on`, otherwise `1`
+if any context could not be checked, otherwise `0`.
 
 ### Running on a schedule
 
@@ -373,8 +381,31 @@ with and says so in its notes.
 
 Issues are matched by a stable key, not by pod name: when a crashlooping pod is replaced by
 another crashlooping pod of the same workload, the issue stays "ongoing". Reports of a
-different kube context or `--namespace` are not compared. The exit code does not depend on
-the comparison; it still reflects all current issues.
+different kube context or `--namespace` are not compared.
+
+By default the exit code still reflects all current issues, so a cron job keeps alerting
+every hour while one known problem stays broken. With `--fail-on new` it exits with `2` only
+when a critical issue is new or escalated since the compared report. When there is nothing
+to compare with (the first run, or a report of another context), every critical issue
+counts as new, so an outage is never hidden:
+
+```cron
+0 * * * * cd /path/to/local-devops-agent && mkdir -p reports && pnpm -s check --fail-on new --compare reports/latest.json --output reports/latest.json --output "reports/$(date +\%F-\%H).md" > /dev/null 2>> reports/cron.log || logger "cluster check failed or found new critical issues"
+```
+
+To check several clusters, list their contexts with `--context`. They run one after
+another, each with its own report: stdout gets the markdown reports separated by `---` (or
+a JSON array with `--format json`), and `{context}` in a path becomes the context name,
+with characters like `:` and `/` replaced by `_`:
+
+```bash
+pnpm -s check --context staging,prod --fail-on new --compare "reports/{context}.json" --output "reports/{context}.json"
+```
+
+A context that cannot be checked (unreachable, unknown namespace) gets an error section in
+the output and does not stop the others. Its files are not overwritten, so the next
+`--compare` still has its last good report. `KUBECONFIG` may list several files separated by
+`:`, as with kubectl.
 
 Cron runs with a minimal `PATH`, so `pnpm` may not be found if Node was installed with
 nvm. Add a `PATH=...` line at the top of the crontab that includes the directory from
