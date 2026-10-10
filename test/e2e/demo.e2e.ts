@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 import { createK8sClients } from "../../src/k8s/client.js";
 import { detectIssues } from "../../src/scan/detect.js";
@@ -160,5 +161,36 @@ describe("CLI against the demo cluster", () => {
     expect(result.status).toBe(2);
     expect(result.stdout).toContain("**Status: CRITICAL**");
     expect(result.stdout).toContain("Context: `kind-devops-agent-demo`");
+  });
+
+  it("prints JSON and, run twice with --compare, reports every issue as ongoing", () => {
+    const latest = join(mkdtempSync(join(tmpdir(), "e2e-compare-")), "latest.json");
+    const run = () =>
+      spawnSync(
+        "pnpm",
+        [
+          "-s",
+          "check",
+          "--namespace",
+          NAMESPACE,
+          "--no-llm",
+          "--format",
+          "json",
+          "--compare",
+          latest,
+          "--output",
+          latest,
+        ],
+        { env: { ...process.env, KUBECONFIG }, encoding: "utf8" },
+      );
+    const first = JSON.parse(run().stdout);
+    expect(first.status).toBe("CRITICAL");
+    expect(first.comparison).toBeNull();
+    expect(first.notes.comparison).toMatch(/^no previous report/);
+
+    const second = JSON.parse(run().stdout);
+    expect(second.comparison.previousScannedAt).toBe(first.scannedAt);
+    expect(second.comparison.new).toBe(0);
+    expect(second.comparison.ongoing).toBe(second.issues.length);
   });
 });

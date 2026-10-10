@@ -113,7 +113,8 @@ export function deploymentOfReplicaSet(replicaSet: string, hash?: string): strin
 /** The workload a pod belongs to: the Deployment of its ReplicaSet, else its owner. */
 export function podWorkload(pod: V1Pod): string | undefined {
   const owner = pod.metadata?.ownerReferences?.find((o) => o.controller) ?? pod.metadata?.ownerReferences?.[0];
-  if (!owner) return undefined;
+  // Static pods are "owned" by their Node, which is not a workload: pods on one node are unrelated.
+  if (!owner || owner.kind === "Node") return undefined;
   if (owner.kind !== "ReplicaSet") return owner.name;
   const hash = pod.metadata?.labels?.["pod-template-hash"];
   return hash ? deploymentOfReplicaSet(owner.name, hash) : owner.name;

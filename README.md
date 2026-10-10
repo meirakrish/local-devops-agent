@@ -37,7 +37,8 @@ $ pnpm demo:check --verbose
   not just by prompt instructions (see [Safety](#safety)).
 - **Works without the LLM:** if Ollama is down, or with `--no-llm`, you still get the
   rule-based report.
-- **Cron/CI friendly:** exits with code `2` when critical issues are found.
+- **Cron/CI friendly:** exits with code `2` when critical issues are found, writes a JSON
+  report, and with `--compare` shows what is new, escalated or resolved since the last run.
 - **One-command demo:** a kind cluster with deliberately broken workloads to try it on.
 
 ## Quickstart (about 5 minutes)
@@ -245,6 +246,8 @@ src/
                         DaemonSets, Services, DNS, pod creation) and cluster-rules
                         (control plane, etcd, webhooks)
   report/markdown.ts    Markdown report renderer
+  report/json.ts        JSON report (schema version 1)
+  report/compare.ts     Changes since a previous JSON report (--compare)
 test/                   Unit tests (fake cluster and scripted fake LLM; no Ollama needed)
 test/e2e/               End-to-end tests against the demo cluster
 demo/workloads.yaml     Five broken deployments, one healthy one, two broken Services and a broken admission webhook
@@ -337,7 +340,9 @@ pnpm check
 | Flag | Description |
 | --- | --- |
 | `-n, --namespace <name>` | Only check one namespace (nodes are always checked) |
-| `-o, --output <file>` | Also save the report as markdown |
+| `-f, --format <format>` | Report format on stdout: `markdown` (default) or `json` |
+| `-o, --output <file>` | Also save the report to a file: JSON if the name ends in `.json`, markdown otherwise. Can be given more than once |
+| `-c, --compare <file>` | Compare with a previous JSON report and mark issues as new, escalated or resolved |
 | `-v, --verbose` | Log each step and every tool call to stderr |
 | `--no-llm` | Skip LLM triage and investigation (fast, rule-based report only) |
 | `-h, --help` | Show help |
@@ -354,18 +359,31 @@ captures only the report.
 ### Running on a schedule
 
 The exit codes make the agent easy to run from cron or CI. For example, a crontab entry
-that checks the cluster every hour and keeps a timestamped report:
+that checks the cluster every hour, keeps a timestamped markdown report, and compares each
+run with the previous one through `reports/latest.json`:
 
 ```cron
-0 * * * * cd /path/to/local-devops-agent && mkdir -p reports && pnpm -s check --output "reports/$(date +\%F-\%H).md" > /dev/null 2>> reports/cron.log || logger "cluster check failed or found critical issues"
+0 * * * * cd /path/to/local-devops-agent && mkdir -p reports && pnpm -s check --compare reports/latest.json --output reports/latest.json --output "reports/$(date +\%F-\%H).md" > /dev/null 2>> reports/cron.log || logger "cluster check failed or found critical issues"
 ```
+
+`--compare` reads the previous report before `--output` overwrites it, so one file is
+enough. Each report then starts with a "Changes since last run" section, and new or
+escalated issues are tagged `[NEW]` or `[ESCALATED]`. The first run has nothing to compare
+with and says so in its notes.
+
+Issues are matched by a stable key, not by pod name: when a crashlooping pod is replaced by
+another crashlooping pod of the same workload, the issue stays "ongoing". Reports of a
+different kube context or `--namespace` are not compared. The exit code does not depend on
+the comparison; it still reflects all current issues.
 
 Cron runs with a minimal `PATH`, so `pnpm` may not be found if Node was installed with
 nvm. Add a `PATH=...` line at the top of the crontab that includes the directory from
 `dirname "$(which pnpm)"`.
 
 In CI, run `pnpm -s check --no-llm` to fail a job on critical issues without needing a
-GPU. The rule-based report needs only cluster access.
+GPU. The rule-based report needs only cluster access. Add `--format json` (or
+`--output report.json`) for a machine-readable report: status, issue counts, the summary
+numbers, every issue with its evidence and key, the LLM findings, and scan notes.
 
 ## Example report
 

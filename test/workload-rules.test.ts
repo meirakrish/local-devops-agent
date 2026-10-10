@@ -71,6 +71,12 @@ describe("pod workload", () => {
     ];
     expect(podWorkload(p)).toBe("db");
   });
+
+  it("gives static pods (owned by their Node) no workload", () => {
+    const p = pod("etcd-cp", {}, true);
+    p.metadata!.ownerReferences = [{ apiVersion: "v1", kind: "Node", name: "cp", uid: "1", controller: true }];
+    expect(podWorkload(p)).toBeUndefined();
+  });
 });
 
 describe("service rules", () => {
