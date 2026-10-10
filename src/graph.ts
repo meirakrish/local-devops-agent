@@ -7,7 +7,7 @@ import type { K8sClients } from "./k8s/client.js";
 import type { LlmClient, LlmUsage } from "./llm/model.js";
 import { checkOllama, type OllamaStatus } from "./llm/ollama.js";
 import { renderMarkdownReport } from "./report/markdown.js";
-import { detectIssues } from "./scan/rules.js";
+import { detectIssues } from "./scan/detect.js";
 import { scanCluster } from "./scan/scan.js";
 import type { ClusterOverview, Issue } from "./scan/types.js";
 import { createK8sTools } from "./tools/k8s-tools.js";

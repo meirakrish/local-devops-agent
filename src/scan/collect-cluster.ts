@@ -6,7 +6,7 @@ import {
   etcdQuotaFromArgs,
   etcdStorageFromMetrics,
   parseHealthChecks,
-} from "./cluster.js";
+} from "./apiserver-parse.js";
 import { eventLastSeen, podRequests, summarizeService } from "./summarize.js";
 import type { ControlPlanePod, ControlPlaneSummary, DnsSummary, NodeSummary, WebhookSummary } from "./types.js";
 

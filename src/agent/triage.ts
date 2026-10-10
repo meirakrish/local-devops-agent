@@ -1,7 +1,7 @@
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { z } from "zod";
 import type { LlmClient } from "../llm/model.js";
-import { compareSeverity } from "../scan/rules.js";
+import { compareSeverity } from "../scan/severity.js";
 import type { ClusterOverview, Issue, Severity } from "../scan/types.js";
 import type { Problem } from "./types.js";
 

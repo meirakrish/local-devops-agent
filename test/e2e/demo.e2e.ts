@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 import { createK8sClients } from "../../src/k8s/client.js";
-import { detectIssues } from "../../src/scan/rules.js";
+import { detectIssues } from "../../src/scan/detect.js";
 import { scanCluster } from "../../src/scan/scan.js";
 import type { ClusterOverview, Issue } from "../../src/scan/types.js";
 

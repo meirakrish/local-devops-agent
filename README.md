@@ -230,14 +230,20 @@ src/
   agent/investigate.ts  Tool-calling loop (subgraph) and structured conclusion
   k8s/client.ts         Read-only Kubernetes client
   k8s/raw.ts            GET-only reader for /readyz, /livez, /version and /metrics
-  llm/model.ts          LlmClient interface and Ollama implementation
+  k8s/errors.ts         Kubernetes API error helpers
+  llm/model.ts          LlmClient interface, Ollama implementation, token usage
   llm/ollama.ts         Ollama connection check
   tools/k8s-tools.ts    The eight read-only tools
+  tools/format.ts       Compact text for pods, nodes and events in tool output
   tools/truncate.ts     Output truncation
-  scan/                 Cluster overview, summaries, quantities and rules
-                        (rules.ts: pods, Deployments and nodes; workload-rules.ts: DaemonSets,
-                        StatefulSets, Services, cluster DNS, pod creation failures;
-                        cluster-rules.ts: control plane, etcd, webhooks)
+  scan/scan.ts          Cluster overview: lists everything in parallel
+  scan/collect-cluster.ts  Control plane, etcd, node usage, webhooks and DNS collection
+  scan/summarize.ts     Raw Kubernetes objects to compact summaries (scan/types.ts)
+  scan/apiserver-parse.ts  Parsers for /readyz, /metrics and versions
+  scan/detect.ts        Runs every rule over the overview
+  scan/*-rules.ts       The rules: pod-, node-, workload- (Deployments, StatefulSets,
+                        DaemonSets, Services, DNS, pod creation) and cluster-rules
+                        (control plane, etcd, webhooks)
   report/markdown.ts    Markdown report renderer
 test/                   Unit tests (fake cluster and scripted fake LLM; no Ollama needed)
 test/e2e/               End-to-end tests against the demo cluster

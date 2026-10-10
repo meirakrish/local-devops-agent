@@ -1,6 +1,6 @@
 import type { V1EndpointSlice, V1Pod, V1Service } from "@kubernetes/client-node";
 import { describe, expect, it } from "vitest";
-import { detectIssues } from "../src/scan/rules.js";
+import { detectIssues } from "../src/scan/detect.js";
 import { podCreateFailures } from "../src/scan/scan.js";
 import { podWorkload, summarizePod, summarizeService } from "../src/scan/summarize.js";
 import type { ClusterOverview, EventSummary, ServiceSummary, WorkloadSummary } from "../src/scan/types.js";

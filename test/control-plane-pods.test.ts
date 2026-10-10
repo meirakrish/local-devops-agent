@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { renderMarkdownReport } from "../src/report/markdown.js";
 import { summarizeControlPlanePods } from "../src/scan/collect-cluster.js";
 import { controlPlanePodIssues } from "../src/scan/cluster-rules.js";
-import { detectIssues } from "../src/scan/rules.js";
+import { detectIssues } from "../src/scan/detect.js";
 import { summarizePod } from "../src/scan/summarize.js";
 import type { ClusterOverview, ControlPlanePod } from "../src/scan/types.js";
 

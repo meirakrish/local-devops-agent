@@ -1,6 +1,9 @@
 import type { V1ContainerStatus, V1Deployment, V1Node, V1Pod } from "@kubernetes/client-node";
 import { describe, expect, it } from "vitest";
-import { detectIssues, deploymentIssues, nodeIssues, podIssues } from "../src/scan/rules.js";
+import { detectIssues } from "../src/scan/detect.js";
+import { nodeIssues } from "../src/scan/node-rules.js";
+import { podIssues } from "../src/scan/pod-rules.js";
+import { deploymentIssues } from "../src/scan/workload-rules.js";
 import { summarizeDeployment, summarizeNode, summarizePod } from "../src/scan/summarize.js";
 import type { ClusterOverview } from "../src/scan/types.js";
 

@@ -24,3 +24,8 @@ export function formatMemory(bytes: number): string {
   if (bytes >= 2 ** 30) return `${Number((bytes / 2 ** 30).toFixed(1))}Gi`;
   return `${Math.round(bytes / 2 ** 20)}Mi`;
 }
+
+/** 0.734 -> "73%". */
+export function formatPercent(ratio: number): string {
+  return `${Math.round(ratio * 100)}%`;
+}

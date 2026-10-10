@@ -7,8 +7,9 @@ import {
   parseHealthChecks,
   parseMetrics,
   parseMinorVersion,
-} from "../src/scan/cluster.js";
-import { controlPlaneIssues, nodeCapacityIssues, webhookIssues } from "../src/scan/cluster-rules.js";
+} from "../src/scan/apiserver-parse.js";
+import { controlPlaneIssues, webhookIssues } from "../src/scan/cluster-rules.js";
+import { nodeCapacityIssues } from "../src/scan/node-rules.js";
 import type { ControlPlaneSummary, NodeSummary, WebhookSummary } from "../src/scan/types.js";
 
 // Captured from a real kind cluster (Kubernetes v1.37).

@@ -1,5 +1,5 @@
 import type { PeerCertificate } from "../k8s/raw.js";
-import type { HealthCheck } from "./cluster.js";
+import type { HealthCheck } from "./apiserver-parse.js";
 
 /**
  * Compact summaries of cluster objects. Raw Kubernetes objects are large; these

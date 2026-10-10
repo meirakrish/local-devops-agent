@@ -1,6 +1,14 @@
-import type { DnsSummary, EventSummary, Issue, ServicePod, ServiceSummary, WorkloadSummary } from "./types.js";
+import type {
+  DeploymentSummary,
+  DnsSummary,
+  EventSummary,
+  Issue,
+  ServicePod,
+  ServiceSummary,
+  WorkloadSummary,
+} from "./types.js";
 
-/** Rules for DaemonSets, StatefulSets, Services, cluster DNS and pod creation failures. */
+/** Rules for Deployments, DaemonSets, StatefulSets, Services, cluster DNS and pod creation failures. */
 
 function ageMinutes(createdAt: string | undefined, now: Date): number {
   if (!createdAt) return Number.POSITIVE_INFINITY;
@@ -20,6 +28,47 @@ function podState(p: ServicePod): string {
 function singleWorkload(namespace: string, pods: ServicePod[]): string | undefined {
   const names = [...new Set(pods.map((p) => p.workload).filter((w): w is string => w !== undefined))];
   return names.length === 1 ? `${namespace}/${names[0]}` : undefined;
+}
+
+export function deploymentIssues(d: DeploymentSummary): Issue[] {
+  const resource = { kind: "Deployment", namespace: d.namespace, name: d.name };
+  const workload = `${d.namespace}/${d.name}`;
+  const progressing = d.conditions.find((c) => c.type === "Progressing");
+  const issues: Issue[] = [];
+
+  if (progressing?.status === "False" && progressing.reason === "ProgressDeadlineExceeded") {
+    issues.push({
+      id: `deployment/${d.namespace}/${d.name}:rollout-stuck`,
+      severity: "critical",
+      category: "rollout-stuck",
+      resource,
+      title: `Deployment ${d.namespace}/${d.name} rollout exceeded its progress deadline`,
+      evidence: [progressing.message ?? "Progressing=False (ProgressDeadlineExceeded)"],
+      hint: "Inspect the new ReplicaSet's pods; consider `kubectl rollout undo` after finding the cause.",
+      workload,
+    });
+  }
+
+  if (d.desired > 0 && d.ready < d.desired) {
+    // ReplicaFailure=True: the API server rejected its pods, so there are no pods to look at.
+    const replicaFailure = d.conditions.find((c) => c.type === "ReplicaFailure" && c.status === "True");
+    issues.push({
+      id: `deployment/${d.namespace}/${d.name}:unavailable`,
+      severity: d.ready === 0 ? "critical" : "warning",
+      category: "replicas-unavailable",
+      resource,
+      title: `Deployment ${d.namespace}/${d.name} has ${d.ready}/${d.desired} replicas ready`,
+      evidence: [
+        `desired=${d.desired} ready=${d.ready} available=${d.available} updated=${d.updated}`,
+        ...(replicaFailure ? [`ReplicaFailure (${replicaFailure.reason ?? "?"}): ${replicaFailure.message ?? ""}`] : []),
+      ],
+      hint: replicaFailure
+        ? "Its pods cannot be created; the ReplicaSet's FailedCreate events say why (quota, Pod Security, admission webhook)."
+        : "See the pod issues for this deployment for the underlying cause.",
+      workload,
+    });
+  }
+  return issues;
 }
 
 export function workloadIssues(w: WorkloadSummary): Issue[] {
