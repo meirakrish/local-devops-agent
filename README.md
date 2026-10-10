@@ -210,11 +210,16 @@ several failure modes, and each fix moved responsibility from the prompt into co
 - **Workloads are grouped in code.** Each issue records its workload, taken from the pod's
   owner, so a Deployment, StatefulSet or DaemonSet, its failing pods, the Service in front
   of them and any `FailedCreate` errors become one problem. Pod names alone could not group
-  StatefulSet pods (`db-0`) or a Deployment whose pods were never created.
+  StatefulSet pods (`db-0`) or a Deployment whose pods were never created. The same holds
+  for a PVC and the pods that mount it, and for a CronJob and the pods of its Jobs. Code
+  also drops the model's merges across two different workloads: it once folded three
+  unrelated broken Deployments into an OOM problem, splitting them from their own pods.
 - **Control-plane incidents are grouped in code.** Failures cascade: a slow etcd makes
   the API server time out, so the scheduler and controller-manager lose leader election
-  and restart. All control-plane health issues become one problem, investigated from the
-  top of the chain (etcd, then the API server).
+  and restart. All control-plane health issues, including a stale leader-election Lease,
+  become one problem, investigated from the top of the chain (etcd, then the API server).
+  Likewise, an unavailable aggregated API and the namespaces it keeps from deleting form
+  one problem led by the APIService.
 - **Focused tool output.** `k8s_cluster_health` returns only the requested section. With
   everything in one answer, the model blamed a webhook outage on unrelated control-plane
   problems.

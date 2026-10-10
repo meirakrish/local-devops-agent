@@ -111,6 +111,14 @@ describe("triage", () => {
     expect(problems[1]?.related).toEqual([]);
   });
 
+  it("buildProblems keeps another workload's issues out of a problem, so they can form their own", () => {
+    const problems = buildProblems([{ issueId: payPod.id, relatedIssueIds: [webDeploy.id, cordoned.id] }], ALL, 5);
+    // The node issue has no workload, so the model's merge is kept; the web Deployment is not.
+    expect(problems[0]?.related.map((i) => i.id)).toEqual([cordoned.id]);
+    const completed = addMissedCritical(problems, ALL, 5);
+    expect(completed.map((p) => p.primary.id)).toContain(webPod1.id);
+  });
+
   it("makes the pod the primary issue even when the LLM picks the deployment", async () => {
     const { llm } = fakeLlm([], {
       problems: [{ issueId: webDeploy.id, relatedIssueIds: [webPod1.id], reason: "web down" }],

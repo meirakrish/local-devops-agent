@@ -131,9 +131,14 @@ export function buildProblems(
     const primary = byId.get(pick.issueId);
     if (!primary || used.has(primary.id)) continue;
     used.add(primary.id);
+    // Issues of two different workloads do not share a root cause the model can see; in
+    // testing it merged unrelated broken Deployments into an OOM problem, which split them
+    // from their own pods and storage issues. Those stay available for their own problem.
+    const otherWorkload = (i: Issue) =>
+      i.workload !== undefined && primary.workload !== undefined && i.workload !== primary.workload;
     const related = (pick.relatedIssueIds ?? [])
       .map((id) => byId.get(id))
-      .filter((i): i is Issue => i !== undefined && !used.has(i.id) && i !== primary);
+      .filter((i): i is Issue => i !== undefined && !used.has(i.id) && i !== primary && !otherWorkload(i));
     // Also absorb issues of the same workload, in case the model did not merge them.
     for (const i of issues) {
       if (!used.has(i.id) && i !== primary && !related.includes(i) && groupKey(i) === groupKey(primary)) {
