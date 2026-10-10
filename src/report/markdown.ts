@@ -1,4 +1,4 @@
-import type { Finding } from "../agent/types.js";
+import type { Finding, FixFlag } from "../agent/types.js";
 import { addUsage, emptyUsage, type LlmUsage } from "../llm/model.js";
 import type { OllamaStatus } from "../llm/ollama.js";
 import { formatBytes } from "../scan/quantity.js";
@@ -113,6 +113,24 @@ function problemChange(f: Finding, comparison: Comparison | undefined): IssueCha
   return changes.includes("new") ? "new" : changes.includes("escalated") ? "escalated" : "ongoing";
 }
 
+const code = (value: string) => `\`${value.replace(/`/g, "")}\``;
+
+/** Notes after a fix step, e.g. "_(unverified: `nginx:1.25.9` does not appear in the cluster data)_". */
+export function fixStepNotes(flags: FixFlag[]): string {
+  const notes: string[] = [];
+  const unverified = flags.filter((f) => f.kind === "unverified").map((f) => code(f.value));
+  if (unverified.length > 0) {
+    const verb = unverified.length === 1 ? "does" : "do";
+    notes.push(`_(unverified: ${unverified.join(", ")} ${verb} not appear in the cluster data)_`);
+  }
+  for (const f of flags.filter((x) => x.kind !== "unverified")) {
+    notes.push(
+      `_(${f.kind === "destructive" ? "destructive" : "changes the cluster"}: ${code(f.value)} ${f.message})_`,
+    );
+  }
+  return notes.join(" ");
+}
+
 function renderFinding(f: Finding, index: number, numCtx: number | undefined, change?: IssueChange): string {
   const { problem } = f;
   const affected = [problem.primary, ...problem.related].map(resourceName);
@@ -135,10 +153,16 @@ function renderFinding(f: Finding, index: number, numCtx: number | undefined, ch
     lines.push("**Evidence:**", "", ...f.evidence.map((e) => `- ${truncate(e, 300)}`), "");
   }
   if (f.suggestedFix.length > 0) {
-    lines.push("**Suggested fix** (not applied):", "", ...f.suggestedFix.map((s, i) => `${i + 1}. ${s}`), "");
+    const steps = f.suggestedFix.map((s, i) => {
+      const notes = fixStepNotes((f.fixFlags ?? []).filter((flag) => flag.step === i));
+      return `${i + 1}. ${s}${notes ? ` ${notes}` : ""}`;
+    });
+    lines.push("**Suggested fix** (not applied):", "", ...steps, "");
   }
   const usage = f.usage && f.usage.calls > 0 ? ` · ${tokens(f.usage, numCtx)}` : "";
-  lines.push(`_Confidence: ${f.confidence} · ${f.toolCalls} tool call(s)${usage}_`);
+  const reason = f.confidenceReason ? ` (${f.confidenceReason})` : "";
+  const repeats = f.repeatedCalls ? ` · ${f.repeatedCalls} repeated call(s) not run` : "";
+  lines.push(`_Confidence: ${f.confidence}${reason} · ${f.toolCalls} tool call(s)${repeats}${usage}_`);
   return lines.join("\n");
 }
 

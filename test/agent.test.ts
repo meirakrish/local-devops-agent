@@ -239,8 +239,80 @@ describe("investigate loop", () => {
       .filter((m) => m instanceof ToolMessage)
       .map((m) => String(m.content));
     expect(toolReplies[0]).toContain('unknown tool "k8s_delete_pod"');
-    expect(toolReplies[2]).toContain("already made this exact call");
-    expect(finding.toolCalls).toBe(3);
+    expect(toolReplies[2]).toContain("Not run: you already called k8s_get_logs with these exact arguments");
+    expect(toolReplies[2]).toContain("After 1 more repeated call(s) the investigation ends.");
+    // The unknown tool uses a step; the blocked repeat does not.
+    expect(finding.toolCalls).toBe(2);
+    expect(finding.repeatedCalls).toBe(1);
+  });
+
+  it("does not charge blocked repeats to the step budget", async () => {
+    calls = [];
+    const { llm } = fakeLlm([
+      call("k8s_get_logs", { pod: "a" }, "c1"),
+      call("k8s_get_logs", { pod: "a" }, "c2"), // repeat: answered, not run, no step used
+      call("k8s_get_logs", { pod: "b" }, "c3"), // still runs with maxSteps=2
+    ]);
+    const finding = await investigate(problem, { llm, tools: [getLogs], maxSteps: 2 });
+    expect(calls).toEqual([{ pod: "a" }, { pod: "b" }]);
+    expect(finding.toolCalls).toBe(2);
+    expect(finding.repeatedCalls).toBe(1);
+  });
+
+  it("ends the loop after the second repeated call and goes straight to the conclusion", async () => {
+    calls = [];
+    const getEvents = tool(async () => "no events", {
+      name: "k8s_list_events",
+      description: "events",
+      schema: z.object({ namespace: z.string() }),
+    });
+    const replies = [
+      call("k8s_get_logs", { pod: "a" }, "c1"),
+      call("k8s_get_logs", { pod: "a" }, "c2"),
+      call("k8s_get_logs", { pod: "a" }, "c3"),
+      call("k8s_get_logs", { pod: "z" }, "c4"), // never asked for: the loop ended
+    ];
+    const { llm, seen } = fakeLlm(replies);
+    const finding = await investigate(problem, { llm, tools: [getLogs, getEvents], maxSteps: 6 });
+    expect(calls).toHaveLength(1);
+    expect(replies).toHaveLength(1); // the 4th reply was never requested
+    expect(finding.toolCalls).toBe(1);
+    expect(finding.repeatedCalls).toBe(2);
+    const toolReplies = seen
+      .at(-1)!
+      .filter((m) => m instanceof ToolMessage)
+      .map((m) => String(m.content));
+    // The first repeat names the tools not used yet; the second says the loop ends.
+    expect(toolReplies[1]).toContain("Tools you have not used yet: k8s_list_events.");
+    expect(toolReplies[2]).toContain("The investigation now ends");
+    // Ending on repeats does not lower the computed confidence by itself.
+    expect(finding.modelConfidence).toBe("high");
+    expect(finding.confidence).toBe("high");
+  });
+
+  it("computes confidence from the tool output, not the model's rating", async () => {
+    const { llm } = fakeLlm([call("k8s_get_logs", { pod: "web-1" }, "c1"), new AIMessage("done")], {
+      ...CONCLUSION,
+      evidence: ["The node is at 95% CPU utilization", "Memory usage is 3Gi"],
+    });
+    const finding = await investigate(problem, { llm, tools: [getLogs], maxSteps: 5 });
+    expect(finding.modelConfidence).toBe("high");
+    expect(finding.confidence).toBe("low");
+    expect(finding.confidenceReason).toBe("evidence not found in tool output; the model said high");
+  });
+
+  it("flags fix steps with values the investigation never saw", async () => {
+    const { llm } = fakeLlm([call("k8s_get_logs", { pod: "web-1" }, "c1"), new AIMessage("done")], {
+      ...CONCLUSION,
+      suggestedFix: [
+        "kubectl set env deployment/web DATABASE_URL=postgres://db:5432/app",
+        "Add DATABASE_URL to the deployment env",
+      ],
+    });
+    const finding = await investigate(problem, { llm, tools: [getLogs], maxSteps: 5 });
+    expect(finding.fixFlags).toEqual([
+      { step: 0, kind: "unverified", value: "postgres://db:5432/app", message: "does not appear in the cluster data" },
+    ]);
   });
 
   it("treats null optional arguments as missing", async () => {
@@ -325,7 +397,8 @@ describe("investigate loop", () => {
     const finding = await investigate(problem, { llm, tools: [describe], maxSteps: 5 });
     expect(described).toEqual([{ namespace: "shop", name: "web-7db8d69f68-4f2n7" }]); // only the seed ran
     expect(String(seen[0]?.find((m) => m instanceof ToolMessage)?.content)).toContain("CrashLoopBackOff");
-    expect(finding.toolCalls).toBe(2); // seed + the blocked repeat
+    expect(finding.toolCalls).toBe(1); // the seed; the blocked repeat is not counted
+    expect(finding.repeatedCalls).toBe(1);
   });
 
   it("chooses seed calls by resource kind", () => {
