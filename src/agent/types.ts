@@ -1,3 +1,4 @@
+import type { LlmUsage } from "../llm/model.js";
 import type { Issue, Severity } from "../scan/types.js";
 
 /** A problem chosen by triage: one primary issue plus issues sharing its root cause. */
@@ -20,6 +21,8 @@ export interface Finding {
   suggestedFix: string[];
   confidence: Confidence;
   toolCalls: number;
+  /** Tokens used by this investigation, if the LLM client reports them. */
+  usage?: LlmUsage;
   /** Set when the investigation failed; the report falls back to rule-based info. */
   error?: string;
 }

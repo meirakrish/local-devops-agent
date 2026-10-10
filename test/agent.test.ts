@@ -187,6 +187,15 @@ describe("investigate loop", () => {
     expect(String(toolMsg?.content)).toContain("FATAL");
   });
 
+  it("attaches the investigation's token usage to the finding", async () => {
+    const { llm } = fakeLlm([new AIMessage("I know the cause.")]);
+    let taken = 0;
+    llm.takeUsage = () => ({ calls: ++taken, promptTokens: 100, outputTokens: 10, peakPromptTokens: 100 });
+    const finding = await investigate(problem, { llm, tools: [getLogs], maxSteps: 5 });
+    // Taken once at the start (discarding earlier calls) and once at the end.
+    expect(finding.usage?.calls).toBe(2);
+  });
+
   it("stops at maxSteps and still concludes", async () => {
     calls = [];
     const { llm } = fakeLlm([

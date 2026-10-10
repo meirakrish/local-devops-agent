@@ -1,4 +1,5 @@
 import type { Finding } from "../agent/types.js";
+import { addUsage, emptyUsage, type LlmUsage } from "../llm/model.js";
 import type { OllamaStatus } from "../llm/ollama.js";
 import type { ClusterOverview, Issue, Severity } from "../scan/types.js";
 
@@ -70,7 +71,23 @@ function resourceName(i: Issue): string {
   return `${i.resource.kind} ${i.resource.namespace ? `${i.resource.namespace}/` : ""}${i.resource.name}`;
 }
 
-function renderFinding(f: Finding, index: number): string {
+/** A prompt using this share of NUM_CTX is close to being truncated. */
+const CONTEXT_WARNING_RATIO = 0.8;
+
+const n = (v: number) => v.toLocaleString("en-US");
+
+function tokens(usage: LlmUsage, numCtx: number | undefined): string {
+  const peak = `largest prompt ${n(usage.peakPromptTokens)}${numCtx ? ` of ${n(numCtx)}` : ""}`;
+  return `${n(usage.promptTokens)} prompt + ${n(usage.outputTokens)} output tokens in ${usage.calls} LLM call(s), ${peak}`;
+}
+
+/** Set when a prompt came close to not fitting in the context window. */
+function contextWarning(usage: LlmUsage | undefined, numCtx: number | undefined): string | undefined {
+  if (!usage || !numCtx || usage.peakPromptTokens < numCtx * CONTEXT_WARNING_RATIO) return undefined;
+  return `the largest prompt used ${Math.round((usage.peakPromptTokens / numCtx) * 100)}% of \`NUM_CTX\`; a longer one would not fit. Consider raising \`NUM_CTX\` or lowering \`TOOL_OUTPUT_MAX_CHARS\`.`;
+}
+
+function renderFinding(f: Finding, index: number, numCtx: number | undefined): string {
   const { problem } = f;
   const affected = [problem.primary, ...problem.related].map(resourceName);
   const lines = [
@@ -79,6 +96,8 @@ function renderFinding(f: Finding, index: number): string {
     `**Affected:** ${[...new Set(affected)].join(", ")}`,
     "",
   ];
+  const warning = contextWarning(f.usage, numCtx);
+  if (warning) lines.push(`**Context limit:** ${warning}`, "");
   if (f.error) {
     lines.push(`_LLM investigation failed: ${truncate(f.error, 200)}. Rule-based evidence:_`, "");
     for (const e of problem.primary.evidence) lines.push(`- ${truncate(e, 300)}`);
@@ -92,7 +111,8 @@ function renderFinding(f: Finding, index: number): string {
   if (f.suggestedFix.length > 0) {
     lines.push("**Suggested fix** (not applied):", "", ...f.suggestedFix.map((s, i) => `${i + 1}. ${s}`), "");
   }
-  lines.push(`_Confidence: ${f.confidence} · ${f.toolCalls} tool call(s)_`);
+  const usage = f.usage && f.usage.calls > 0 ? ` · ${tokens(f.usage, numCtx)}` : "";
+  lines.push(`_Confidence: ${f.confidence} · ${f.toolCalls} tool call(s)${usage}_`);
   return lines.join("\n");
 }
 
@@ -101,6 +121,10 @@ export interface ReportInput {
   issues: Issue[];
   ollama?: OllamaStatus;
   findings?: Finding[];
+  /** Tokens used by triage, if the LLM client reports them. */
+  triageUsage?: LlmUsage;
+  /** Ollama context window, to show how close prompts came to it. */
+  numCtx?: number;
   /** Why the LLM steps did not run, if they did not. */
   llmSkipped?: string;
 }
@@ -110,6 +134,8 @@ export function renderMarkdownReport({
   issues,
   ollama,
   findings = [],
+  triageUsage,
+  numCtx,
   llmSkipped,
 }: ReportInput): string {
   const status = overallStatus(issues);
@@ -148,7 +174,7 @@ export function renderMarkdownReport({
 
   if (findings.length > 0) {
     out.push("## Investigated problems", "");
-    findings.forEach((f, i) => out.push(renderFinding(f, i + 1), ""));
+    findings.forEach((f, i) => out.push(renderFinding(f, i + 1, numCtx), ""));
   }
 
   // Issues already covered by an investigated problem are not repeated.
@@ -195,6 +221,13 @@ export function renderMarkdownReport({
       out.push(`- LLM: Ollama reachable, but model \`${ollama.model}\` is not pulled (\`ollama pull ${ollama.model}\`)`);
     else out.push(`- LLM: \`${ollama.model}\` at ${ollama.url}`);
   }
+  const total = [triageUsage, ...findings.map((f) => f.usage)].reduce<LlmUsage>(
+    (sum, u) => (u ? addUsage(sum, u) : sum),
+    emptyUsage(),
+  );
+  if (total.calls > 0) out.push(`- LLM usage: ${tokens(total, numCtx)}`);
+  const triageWarning = contextWarning(triageUsage, numCtx);
+  if (triageWarning) out.push(`- Context limit in triage: ${triageWarning}`);
   if (llmSkipped) out.push(`- LLM investigation skipped: ${llmSkipped}.`);
   out.push(
     "- Issues are detected by rules; root causes in \"Investigated problems\" come from the local LLM and may be wrong.",

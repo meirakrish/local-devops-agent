@@ -239,6 +239,7 @@ export function buildInvestigationGraph({ llm, tools, maxSteps, log = () => {} }
 
 export async function investigate(problem: Problem, deps: InvestigateDeps): Promise<Finding> {
   const graph = buildInvestigationGraph(deps);
+  deps.llm.takeUsage?.(); // count only this investigation's calls
   const messages: BaseMessage[] = [
     new SystemMessage(SYSTEM_PROMPT),
     new HumanMessage(problemPrompt(problem, deps.maxSteps)),
@@ -268,7 +269,7 @@ export async function investigate(problem: Problem, deps: InvestigateDeps): Prom
     }
     // Each agent/tools round is 2 graph steps; leave room for the rest.
     const result = await graph.invoke(initial, { recursionLimit: deps.maxSteps * 2 + 10 });
-    return { problem, ...result.conclusion, toolCalls: result.steps };
+    return { problem, ...result.conclusion, toolCalls: result.steps, usage: deps.llm.takeUsage?.() };
   } catch (err) {
     return {
       problem,
@@ -278,6 +279,7 @@ export async function investigate(problem: Problem, deps: InvestigateDeps): Prom
       suggestedFix: [],
       confidence: "low",
       toolCalls: 0,
+      usage: deps.llm.takeUsage?.(),
       error: err instanceof Error ? err.message : String(err),
     };
   }

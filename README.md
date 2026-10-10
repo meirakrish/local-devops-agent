@@ -212,7 +212,9 @@ several failure modes, and each fix moved responsibility from the prompt into co
   crash the run.
 - **Bounded output and context.** Tool output is truncated, keeping the head and the
   tail, since errors are usually at the end. Env var values are never shown, and the
-  context window (`NUM_CTX`) is set explicitly.
+  context window (`NUM_CTX`) is set explicitly. A prompt that does not fit is rejected
+  instead of silently truncated, and the report shows the token usage of each
+  investigation.
 - **Graceful degradation.** Each LLM call is retried once, because local GPUs
   occasionally fail a single request. If Ollama is down, triage fails or one
   investigation fails, the report falls back to the rule-based findings for that part.
@@ -307,9 +309,16 @@ change them:
 
 Invalid values stop the run at startup with an error that names the variable.
 
-`NUM_CTX` matters: Ollama's default context window is small, and longer prompts are
-**silently truncated**, so the model loses the start of the conversation without any
-error. 16384 tokens fits a 7B model in about 6 GB of VRAM.
+`NUM_CTX` matters: Ollama's default context window is small, and by default Ollama
+**silently truncates** longer prompts, so the model loses the start of the conversation
+without any error. The agent asks Ollama to reject such prompts instead
+(`truncate: false`); that investigation then fails with a message to raise `NUM_CTX`,
+and the report falls back to the rule-based evidence. 16384 tokens fits a 7B model in
+about 6 GB of VRAM.
+
+To tune it, check the token usage in the report: each investigated problem shows its
+prompt and output tokens and its largest prompt, and "Scan notes" shows the total. The
+report warns when a prompt used 80% or more of `NUM_CTX`.
 
 ## Usage
 
