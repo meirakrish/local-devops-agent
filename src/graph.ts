@@ -6,7 +6,9 @@ import type { Config } from "./config.js";
 import type { K8sClients } from "./k8s/client.js";
 import type { LlmClient, LlmUsage } from "./llm/model.js";
 import { checkOllama, type OllamaStatus } from "./llm/ollama.js";
-import { renderMarkdownReport } from "./report/markdown.js";
+import { compareWithPrevious, type PreviousReport } from "./report/compare.js";
+import { buildJsonReport, type JsonReport } from "./report/json.js";
+import { renderMarkdownReport, type ReportInput } from "./report/markdown.js";
 import { detectIssues } from "./scan/detect.js";
 import { scanCluster } from "./scan/scan.js";
 import type { ClusterOverview, Issue } from "./scan/types.js";
@@ -28,6 +30,7 @@ export const HealthCheckState = Annotation.Root({
   llmSkipped: Annotation<string | undefined>(),
   // Note: state keys and node names share a namespace, so this cannot be "report".
   markdown: Annotation<string>(),
+  json: Annotation<JsonReport>(),
 });
 
 export type HealthCheckStateType = typeof HealthCheckState.State;
@@ -38,6 +41,8 @@ export interface GraphDeps {
   namespace?: string;
   /** Omit to run without the LLM (rule-based report only). */
   llm?: LlmClient;
+  /** A previous report to compare with (`--compare`), or why it could not be loaded. */
+  previous?: { report?: PreviousReport; note?: string };
   log?: (message: string) => void;
 }
 
@@ -138,18 +143,23 @@ export function buildGraph(deps: GraphDeps) {
   }
 
   function report(state: HealthCheckStateType): Partial<HealthCheckStateType> {
-    log("report: rendering markdown");
-    return {
-      markdown: renderMarkdownReport({
-        overview: state.overview,
-        issues: state.issues,
-        ollama: state.ollama,
-        findings: state.findings,
-        triageUsage: state.triageUsage,
-        numCtx: deps.config.numCtx,
-        llmSkipped: state.llmSkipped,
-      }),
+    log("report: rendering markdown and JSON");
+    const compared = deps.previous?.report
+      ? compareWithPrevious(state.overview, state.issues, deps.previous.report)
+      : { note: deps.previous?.note };
+    if (compared.note) log(`report: ${compared.note}`);
+    const input: ReportInput = {
+      overview: state.overview,
+      issues: state.issues,
+      ollama: state.ollama,
+      findings: state.findings,
+      triageUsage: state.triageUsage,
+      numCtx: deps.config.numCtx,
+      llmSkipped: state.llmSkipped,
+      comparison: compared.comparison,
+      comparisonNote: compared.note,
     };
+    return { markdown: renderMarkdownReport(input), json: buildJsonReport(input) };
   }
 
   return new StateGraph(HealthCheckState)

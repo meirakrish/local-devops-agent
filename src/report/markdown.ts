@@ -3,6 +3,7 @@ import { addUsage, emptyUsage, type LlmUsage } from "../llm/model.js";
 import type { OllamaStatus } from "../llm/ollama.js";
 import { formatBytes } from "../scan/quantity.js";
 import type { ClusterOverview, Issue, Severity } from "../scan/types.js";
+import { changeCounts, type Comparison, type IssueChange } from "./compare.js";
 
 export type OverallStatus = "HEALTHY" | "DEGRADED" | "CRITICAL";
 
@@ -28,8 +29,13 @@ const SECTION_TITLES: Record<Severity, string> = {
   info: "Info",
 };
 
-function renderIssue(issue: Issue): string {
-  const lines = [`#### ${issue.title}`, ""];
+/** "[NEW] " or "[ESCALATED] " in front of a heading; nothing for ongoing issues. */
+function changeTag(change: IssueChange | undefined): string {
+  return change === "new" || change === "escalated" ? `[${change.toUpperCase()}] ` : "";
+}
+
+function renderIssue(issue: Issue, change?: IssueChange): string {
+  const lines = [`#### ${changeTag(change)}${issue.title}`, ""];
   for (const e of issue.evidence) lines.push(`- ${truncate(e, 300)}`);
   if (issue.hint) lines.push("", `_Suggested next step:_ ${issue.hint}`);
   return lines.join("\n");
@@ -100,11 +106,18 @@ function contextWarning(usage: LlmUsage | undefined, numCtx: number | undefined)
   return `the largest prompt used ${Math.round((usage.peakPromptTokens / numCtx) * 100)}% of \`NUM_CTX\`; a longer one would not fit. Consider raising \`NUM_CTX\` or lowering \`TOOL_OUTPUT_MAX_CHARS\`.`;
 }
 
-function renderFinding(f: Finding, index: number, numCtx: number | undefined): string {
+/** A problem is new or escalated if any of its issues is; "new" wins. */
+function problemChange(f: Finding, comparison: Comparison | undefined): IssueChange | undefined {
+  if (!comparison) return undefined;
+  const changes = [f.problem.primary, ...f.problem.related].map((i) => comparison.changes[i.id]);
+  return changes.includes("new") ? "new" : changes.includes("escalated") ? "escalated" : "ongoing";
+}
+
+function renderFinding(f: Finding, index: number, numCtx: number | undefined, change?: IssueChange): string {
   const { problem } = f;
   const affected = [problem.primary, ...problem.related].map(resourceName);
   const lines = [
-    `### ${index}. [${problem.severity.toUpperCase()}] ${f.error ? problem.primary.title : truncate(f.summary, 160)}`,
+    `### ${index}. ${changeTag(change)}[${problem.severity.toUpperCase()}] ${f.error ? problem.primary.title : truncate(f.summary, 160)}`,
     "",
     `**Affected:** ${[...new Set(affected)].join(", ")}`,
     "",
@@ -140,6 +153,27 @@ export interface ReportInput {
   numCtx?: number;
   /** Why the LLM steps did not run, if they did not. */
   llmSkipped?: string;
+  /** Changes since a previous report (`--compare`). */
+  comparison?: Comparison;
+  /** Why no comparison is shown although one was asked for. */
+  comparisonNote?: string;
+}
+
+function renderChanges(issues: Issue[], c: Comparison): string[] {
+  const counts = changeCounts(c);
+  const out = ["## Changes since last run", "", `Compared with the report from ${c.previousScannedAt}.`, ""];
+  if (counts.new + counts.escalated + counts.resolved === 0) {
+    out.push(`No changes: ${counts.ongoing} ongoing issue(s).`, "");
+    return out;
+  }
+  for (const change of ["new", "escalated"] as const) {
+    for (const i of issues.filter((x) => c.changes[x.id] === change)) {
+      out.push(`- **${change.toUpperCase()}** [${i.severity.toUpperCase()}] ${i.title}`);
+    }
+  }
+  for (const r of c.resolved) out.push(`- **RESOLVED** [${r.severity.toUpperCase()}] ${r.title}`);
+  out.push("");
+  return out;
 }
 
 /**
@@ -154,6 +188,8 @@ export function renderMarkdownReport({
   triageUsage,
   numCtx,
   llmSkipped,
+  comparison,
+  comparisonNote,
 }: ReportInput): string {
   const status = overallStatus(issues);
   const count = (s: Severity) => issues.filter((i) => i.severity === s).length;
@@ -186,12 +222,19 @@ export function renderMarkdownReport({
     ...controlPlaneRows(overview, issues, new Date(overview.scannedAt)),
     `| Issues | ${count("critical")} critical, ${count("warning")} warning, ${count("info")} info |`,
     `| Investigated by LLM | ${findings.length > 0 ? `${findings.length} problem(s)` : "none"} |`,
-    "",
   ];
+  if (comparison) {
+    const n = changeCounts(comparison);
+    out.push(
+      `| Since last run | ${n.new} new, ${n.escalated} escalated, ${n.resolved} resolved, ${n.ongoing} ongoing |`,
+    );
+  }
+  out.push("");
+  if (comparison) out.push(...renderChanges(issues, comparison));
 
   if (findings.length > 0) {
     out.push("## Investigated problems", "");
-    findings.forEach((f, i) => out.push(renderFinding(f, i + 1, numCtx), ""));
+    findings.forEach((f, i) => out.push(renderFinding(f, i + 1, numCtx, problemChange(f, comparison)), ""));
   }
 
   // Issues already covered by an investigated problem are not repeated.
@@ -208,7 +251,7 @@ export function renderMarkdownReport({
       const group = remaining.filter((i) => i.severity === severity);
       if (group.length === 0) continue;
       out.push(`### ${SECTION_TITLES[severity]} (${group.length})`, "");
-      for (const issue of group) out.push(renderIssue(issue), "");
+      for (const issue of group) out.push(renderIssue(issue, comparison?.changes[issue.id]), "");
     }
   }
 
@@ -248,6 +291,7 @@ export function renderMarkdownReport({
   const triageWarning = contextWarning(triageUsage, numCtx);
   if (triageWarning) out.push(`- Context limit in triage: ${triageWarning}`);
   if (llmSkipped) out.push(`- LLM investigation skipped: ${llmSkipped}.`);
+  if (comparisonNote) out.push(`- Changes since last run: ${comparisonNote}.`);
   out.push(
     '- Issues are detected by rules; root causes in "Investigated problems" come from the local LLM and may be wrong.',
     "- Suggested fixes are never applied automatically.",

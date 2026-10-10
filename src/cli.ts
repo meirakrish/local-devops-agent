@@ -6,6 +6,7 @@ import { errorMessage } from "./errors.js";
 import { buildGraph } from "./graph.js";
 import { createK8sClients } from "./k8s/client.js";
 import { createOllamaLlm } from "./llm/model.js";
+import { loadPreviousReport } from "./report/compare.js";
 import { overallStatus } from "./report/markdown.js";
 
 /** Exit codes: 0 = healthy or warnings only, 2 = critical issues, 1 = the check itself failed. */
@@ -19,7 +20,11 @@ Runs a read-only health check of the current Kubernetes cluster.
 
 Options:
   -n, --namespace <name>  Only check this namespace (nodes are always checked)
-  -o, --output <file>     Also save the report as markdown to <file>
+  -f, --format <format>   Report format on stdout: markdown (default) or json
+  -o, --output <file>     Also save the report to <file>: JSON if it ends in .json,
+                          markdown otherwise. Can be given more than once
+  -c, --compare <file>    Mark issues as new, escalated or resolved compared with a
+                          previous JSON report (read before --output writes)
   -v, --verbose           Log each step and tool call to stderr
       --no-llm            Skip LLM triage/investigation (rule-based report only)
   -h, --help              Show this help
@@ -32,7 +37,9 @@ async function main(): Promise<number> {
     args: process.argv.slice(2).filter((a) => a !== "--"),
     options: {
       namespace: { type: "string", short: "n" },
-      output: { type: "string", short: "o" },
+      format: { type: "string", short: "f", default: "markdown" },
+      output: { type: "string", short: "o", multiple: true },
+      compare: { type: "string", short: "c" },
       verbose: { type: "boolean", short: "v", default: false },
       "no-llm": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
@@ -45,6 +52,10 @@ async function main(): Promise<number> {
     return EXIT_OK;
   }
 
+  if (values.format !== "markdown" && values.format !== "json") {
+    throw new Error(`--format must be "markdown" or "json", not "${values.format}"`);
+  }
+
   const config = loadConfig();
   const log = values.verbose
     ? (msg: string) => console.error(`[${new Date().toISOString().slice(11, 19)}] ${msg}`)
@@ -54,15 +65,19 @@ async function main(): Promise<number> {
   log?.(`using kube context "${k8s.context}", model "${config.model}" at ${config.ollamaUrl}`);
 
   const llm = values["no-llm"] ? undefined : createOllamaLlm(config);
-  const graph = buildGraph({ config, k8s, namespace: values.namespace, llm, log });
+  // Read before running: --compare and --output may name the same file.
+  const previous = values.compare ? await loadPreviousReport(resolve(values.compare)) : undefined;
+
+  const graph = buildGraph({ config, k8s, namespace: values.namespace, llm, log, previous });
   const result = await graph.invoke({});
+  const json = `${JSON.stringify(result.json, null, 2)}\n`;
 
-  console.log(result.markdown);
+  console.log(values.format === "json" ? json.trimEnd() : result.markdown);
 
-  if (values.output) {
-    const path = resolve(values.output);
+  for (const output of values.output ?? []) {
+    const path = resolve(output);
     await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, result.markdown, "utf8");
+    await writeFile(path, path.endsWith(".json") ? json : result.markdown, "utf8");
     console.error(`Report saved to ${path}`);
   }
 
