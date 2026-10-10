@@ -169,6 +169,28 @@ describe("JSON report", () => {
     ]);
   });
 
+  it("adds the computed-confidence and fix-check fields as optional fields of schema 1", () => {
+    const checked: Finding = {
+      ...finding,
+      confidence: "medium",
+      confidenceReason: "only 1 of 3 evidence point(s) found in tool output; the model said high",
+      modelConfidence: "high",
+      fixFlags: [
+        { step: 0, kind: "unverified", value: "postgres://db/app", message: "does not appear in the cluster data" },
+      ],
+      repeatedCalls: 2,
+    };
+    const json = buildJsonReport({ overview, issues: [webPod, apiDeploy], findings: [checked] });
+    expect(json.schemaVersion).toBe(1);
+    expect(json.findings[0]).toMatchObject({
+      confidence: "medium",
+      confidenceReason: "only 1 of 3 evidence point(s) found in tool output; the model said high",
+      modelConfidence: "high",
+      fixFlags: [{ step: 0, kind: "unverified", value: "postgres://db/app" }],
+      repeatedCalls: 2,
+    });
+  });
+
   it("includes changes when compared", () => {
     const { comparison } = compareWithPrevious(overview, [webPod, apiDeploy], previousOf([apiDeploy, node]));
     const json = buildJsonReport({ overview, issues: [webPod, apiDeploy], comparison });
