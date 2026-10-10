@@ -1,6 +1,13 @@
 import type {
   CoreV1Event,
+  V1APIService,
   V1Container,
+  V1CronJob,
+  V1Job,
+  V1Lease,
+  V1Namespace,
+  V1PersistentVolumeClaim,
+  V1StorageClass,
   V1Endpoint,
   V1ContainerStatus,
   V1DaemonSet,
@@ -12,12 +19,18 @@ import type {
   V1StatefulSet,
 } from "@kubernetes/client-node";
 import type {
+  ApiServiceSummary,
   ContainerSummary,
+  CronJobSummary,
   DeploymentSummary,
   EventSummary,
+  JobSummary,
+  LeaderLease,
   NodeSummary,
   PodSummary,
+  PvcSummary,
   ServiceSummary,
+  TerminatingNamespace,
   WorkloadSummary,
 } from "./types.js";
 import { parseQuantity } from "./quantity.js";
@@ -146,6 +159,124 @@ export function summarizePod(pod: V1Pod): PodSummary {
     containers,
     requests: podRequests(pod.spec?.containers ?? [], pod.spec?.initContainers ?? []),
     unschedulable: scheduled?.status === "False" ? { reason: scheduled.reason, message: scheduled.message } : undefined,
+    claims: claimsOf(pod),
+  };
+}
+
+/** PersistentVolumeClaims a pod mounts; undefined when none. */
+function claimsOf(pod: V1Pod): string[] | undefined {
+  const claims = (pod.spec?.volumes ?? []).flatMap((v) =>
+    v.persistentVolumeClaim ? [v.persistentVolumeClaim.claimName] : [],
+  );
+  return claims.length > 0 ? claims : undefined;
+}
+
+export function summarizeJob(job: V1Job): JobSummary {
+  const conditions = job.status?.conditions ?? [];
+  const failed = conditions.find((c) => c.type === "Failed" && c.status === "True");
+  const owner = job.metadata?.ownerReferences?.find((o) => o.kind === "CronJob");
+  return {
+    namespace: job.metadata?.namespace ?? "default",
+    name: job.metadata?.name ?? "<unknown>",
+    cronJob: owner?.name,
+    createdAt: toIso(job.metadata?.creationTimestamp),
+    completionTime: toIso(job.status?.completionTime),
+    active: job.status?.active ?? 0,
+    succeeded: job.status?.succeeded ?? 0,
+    failed: job.status?.failed ?? 0,
+    complete: conditions.some((c) => c.type === "Complete" && c.status === "True"),
+    failedCondition: failed
+      ? { reason: failed.reason, message: failed.message, since: toIso(failed.lastTransitionTime) }
+      : undefined,
+    backoffLimit: job.spec?.backoffLimit,
+  };
+}
+
+export function summarizeCronJob(cj: V1CronJob): CronJobSummary {
+  return {
+    namespace: cj.metadata?.namespace ?? "default",
+    name: cj.metadata?.name ?? "<unknown>",
+    schedule: cj.spec?.schedule ?? "?",
+    suspended: cj.spec?.suspend === true,
+    lastScheduleTime: toIso(cj.status?.lastScheduleTime),
+    lastSuccessfulTime: toIso(cj.status?.lastSuccessfulTime),
+    active: cj.status?.active?.length ?? 0,
+  };
+}
+
+const DEFAULT_CLASS_ANNOTATION = "storageclass.kubernetes.io/is-default-class";
+
+/**
+ * Summarizes a PVC. With `classes` (the cluster's StorageClasses), also says whether its
+ * class binds on first use and whether it can be provisioned at all; without them (not
+ * visible), those fields stay undefined rather than guessing.
+ */
+export function summarizePvc(pvc: V1PersistentVolumeClaim, classes?: V1StorageClass[]): PvcSummary {
+  const requested = pvc.spec?.storageClassName;
+  const summary: PvcSummary = {
+    namespace: pvc.metadata?.namespace ?? "default",
+    name: pvc.metadata?.name ?? "<unknown>",
+    phase: pvc.status?.phase ?? "Pending",
+    storageClass: requested || undefined,
+    createdAt: toIso(pvc.metadata?.creationTimestamp),
+    requested: pvc.spec?.resources?.requests?.["storage"],
+    volumeName: pvc.spec?.volumeName,
+  };
+  if (!classes || summary.phase !== "Pending") return summary;
+  if (requested === "") {
+    // An explicit "" means static binding: only a pre-created PersistentVolume can satisfy it.
+    if (!summary.volumeName) summary.storageClassProblem = 'storageClassName is "" (no dynamic provisioning)';
+    return summary;
+  }
+  const cls =
+    requested !== undefined
+      ? classes.find((c) => c.metadata?.name === requested)
+      : classes.find((c) => c.metadata?.annotations?.[DEFAULT_CLASS_ANNOTATION] === "true");
+  if (!cls) {
+    summary.storageClassProblem =
+      requested !== undefined
+        ? `StorageClass "${requested}" does not exist (existing: ${classes.map((c) => c.metadata?.name).join(", ") || "none"})`
+        : "no storageClassName and no default StorageClass";
+    return summary;
+  }
+  summary.waitForFirstConsumer = cls.volumeBindingMode === "WaitForFirstConsumer";
+  return summary;
+}
+
+/** Summarizes an APIService backed by a Service; undefined for local (built-in) ones. */
+export function summarizeApiService(a: V1APIService): ApiServiceSummary | undefined {
+  const svc = a.spec?.service;
+  if (!svc) return undefined;
+  const available = a.status?.conditions?.find((c) => c.type === "Available");
+  return {
+    name: a.metadata?.name ?? "<unknown>",
+    service: { namespace: svc.namespace ?? "default", name: svc.name ?? "?" },
+    available: available?.status === "True",
+    reason: available?.reason,
+    message: available?.message,
+    since: toIso(available?.lastTransitionTime),
+  };
+}
+
+/** Summarizes a namespace that is being deleted; undefined for one that is not. */
+export function summarizeTerminatingNamespace(ns: V1Namespace): TerminatingNamespace | undefined {
+  if (ns.status?.phase !== "Terminating") return undefined;
+  return {
+    name: ns.metadata?.name ?? "<unknown>",
+    deletionTimestamp: toIso(ns.metadata?.deletionTimestamp),
+    conditions: (ns.status.conditions ?? [])
+      .filter((c) => c.status === "True")
+      .map((c) => ({ type: c.type, reason: c.reason, message: c.message })),
+    finalizers: ns.spec?.finalizers ?? [],
+  };
+}
+
+export function summarizeLeaderLease(component: string, lease: V1Lease): LeaderLease {
+  return {
+    component,
+    holder: lease.spec?.holderIdentity || undefined,
+    renewTime: toIso(lease.spec?.renewTime),
+    leaseDurationSeconds: lease.spec?.leaseDurationSeconds,
   };
 }
 

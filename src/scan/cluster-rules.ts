@@ -1,8 +1,19 @@
 import { formatBytes, formatPercent } from "./quantity.js";
 import { minutesSince } from "./time.js";
-import type { ControlPlanePod, ControlPlaneSummary, Issue, WebhookSummary } from "./types.js";
+import type {
+  ApiServiceSummary,
+  ControlPlanePod,
+  ControlPlaneSummary,
+  Issue,
+  LeaderLease,
+  TerminatingNamespace,
+  WebhookSummary,
+} from "./types.js";
 
-/** Rules for cluster-level health: control plane, etcd and admission webhooks. */
+/**
+ * Rules for cluster-level health: control plane, etcd, leader election, admission
+ * webhooks, aggregated APIs and namespaces stuck terminating.
+ */
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -14,6 +25,12 @@ export const CLUSTER_THRESHOLDS = {
   objectCountWarning: 100_000,
   /** Probe failures of a control-plane pod within the event window before warning. */
   probeFailureWarning: 3,
+  /**
+   * Seconds a leader-election Lease may be overdue (past leaseDurationSeconds) before it
+   * counts as stale. Covers clock skew between this machine and the control plane, and a
+   * leader handover, which takes up to one lease duration plus a retry period.
+   */
+  leaderLeaseSlackSeconds: 60,
 };
 
 export function controlPlaneIssues(cp: ControlPlaneSummary, now: Date): Issue[] {
@@ -209,4 +226,123 @@ export function controlPlanePodIssues(pods: ControlPlanePod[], now: Date, window
     });
   }
   return issues;
+}
+
+/** What stops working while a component has no active leader. */
+const LEADER_IMPACT: Record<string, string> = {
+  "kube-scheduler": "nothing schedules new pods: they stay Pending without a scheduling event",
+  "kube-controller-manager":
+    "controllers do not reconcile: Deployments and Jobs create no pods, Service endpoints are not updated, NotReady nodes are not handled, and namespaces are not deleted",
+};
+
+function duration(seconds: number): string {
+  return seconds < 120 ? `${Math.round(seconds)}s` : `${Math.round(seconds / 60)} min`;
+}
+
+/**
+ * A stale leader-election Lease means the component is not working: no instance holds and
+ * renews it. Works on managed clusters too, where the control-plane pods are hidden.
+ */
+export function leaderLeaseIssues(leases: LeaderLease[], now: Date): Issue[] {
+  return leases.flatMap((lease): Issue[] => {
+    const duration_ = lease.leaseDurationSeconds ?? 15;
+    const age = lease.renewTime ? (now.getTime() - Date.parse(lease.renewTime)) / 1000 : Number.POSITIVE_INFINITY;
+    if (age <= duration_ + CLUSTER_THRESHOLDS.leaderLeaseSlackSeconds) return [];
+    const renewed = lease.renewTime ? `last renewed ${duration(age)} ago (${lease.renewTime})` : "never renewed";
+    return [
+      {
+        id: `controlplane/${lease.component}:leader-stale`,
+        severity: "critical",
+        category: "leader-election-stale",
+        resource: { kind: "ControlPlane", name: lease.component },
+        title: `${lease.component} has no active leader: its leader-election Lease was ${renewed.split(" (")[0]}`,
+        evidence: [
+          `Lease kube-system/${lease.component}: holder ${lease.holder ?? "(none)"}, ${renewed}, leaseDurationSeconds=${duration_}`,
+          `while no ${lease.component} instance leads, ${LEADER_IMPACT[lease.component] ?? "this component does nothing"}`,
+        ],
+        hint: `Every ${lease.component} instance is down or cannot reach the API server. On self-managed clusters, check its pods and previous logs on the control-plane nodes (k8s_cluster_health section="control-plane") and the API server and etcd it depends on; on managed clusters, contact the provider.`,
+      },
+    ];
+  });
+}
+
+/** "v1beta1.metrics.k8s.io" -> "metrics.k8s.io/v1beta1". */
+export function apiServiceGroupVersion(name: string): string {
+  const dot = name.indexOf(".");
+  return dot > 0 ? `${name.slice(dot + 1)}/${name.slice(0, dot)}` : name;
+}
+
+/**
+ * An aggregated API whose backend does not answer. Besides its own API failing, API
+ * discovery is incomplete, which stalls namespace deletion and garbage collection
+ * cluster-wide. Brief outages (e.g. while its pods restart) are skipped.
+ */
+export function apiServiceIssues(a: ApiServiceSummary, now: Date, graceMinutes = 5): Issue[] {
+  if (a.available || minutesSince(a.since, now) < graceMinutes) return [];
+  const gv = apiServiceGroupVersion(a.name);
+  const svc = `${a.service.namespace}/${a.service.name}`;
+  const since = a.since ? `for ${Math.round(minutesSince(a.since, now))} min` : "for an unknown time";
+  return [
+    {
+      id: `apiservice/${a.name}:unavailable`,
+      severity: "critical",
+      category: "apiservice-unavailable",
+      resource: { kind: "APIService", name: a.name },
+      title: `Aggregated API ${gv} is unavailable${a.reason ? ` (${a.reason})` : ""}`,
+      evidence: [
+        `APIService ${a.name}: Available=False ${since}${a.reason ? ` (${a.reason})` : ""}${a.message ? `: ${a.message}` : ""}`,
+        `backed by Service ${svc}`,
+        `requests to ${gv} fail, API discovery is incomplete (kubectl warns "unable to retrieve the complete list of server APIs"), and namespace deletion and garbage collection stall${gv.startsWith("metrics.k8s.io/") ? "; HorizontalPodAutoscalers and `kubectl top` stop working" : ""}`,
+      ],
+      hint: `Restore the backend: Service ${svc}, its endpoints and pods (k8s_get_service). If that component was uninstalled, delete the leftover APIService ${a.name}.`,
+    },
+  ];
+}
+
+/** Conditions that mean the namespace controller cannot list or delete some API group. */
+const API_DELETION_FAILURES = new Set([
+  "NamespaceDeletionDiscoveryFailure",
+  "NamespaceDeletionGroupVersionParsingFailure",
+]);
+
+/**
+ * A namespace still Terminating after the grace period. When deletion is blocked by API
+ * discovery (often an unavailable aggregated API) the category is "namespace-terminating-api",
+ * which triage groups with the unavailable APIServices; otherwise "namespace-terminating".
+ */
+export function terminatingNamespaceIssues(
+  ns: TerminatingNamespace,
+  unavailableApis: ApiServiceSummary[],
+  now: Date,
+  graceMinutes = 5,
+): Issue[] {
+  const minutes = minutesSince(ns.deletionTimestamp, now);
+  if (minutes < graceMinutes) return [];
+  const messages = ns.conditions.map((c) => c.message ?? "").join("\n");
+  const blockingApis = unavailableApis.filter((a) => messages.includes(apiServiceGroupVersion(a.name)));
+  const apiBlocked = ns.conditions.some((c) => API_DELETION_FAILURES.has(c.type)) || blockingApis.length > 0;
+  const named = blockingApis.length > 0 ? blockingApis : apiBlocked ? unavailableApis : [];
+
+  return [
+    {
+      id: `namespace/${ns.name}:stuck-terminating`,
+      severity: "warning",
+      category: apiBlocked ? "namespace-terminating-api" : "namespace-terminating",
+      resource: { kind: "Namespace", name: ns.name },
+      title: `Namespace ${ns.name} is stuck Terminating${Number.isFinite(minutes) ? ` for ${Math.round(minutes)} min` : ""}`,
+      evidence: [
+        ...ns.conditions.map((c) => `${c.type}${c.reason ? ` (${c.reason})` : ""}: ${c.message ?? ""}`),
+        ...(ns.conditions.length === 0 ? ["no deletion conditions reported yet"] : []),
+        ...(named.length > 0
+          ? [
+              `unavailable aggregated API(s): ${named.map((a) => a.name).join(", ")}; deletion waits until every API group can be listed`,
+            ]
+          : []),
+        ...(ns.finalizers.length > 0 ? [`spec.finalizers: ${ns.finalizers.join(", ")}`] : []),
+      ],
+      hint: apiBlocked
+        ? "Deletion is blocked because an API group cannot be discovered or listed, usually an unavailable aggregated API (APIService). Fix or delete that APIService; deletion then resumes on its own. Do not remove the namespace's finalizer by hand: that leaves orphaned objects behind."
+        : "Objects with finalizers are left in the namespace (see NamespaceContentRemaining / NamespaceFinalizersRemaining). Find the controller that should remove those finalizers (often an uninstalled operator); remove a finalizer by hand only once you know what it protects.",
+    },
+  ];
 }

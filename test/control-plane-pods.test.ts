@@ -164,6 +164,11 @@ describe("control-plane pods in detectIssues and the report", () => {
     warningEvents: [],
     controlPlane: { pods: summarizeControlPlanePods([crashing], [], NOW, 60), notVisible: [] },
     webhooks: [],
+    jobs: [],
+    cronJobs: [],
+    persistentVolumeClaims: [],
+    storageEvents: [],
+    apiHealth: { notVisible: [] },
     errors: [],
   };
 

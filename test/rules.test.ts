@@ -318,6 +318,11 @@ describe("detectIssues", () => {
       warningEvents: [],
       controlPlane: { notVisible: [] },
       webhooks: [],
+      jobs: [],
+      cronJobs: [],
+      persistentVolumeClaims: [],
+      storageEvents: [],
+      apiHealth: { notVisible: [] },
       errors: [],
     };
     expect(detectIssues(overview, OPTS).map((i) => i.severity)).toEqual(["critical", "warning"]);

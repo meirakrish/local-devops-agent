@@ -301,6 +301,11 @@ describe("detectIssues with workloads, services and DNS", () => {
     podCreateFailures: [],
     controlPlane: { notVisible: [] },
     webhooks: [],
+    jobs: [],
+    cronJobs: [],
+    persistentVolumeClaims: [],
+    storageEvents: [],
+    apiHealth: { notVisible: [] },
     errors: [],
   };
   const noPods = (namespace: string, name: string): ServiceSummary => ({

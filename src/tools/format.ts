@@ -1,7 +1,7 @@
 import type { V1Container, V1Pod } from "@kubernetes/client-node";
 import { formatCpu, formatMemory, parseQuantity } from "../scan/quantity.js";
 import { summarizePod } from "../scan/summarize.js";
-import type { EventSummary, NodeSummary, PodSummary } from "../scan/types.js";
+import type { EventSummary, JobSummary, LeaderLease, NodeSummary, PodSummary, PvcSummary } from "../scan/types.js";
 
 /**
  * Compact text renderings of cluster objects for tool output: one line per pod, node or
@@ -52,6 +52,43 @@ export function eventLine(e: EventSummary): string {
   return `- ${e.lastSeen ?? "?"} ${obj} ${e.reason ?? ""} (x${e.count}): ${e.message ?? ""}`.trim();
 }
 
+export function jobLine(j: JobSummary): string {
+  const state = j.failedCondition
+    ? `FAILED (${j.failedCondition.reason ?? "?"}${j.failedCondition.message ? `: ${j.failedCondition.message}` : ""})`
+    : j.complete
+      ? "Complete"
+      : j.active > 0
+        ? "Running"
+        : "Pending";
+  return `${state} active=${j.active} succeeded=${j.succeeded} failed=${j.failed} created=${j.createdAt ?? "?"}${j.completionTime ? ` completed=${j.completionTime}` : ""}`;
+}
+
+export function leaseLine(l: LeaderLease, now: Date): string {
+  const age = l.renewTime ? `${Math.round((now.getTime() - Date.parse(l.renewTime)) / 1000)}s ago` : "never";
+  return `${l.component}: holder=${l.holder ?? "(none)"} renewed ${age} (leaseDurationSeconds=${l.leaseDurationSeconds ?? "?"})`;
+}
+
+/** A PersistentVolumeClaim a pod mounts, as shown by k8s_describe_pod. */
+export interface ClaimInfo {
+  name: string;
+  pvc?: PvcSummary;
+  /** Warning events of a claim that is not Bound, newest first. */
+  events?: EventSummary[];
+  /** Why the claim could not be read, e.g. "does not exist". */
+  error?: string;
+}
+
+function claimLines(c: ClaimInfo): string[] {
+  if (!c.pvc) return [`- ${c.name}: ${c.error ?? "unknown"}`];
+  const p = c.pvc;
+  const lines = [
+    `- ${c.name}: ${p.phase} storageClass=${p.storageClass ?? "(none)"}${p.requested ? ` size=${p.requested}` : ""}${p.volumeName ? ` volume=${p.volumeName}` : ""}${p.waitForFirstConsumer ? " (binds when first used)" : ""}`,
+  ];
+  if (p.storageClassProblem) lines.push(`  problem: ${p.storageClassProblem}`);
+  for (const e of c.events ?? []) lines.push(`  ${eventLine(e)}`);
+  return lines;
+}
+
 function formatResources(c: V1Container): string | undefined {
   const r = c.resources;
   if (!r?.requests && !r?.limits) return undefined;
@@ -94,7 +131,7 @@ function formatProbe(name: string, c: V1Container): string | undefined {
   return `${name}: ${how} (delay=${p.initialDelaySeconds ?? 0}s period=${p.periodSeconds ?? 10}s failureThreshold=${p.failureThreshold ?? 3})`;
 }
 
-export function describePodText(pod: V1Pod, events: EventSummary[]): string {
+export function describePodText(pod: V1Pod, events: EventSummary[], claims: ClaimInfo[] = []): string {
   const s = summarizePod(pod);
   const lines = [
     `Pod ${s.namespace}/${s.name}`,
@@ -139,6 +176,7 @@ export function describePodText(pod: V1Pod, events: EventSummary[]): string {
     }
   }
 
+  if (claims.length > 0) lines.push("PersistentVolumeClaims:", ...claims.flatMap(claimLines));
   lines.push("Events (newest first):");
   if (events.length === 0) lines.push("- (none)");
   for (const e of events) lines.push(eventLine(e));

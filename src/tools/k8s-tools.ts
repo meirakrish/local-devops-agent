@@ -6,18 +6,22 @@ import { isNotFound, k8sErrorMessage } from "../k8s/errors.js";
 import {
   byNewest,
   formatLabels,
+  summarizeCronJob,
   summarizeDaemonSet,
   summarizeDeployment,
   summarizeEvent,
+  summarizeJob,
   summarizeNode,
   summarizePod,
+  summarizePvc,
   summarizeService,
   summarizeStatefulSet,
 } from "../scan/summarize.js";
-import { addNodeUsage, collectControlPlane, collectWebhooks } from "../scan/collect-cluster.js";
+import { addNodeUsage, collectApiHealth, collectControlPlane, collectWebhooks } from "../scan/collect-cluster.js";
+import { apiServiceGroupVersion } from "../scan/cluster-rules.js";
 import { formatBytes } from "../scan/quantity.js";
-import type { EventSummary, PodSummary } from "../scan/types.js";
-import { describePodText, eventLine, nodeLine, podLine } from "./format.js";
+import type { ApiHealthSummary, EventSummary, PodSummary } from "../scan/types.js";
+import { describePodText, eventLine, jobLine, leaseLine, nodeLine, podLine, type ClaimInfo } from "./format.js";
 import { truncateMiddle } from "./truncate.js";
 
 /**
@@ -26,9 +30,9 @@ import { truncateMiddle } from "./truncate.js";
  * Errors are returned as text so the model can correct itself instead of crashing.
  */
 
-const HEALTH_SECTIONS = ["control-plane", "etcd", "webhooks", "all"] as const;
+const HEALTH_SECTIONS = ["control-plane", "etcd", "webhooks", "apiservices", "all"] as const;
 type HealthSection = (typeof HEALTH_SECTIONS)[number];
-const WORKLOAD_KINDS = ["Deployment", "StatefulSet", "DaemonSet"] as const;
+const WORKLOAD_KINDS = ["Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob"] as const;
 type WorkloadKind = (typeof WORKLOAD_KINDS)[number];
 
 export interface ToolOptions {
@@ -158,15 +162,52 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
     },
   );
 
+  /** Status of the PVCs a pod mounts, with the warning events of those not Bound. */
+  async function claimInfo(namespace: string, claims: string[]): Promise<ClaimInfo[]> {
+    if (claims.length === 0) return [];
+    const classes = await k8s.storage
+      .listStorageClass()
+      .then((l) => l.items)
+      .catch(() => undefined);
+    return Promise.all(
+      claims.map(async (claim): Promise<ClaimInfo> => {
+        try {
+          const pvc = summarizePvc(
+            await k8s.core.readNamespacedPersistentVolumeClaim({ namespace, name: claim }),
+            classes,
+          );
+          const events =
+            pvc.phase === "Bound"
+              ? []
+              : (
+                  await k8s.core.listNamespacedEvent({
+                    namespace,
+                    fieldSelector: `type=Warning,involvedObject.kind=PersistentVolumeClaim,involvedObject.name=${claim}`,
+                  })
+                ).items
+                  .map(summarizeEvent)
+                  .sort(byNewest)
+                  .slice(0, 3);
+          return { name: claim, pvc, events };
+        } catch (err) {
+          return { name: claim, error: isNotFound(err) ? "does not exist" : k8sErrorMessage(err) };
+        }
+      }),
+    );
+  }
+
   const describePod = tool(
     safe(k8s, opts.maxChars, async ({ namespace, name }: { namespace: string; name: string }) => {
       const pod = await k8s.core.readNamespacedPod({ namespace, name });
-      return describePodText(pod, await podEvents(namespace, name));
+      const claims = (pod.spec?.volumes ?? []).flatMap((v) =>
+        v.persistentVolumeClaim ? [v.persistentVolumeClaim.claimName] : [],
+      );
+      return describePodText(pod, await podEvents(namespace, name), await claimInfo(namespace, claims));
     }),
     {
       name: "k8s_describe_pod",
       description:
-        "Describe one pod: conditions, container states and last termination reason, image, resources, env var names, probes and the pod's recent events.",
+        "Describe one pod: conditions, container states and last termination reason, image, resources, env var names, probes, the status of its PersistentVolumeClaims, and the pod's recent events.",
       schema: z.object({
         namespace: namespaceField,
         name: k8sName("pod name"),
@@ -320,7 +361,8 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
       .filter(
         (e) =>
           (e.involvedKind === kind && e.involvedName === name) ||
-          (kind === "Deployment" && e.involvedKind === "ReplicaSet" && (e.involvedName ?? "").startsWith(`${name}-`)),
+          (kind === "Deployment" && e.involvedKind === "ReplicaSet" && (e.involvedName ?? "").startsWith(`${name}-`)) ||
+          (kind === "CronJob" && e.involvedKind === "Job" && (e.involvedName ?? "").startsWith(`${name}-`)),
       )
       .sort(byNewest)
       .slice(0, 10);
@@ -368,6 +410,43 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
             images(st.spec?.template.spec?.containers),
             `Volume claim templates: ${(st.spec?.volumeClaimTemplates ?? []).map((v) => v.metadata?.name).join(", ") || "(none)"}`,
           );
+        } else if (kind === "Job") {
+          const job = await k8s.batch.readNamespacedJob({ namespace, name });
+          const s = summarizeJob(job);
+          selector = job.spec?.selector;
+          lines.push(
+            `Job ${s.namespace}/${s.name}${s.cronJob ? ` (created by CronJob ${s.cronJob})` : ""}`,
+            `Status: ${jobLine(s)}`,
+            `Spec: completions=${job.spec?.completions ?? 1} parallelism=${job.spec?.parallelism ?? 1} backoffLimit=${job.spec?.backoffLimit ?? 6} activeDeadlineSeconds=${job.spec?.activeDeadlineSeconds ?? "none"} restartPolicy=${job.spec?.template.spec?.restartPolicy ?? "?"}`,
+            images(job.spec?.template.spec?.containers),
+          );
+        } else if (kind === "CronJob") {
+          const [cj, jobs] = await Promise.all([
+            k8s.batch.readNamespacedCronJob({ namespace, name }),
+            k8s.batch.listNamespacedJob({ namespace }),
+          ]);
+          const s = summarizeCronJob(cj);
+          const own = jobs.items
+            .map((j) => ({ job: j, summary: summarizeJob(j) }))
+            .filter((j) => j.summary.cronJob === name)
+            .sort((a, b) => (b.summary.createdAt ?? "").localeCompare(a.summary.createdAt ?? ""));
+          lines.push(
+            `CronJob ${s.namespace}/${s.name}`,
+            `Schedule: "${s.schedule}"${cj.spec?.timeZone ? ` (${cj.spec.timeZone})` : ""}  suspend=${s.suspended}  concurrencyPolicy=${cj.spec?.concurrencyPolicy ?? "Allow"}  active=${s.active}`,
+            `Last scheduled: ${s.lastScheduleTime ?? "never"}  Last successful: ${s.lastSuccessfulTime ?? "never"}`,
+            `History limits: successful=${cj.spec?.successfulJobsHistoryLimit ?? 3} failed=${cj.spec?.failedJobsHistoryLimit ?? 1}`,
+            images(cj.spec?.jobTemplate.spec?.template.spec?.containers),
+            "Jobs (newest first):",
+            ...(own.length > 0
+              ? own.slice(0, 10).map((j) => `- ${j.summary.name}: ${jobLine(j.summary)}`)
+              : ["- (none kept)"]),
+          );
+          // The pods of the newest Job show what its last run did.
+          const newest = own[0];
+          if (newest) {
+            selector = newest.job.spec?.selector;
+            lines.push(`Newest Job: ${newest.summary.name}`);
+          }
         } else {
           const ds = await k8s.apps.readNamespacedDaemonSet({ namespace, name });
           const s = summarizeDaemonSet(ds);
@@ -388,7 +467,7 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
     {
       name: "k8s_get_workload",
       description:
-        "Get a Deployment, StatefulSet or DaemonSet: desired vs ready pods, rollout status, images, its pods with their nodes, and its controller's warning events (e.g. FailedCreate when the API server rejects its pods).",
+        "Get a Deployment, StatefulSet, DaemonSet, Job or CronJob: desired vs ready pods (for a Job: its status and failure reason), rollout status, images, its pods with their nodes, and its controller's warning events (e.g. FailedCreate when the API server rejects its pods). For a CronJob: schedule, last runs, its Jobs and the pods of the newest Job.",
       schema: z.object({
         kind: z.enum(WORKLOAD_KINDS).optional().describe('Workload kind (default "Deployment")'),
         namespace: namespaceField,
@@ -473,7 +552,7 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
     safe(k8s, opts.maxChars, async ({ section = "all" }: { section?: HealthSection }) => {
       const want = (s: HealthSection) => section === "all" || section === s;
       const problems: string[] = [];
-      const [cp, webhooks] = await Promise.all([
+      const [cp, webhooks, apiHealth] = await Promise.all([
         collectControlPlane(k8s, opts.windowMinutes),
         want("webhooks")
           ? collectWebhooks(k8s).catch((err: unknown) => {
@@ -481,7 +560,9 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
               return [];
             })
           : Promise.resolve([]),
+        want("apiservices") ? collectApiHealth(k8s) : Promise.resolve<ApiHealthSummary>({ notVisible: [] }),
       ]);
+      const now = new Date();
 
       const lines: string[] = [];
       if (want("control-plane")) {
@@ -516,6 +597,12 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
             lines.push(parts.join(" "));
           }
         }
+        if (cp.leaderLeases) {
+          lines.push(
+            "Leader election (Leases in kube-system):",
+            ...cp.leaderLeases.map((l) => `- ${leaseLine(l, now)}`),
+          );
+        }
       }
       if (want("etcd")) {
         const etcdCheck = cp.readyz?.find((c) => c.name === "etcd");
@@ -544,13 +631,39 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
           );
         }
       }
-      for (const n of [...cp.notVisible, ...problems]) lines.push(`Not visible: ${n}`);
+      if (want("apiservices")) {
+        const apis = apiHealth.apiServices;
+        if (apis) {
+          const down = apis.filter((a) => !a.available);
+          lines.push(`Aggregated APIs (APIServices backed by a Service): ${apis.length}, ${down.length} unavailable`);
+          for (const a of apis) {
+            const state = a.available
+              ? "Available"
+              : `UNAVAILABLE${a.reason ? ` (${a.reason})` : ""}${a.since ? ` since ${a.since}` : ""}${a.message ? `: ${a.message}` : ""}`;
+            lines.push(
+              `- ${a.name} (${apiServiceGroupVersion(a.name)}) service=${a.service.namespace}/${a.service.name} ${state}`,
+            );
+          }
+        }
+        const terminating = apiHealth.terminatingNamespaces;
+        if (terminating) {
+          lines.push(`Namespaces terminating: ${terminating.length}`);
+          for (const ns of terminating) {
+            lines.push(`- ${ns.name} deleting since ${ns.deletionTimestamp ?? "?"}`);
+            for (const c of ns.conditions) {
+              lines.push(`  ${c.type}${c.reason ? ` (${c.reason})` : ""}: ${c.message ?? ""}`);
+            }
+          }
+        }
+      }
+      const shownNotVisible = want("control-plane") || want("etcd") ? cp.notVisible : [];
+      for (const n of [...shownNotVisible, ...apiHealth.notVisible, ...problems]) lines.push(`Not visible: ${n}`);
       return lines.join("\n");
     }),
     {
       name: "k8s_cluster_health",
       description:
-        "Cluster health by section. control-plane: API server version, certificate expiry, /readyz checks, and control-plane pods (kube-apiserver, etcd, scheduler, controller-manager) with recent restarts and probe failures. etcd: etcd health check, database size vs quota, largest object counts. webhooks: admission webhooks and whether their service can answer.",
+        "Cluster health by section. control-plane: API server version, certificate expiry, /readyz checks, and control-plane pods (kube-apiserver, etcd, scheduler, controller-manager) with recent restarts and probe failures, and the kube-scheduler and kube-controller-manager leader-election leases (when each was last renewed). etcd: etcd health check, database size vs quota, largest object counts. webhooks: admission webhooks and whether their service can answer. apiservices: aggregated APIs (e.g. metrics-server) and whether they are available, and namespaces stuck terminating with the conditions that block their deletion.",
       schema: z.object({
         section: z
           .enum(HEALTH_SECTIONS)

@@ -7,8 +7,27 @@ import {
   etcdStorageFromMetrics,
   parseHealthChecks,
 } from "./apiserver-parse.js";
-import { eventLastSeen, formatLabels, isEndpointReady, podRequests, summarizeService } from "./summarize.js";
-import type { ControlPlanePod, ControlPlaneSummary, DnsSummary, NodeSummary, WebhookSummary } from "./types.js";
+import {
+  eventLastSeen,
+  formatLabels,
+  isEndpointReady,
+  podRequests,
+  summarizeApiService,
+  summarizeLeaderLease,
+  summarizeService,
+  summarizeTerminatingNamespace,
+} from "./summarize.js";
+import type {
+  ApiHealthSummary,
+  ApiServiceSummary,
+  ControlPlanePod,
+  ControlPlaneSummary,
+  DnsSummary,
+  LeaderLease,
+  NodeSummary,
+  TerminatingNamespace,
+  WebhookSummary,
+} from "./types.js";
 
 /** Why a raw endpoint could not be read, phrased for the report. */
 function rawProblem(status: number): string {
@@ -88,15 +107,23 @@ export async function collectControlPlane(
   now: Date = new Date(),
 ): Promise<ControlPlaneSummary> {
   const notVisible: string[] = [];
-  const [version, readyz, metrics, cpPods, unhealthy] = await Promise.allSettled([
+  const [version, readyz, metrics, cpPods, unhealthy, leases] = await Promise.allSettled([
     k8s.raw.get("/version"),
     k8s.raw.get("/readyz?verbose"),
     k8s.raw.get("/metrics"),
     // kubeadm, kind and minikube label their static control-plane pods tier=control-plane.
     k8s.core.listNamespacedPod({ namespace: "kube-system", labelSelector: "tier=control-plane" }),
     k8s.core.listNamespacedEvent({ namespace: "kube-system", fieldSelector: "type=Warning,reason=Unhealthy" }),
+    collectLeaderLeases(k8s),
   ]);
   const summary: ControlPlaneSummary = { notVisible };
+
+  if (leases.status === "fulfilled") {
+    if (leases.value.leases.length > 0) summary.leaderLeases = leases.value.leases;
+    notVisible.push(...leases.value.notVisible);
+  } else {
+    notVisible.push(`leader election: ${k8sErrorMessage(leases.reason)}`);
+  }
 
   if (cpPods.status === "fulfilled" && cpPods.value.items.length > 0) {
     summary.pods = summarizeControlPlanePods(
@@ -163,6 +190,61 @@ export async function collectControlPlane(
     notVisible.push(
       `etcd size and object counts: /metrics ${metrics.status === "fulfilled" ? rawProblem(metrics.value.status) : k8sErrorMessage(metrics.reason)}`,
     );
+  }
+  return summary;
+}
+
+/** Components whose leader-election Lease in kube-system shows whether they are working. */
+export const LEADER_COMPONENTS = ["kube-scheduler", "kube-controller-manager"] as const;
+
+/**
+ * Reads the leader-election Leases of the scheduler and the controller-manager. They are
+ * visible even on managed clusters that hide the control-plane pods. A Lease that does not
+ * exist (or cannot be read) is reported as not visible, never as healthy or broken.
+ */
+export async function collectLeaderLeases(k8s: K8sClients): Promise<{ leases: LeaderLease[]; notVisible: string[] }> {
+  const leases: LeaderLease[] = [];
+  const notVisible: string[] = [];
+  await Promise.all(
+    LEADER_COMPONENTS.map(async (component) => {
+      try {
+        const lease = await k8s.coordination.readNamespacedLease({ namespace: "kube-system", name: component });
+        leases.push(summarizeLeaderLease(component, lease));
+      } catch (err) {
+        notVisible.push(
+          `${component} leader election: ${isNotFound(err) ? `no Lease kube-system/${component} (managed control plane, or leader election disabled)` : k8sErrorMessage(err)}`,
+        );
+      }
+    }),
+  );
+  leases.sort((a, b) => a.component.localeCompare(b.component));
+  return { leases, notVisible: notVisible.sort() };
+}
+
+/**
+ * Aggregated APIs (APIServices backed by a Service) and namespaces stuck in Terminating.
+ * Cluster-level, so it runs regardless of --namespace. What cannot be read goes to
+ * `notVisible`.
+ */
+export async function collectApiHealth(k8s: K8sClients): Promise<ApiHealthSummary> {
+  const [apiServices, namespaces] = await Promise.allSettled([
+    k8s.apiregistration.listAPIService(),
+    k8s.core.listNamespace(),
+  ]);
+  const summary: ApiHealthSummary = { notVisible: [] };
+  if (apiServices.status === "fulfilled") {
+    summary.apiServices = apiServices.value.items
+      .map(summarizeApiService)
+      .filter((a): a is ApiServiceSummary => a !== undefined);
+  } else {
+    summary.notVisible.push(`aggregated APIs (APIServices): ${k8sErrorMessage(apiServices.reason)}`);
+  }
+  if (namespaces.status === "fulfilled") {
+    summary.terminatingNamespaces = namespaces.value.items
+      .map(summarizeTerminatingNamespace)
+      .filter((n): n is TerminatingNamespace => n !== undefined);
+  } else {
+    summary.notVisible.push(`namespaces stuck terminating: ${k8sErrorMessage(namespaces.reason)}`);
   }
   return summary;
 }
