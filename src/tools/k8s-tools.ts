@@ -1,13 +1,16 @@
-import type { V1Container, V1Pod } from "@kubernetes/client-node";
+import type { V1Container, V1LabelSelector, V1Pod } from "@kubernetes/client-node";
 import { tool, type StructuredToolInterface } from "@langchain/core/tools";
 import { z } from "zod";
 import type { K8sClients } from "../k8s/client.js";
 import { k8sErrorMessage } from "../k8s/errors.js";
 import {
+  summarizeDaemonSet,
   summarizeDeployment,
   summarizeEvent,
   summarizeNode,
   summarizePod,
+  summarizeService,
+  summarizeStatefulSet,
 } from "../scan/summarize.js";
 import { addNodeUsage, collectControlPlane, collectWebhooks } from "../scan/collect-cluster.js";
 import { formatCpu, formatMemory, parseQuantity } from "../scan/quantity.js";
@@ -22,6 +25,8 @@ import { truncateMiddle } from "./truncate.js";
 
 const HEALTH_SECTIONS = ["control-plane", "etcd", "webhooks", "all"] as const;
 type HealthSection = (typeof HEALTH_SECTIONS)[number];
+const WORKLOAD_KINDS = ["Deployment", "StatefulSet", "DaemonSet"] as const;
+type WorkloadKind = (typeof WORKLOAD_KINDS)[number];
 
 export interface ToolOptions {
   maxChars: number;
@@ -411,32 +416,140 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
     },
   );
 
-  const getDeployment = tool(
+  /** Warning events of a workload's controller; for a Deployment, also of its ReplicaSets. */
+  async function controllerEvents(kind: WorkloadKind, namespace: string, name: string): Promise<EventSummary[]> {
+    const list = await k8s.core.listNamespacedEvent({ namespace, fieldSelector: "type=Warning" });
+    return list.items
+      .map(summarizeEvent)
+      .filter(
+        (e) =>
+          (e.involvedKind === kind && e.involvedName === name) ||
+          (kind === "Deployment" && e.involvedKind === "ReplicaSet" && (e.involvedName ?? "").startsWith(`${name}-`)),
+      )
+      .sort((a, b) => (b.lastSeen ?? "").localeCompare(a.lastSeen ?? ""))
+      .slice(0, 10);
+  }
+
+  async function podsOf(namespace: string, selector: V1LabelSelector | undefined): Promise<string[]> {
+    const matchLabels = selector?.matchLabels;
+    if (!matchLabels) return [];
+    const labelSelector = Object.entries(matchLabels).map(([k, v]) => `${k}=${v}`).join(",");
+    const pods = (await k8s.core.listNamespacedPod({ namespace, labelSelector })).items.map(summarizePod);
+    return ["Pods:", ...(pods.length > 0 ? pods.map((p) => `- ${podLine(p)}`) : ["- (none)"])];
+  }
+
+  const getWorkload = tool(
+    safe(k8s, opts.maxChars, async ({ kind = "Deployment", namespace, name }: { kind?: WorkloadKind; namespace: string; name: string }) => {
+      const images = (containers: V1Container[] | undefined) =>
+        `Images: ${(containers ?? []).map((c) => `${c.name}=${c.image}`).join(", ")}`;
+      const lines: string[] = [];
+      let selector: V1LabelSelector | undefined;
+      if (kind === "Deployment") {
+        const d = await k8s.apps.readNamespacedDeployment({ namespace, name });
+        const s = summarizeDeployment(d);
+        selector = d.spec?.selector;
+        lines.push(
+          `Deployment ${s.namespace}/${s.name}`,
+          `Replicas: desired=${s.desired} ready=${s.ready} available=${s.available} updated=${s.updated}`,
+          `Strategy: ${d.spec?.strategy?.type ?? "RollingUpdate"}  Generation: ${d.metadata?.generation ?? "?"} observed=${d.status?.observedGeneration ?? "?"}`,
+          images(d.spec?.template.spec?.containers),
+          "Conditions:",
+          ...s.conditions.map((c) => `- ${c.type}=${c.status}${c.reason ? ` (${c.reason})` : ""}${c.message ? `: ${c.message}` : ""}`),
+        );
+      } else if (kind === "StatefulSet") {
+        const st = await k8s.apps.readNamespacedStatefulSet({ namespace, name });
+        const s = summarizeStatefulSet(st);
+        selector = st.spec?.selector;
+        lines.push(
+          `StatefulSet ${s.namespace}/${s.name}`,
+          `Replicas: desired=${s.desired} ready=${s.ready} updated=${s.updated}`,
+          `Revisions: current=${s.currentRevision ?? "?"} update=${s.updateRevision ?? "?"}  Pod management: ${st.spec?.podManagementPolicy ?? "OrderedReady"}`,
+          images(st.spec?.template.spec?.containers),
+          `Volume claim templates: ${(st.spec?.volumeClaimTemplates ?? []).map((v) => v.metadata?.name).join(", ") || "(none)"}`,
+        );
+      } else {
+        const ds = await k8s.apps.readNamespacedDaemonSet({ namespace, name });
+        const s = summarizeDaemonSet(ds);
+        selector = ds.spec?.selector;
+        lines.push(
+          `DaemonSet ${s.namespace}/${s.name}`,
+          `Pods: desired=${s.desired} current=${ds.status?.currentNumberScheduled ?? 0} ready=${s.ready} updated=${s.updated} available=${ds.status?.numberAvailable ?? 0} misscheduled=${ds.status?.numberMisscheduled ?? 0}`,
+          images(ds.spec?.template.spec?.containers),
+          `NodeSelector: ${JSON.stringify(ds.spec?.template.spec?.nodeSelector ?? {})}  Tolerations: ${(ds.spec?.template.spec?.tolerations ?? []).map((t) => t.key ?? (t.operator === "Exists" ? "<all>" : "?")).join(", ") || "(none)"}`,
+        );
+      }
+      lines.push(...(await podsOf(namespace, selector)));
+      const events = await controllerEvents(kind, namespace, name);
+      if (events.length > 0) lines.push("Controller warning events (newest first):", ...events.map(eventLine));
+      return lines.join("\n");
+    }),
+    {
+      name: "k8s_get_workload",
+      description:
+        "Get a Deployment, StatefulSet or DaemonSet: desired vs ready pods, rollout status, images, its pods with their nodes, and its controller's warning events (e.g. FailedCreate when the API server rejects its pods).",
+      schema: z.object({
+        kind: z.enum(WORKLOAD_KINDS).optional().describe('Workload kind (default "Deployment")'),
+        namespace: namespaceField,
+        name: k8sName("workload name"),
+      }),
+    },
+  );
+
+  const getService = tool(
     safe(k8s, opts.maxChars, async ({ namespace, name }: { namespace: string; name: string }) => {
-      const d = await k8s.apps.readNamespacedDeployment({ namespace, name });
-      const s = summarizeDeployment(d);
+      const svc = await k8s.core.readNamespacedService({ namespace, name });
+      const [slices, pods] = await Promise.all([
+        k8s.discovery.listNamespacedEndpointSlice({ namespace, labelSelector: `kubernetes.io/service-name=${name}` }),
+        k8s.core.listNamespacedPod({ namespace }),
+      ]);
+      const ports = (svc.spec?.ports ?? []).map((p) => `${p.name ? `${p.name}:` : ""}${p.port}->${p.targetPort ?? p.port}/${p.protocol ?? "TCP"}`);
       const lines = [
-        `Deployment ${s.namespace}/${s.name}`,
-        `Replicas: desired=${s.desired} ready=${s.ready} available=${s.available} updated=${s.updated}`,
-        `Strategy: ${d.spec?.strategy?.type ?? "RollingUpdate"}  Generation: ${d.metadata?.generation ?? "?"} observed=${d.status?.observedGeneration ?? "?"}`,
-        `Images: ${(d.spec?.template.spec?.containers ?? []).map((c) => `${c.name}=${c.image}`).join(", ")}`,
-        "Conditions:",
-        ...s.conditions.map((c) => `- ${c.type}=${c.status}${c.reason ? ` (${c.reason})` : ""}${c.message ? `: ${c.message}` : ""}`),
+        `Service ${namespace}/${name} type=${svc.spec?.type ?? "ClusterIP"} clusterIP=${svc.spec?.clusterIP ?? "?"}`,
+        `Ports: ${ports.join(", ") || "(none)"}`,
       ];
-      const matchLabels = d.spec?.selector.matchLabels;
-      if (matchLabels) {
-        const labelSelector = Object.entries(matchLabels).map(([k, v]) => `${k}=${v}`).join(",");
-        const pods = (await k8s.core.listNamespacedPod({ namespace, labelSelector })).items.map(summarizePod);
-        lines.push("Pods:", ...(pods.length > 0 ? pods.map((p) => `- ${podLine(p)}`) : ["- (none)"]));
+      const endpoints = slices.items.flatMap((s) => s.endpoints ?? []);
+      const endpointLines = endpoints
+        .slice(0, 20)
+        .map((e) => `- ${e.targetRef?.name ?? e.addresses.join(",")} ${e.conditions?.ready === false ? "NOT READY" : "ready"}`);
+
+      const s = summarizeService(svc, slices.items, pods.items);
+      if (!s) {
+        lines.push("No selector: endpoints are managed manually (or this is an ExternalName Service).", `Endpoints: ${endpoints.length}`, ...endpointLines);
+        return lines.join("\n");
+      }
+      lines.push(
+        `Selector: ${Object.entries(s.selector).map(([k, v]) => `${k}=${v}`).join(",")}`,
+        `Endpoints: ${s.readyEndpoints} ready, ${s.notReadyEndpoints} not ready`,
+        ...endpointLines,
+      );
+      const matching = pods.items.filter((p) => s.pods.some((m) => m.name === p.metadata?.name));
+      if (matching.length === 0) {
+        lines.push(
+          "Pods matching the selector: (none)",
+          `Label values on running pods in ${namespace}: ${Object.entries(s.podLabelValues).map(([k, vs]) => `${k}: ${vs.join(", ") || "(no pod has this label)"}`).join("; ")}`,
+        );
+        return lines.join("\n");
+      }
+      lines.push("Pods matching the selector:", ...matching.map((p) => `- ${podLine(summarizePod(p))}`));
+      // A targetPort the pods do not declare is a common cause of refused connections.
+      const declared = matching[0]!.spec?.containers.flatMap((c) => c.ports ?? []) ?? [];
+      if (declared.length > 0) {
+        lines.push(`Container ports (first pod): ${declared.map((p) => `${p.containerPort}${p.name ? `(${p.name})` : ""}`).join(", ")}`);
+        for (const p of svc.spec?.ports ?? []) {
+          const target = p.targetPort ?? p.port;
+          const found = declared.some((d) => d.containerPort === target || d.name === target);
+          if (!found) lines.push(`Note: targetPort ${target} of port ${p.port} is not a declared container port`);
+        }
       }
       return lines.join("\n");
     }),
     {
-      name: "k8s_get_deployment",
-      description: "Get a deployment's desired vs ready replicas, rollout conditions, images and the status of its pods.",
+      name: "k8s_get_service",
+      description:
+        "Get a Service: type, ports, selector, ready and not-ready endpoints, the pods its selector matches and their status. If no pod matches, shows the label values pods in the namespace actually have.",
       schema: z.object({
         namespace: namespaceField,
-        name: k8sName("deployment name"),
+        name: k8sName("service name"),
       }),
     },
   );
@@ -513,5 +626,5 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
     },
   );
 
-  return [listNodes, listPods, describePod, getLogs, listEvents, getDeployment, clusterHealth];
+  return [listNodes, listPods, describePod, getLogs, listEvents, getWorkload, getService, clusterHealth];
 }

@@ -2,9 +2,13 @@ import type {
   CoreV1Event,
   V1Container,
   V1ContainerStatus,
+  V1DaemonSet,
   V1Deployment,
+  V1EndpointSlice,
   V1Node,
   V1Pod,
+  V1Service,
+  V1StatefulSet,
 } from "@kubernetes/client-node";
 import type {
   ContainerSummary,
@@ -12,6 +16,8 @@ import type {
   EventSummary,
   NodeSummary,
   PodSummary,
+  ServiceSummary,
+  WorkloadSummary,
 } from "./types.js";
 import { parseQuantity } from "./quantity.js";
 
@@ -79,6 +85,18 @@ export function podRequests(containers: V1Container[], initContainers: V1Contain
   return { cpu: total("cpu"), memory: total("memory") };
 }
 
+/**
+ * The workload a pod belongs to. A ReplicaSet is named "<deployment>-<pod-template-hash>",
+ * so its Deployment is the name without that suffix.
+ */
+export function podWorkload(pod: V1Pod): string | undefined {
+  const owner = pod.metadata?.ownerReferences?.find((o) => o.controller) ?? pod.metadata?.ownerReferences?.[0];
+  if (!owner) return undefined;
+  if (owner.kind !== "ReplicaSet") return owner.name;
+  const hash = pod.metadata?.labels?.["pod-template-hash"];
+  return hash && owner.name.endsWith(`-${hash}`) ? owner.name.slice(0, -hash.length - 1) : owner.name;
+}
+
 export function summarizePod(pod: V1Pod): PodSummary {
   const status = pod.status ?? {};
   const containers = [
@@ -96,6 +114,7 @@ export function summarizePod(pod: V1Pod): PodSummary {
     message: status.message,
     nodeName: pod.spec?.nodeName,
     owner: owner ? { kind: owner.kind, name: owner.name } : undefined,
+    workload: podWorkload(pod),
     createdAt: toIso(pod.metadata?.creationTimestamp),
     readyContainers: appContainers.filter((c) => c.ready).length,
     // Containers that have not started yet have no status, so fall back to the spec.
@@ -124,6 +143,82 @@ export function summarizeDeployment(d: V1Deployment): DeploymentSummary {
       reason: c.reason,
       message: c.message,
     })),
+  };
+}
+
+export function summarizeDaemonSet(d: V1DaemonSet): WorkloadSummary {
+  return {
+    kind: "DaemonSet",
+    namespace: d.metadata?.namespace ?? "default",
+    name: d.metadata?.name ?? "<unknown>",
+    desired: d.status?.desiredNumberScheduled ?? 0,
+    ready: d.status?.numberReady ?? 0,
+    updated: d.status?.updatedNumberScheduled ?? 0,
+  };
+}
+
+export function summarizeStatefulSet(s: V1StatefulSet): WorkloadSummary {
+  return {
+    kind: "StatefulSet",
+    namespace: s.metadata?.namespace ?? "default",
+    name: s.metadata?.name ?? "<unknown>",
+    desired: s.spec?.replicas ?? 1,
+    ready: s.status?.readyReplicas ?? 0,
+    updated: s.status?.updatedReplicas ?? 0,
+    currentRevision: s.status?.currentRevision,
+    updateRevision: s.status?.updateRevision,
+  };
+}
+
+/**
+ * Summarizes a Service with its endpoints and the pods its selector matches. `slices` and
+ * `pods` may cover more than the Service's namespace; only matching ones are used.
+ * Returns undefined for Services without a selector (their endpoints are managed by hand)
+ * and ExternalName Services.
+ */
+export function summarizeService(svc: V1Service, slices: V1EndpointSlice[], pods: V1Pod[]): ServiceSummary | undefined {
+  const namespace = svc.metadata?.namespace ?? "default";
+  const name = svc.metadata?.name ?? "<unknown>";
+  const selector = svc.spec?.selector ?? {};
+  if (Object.keys(selector).length === 0 || svc.spec?.type === "ExternalName") return undefined;
+
+  const endpoints = slices
+    .filter((s) => s.metadata?.namespace === namespace && s.metadata?.labels?.["kubernetes.io/service-name"] === name)
+    .flatMap((s) => s.endpoints ?? []);
+  // An endpoint without a "ready" condition counts as ready (API convention).
+  const ready = endpoints.filter((e) => e.conditions?.ready !== false).length;
+
+  const live = pods.filter(
+    (p) => p.metadata?.namespace === namespace && p.status?.phase !== "Succeeded" && p.status?.phase !== "Failed",
+  );
+  const matching = live.filter((p) => Object.entries(selector).every(([k, v]) => p.metadata?.labels?.[k] === v));
+  const podLabelValues = Object.fromEntries(
+    Object.keys(selector).map((k) => [
+      k,
+      [...new Set(live.map((p) => p.metadata?.labels?.[k]).filter((v): v is string => v !== undefined))].sort().slice(0, 10),
+    ]),
+  );
+
+  return {
+    namespace,
+    name,
+    type: svc.spec?.type ?? "ClusterIP",
+    selector,
+    readyEndpoints: ready,
+    notReadyEndpoints: endpoints.length - ready,
+    pods: matching.map((p) => {
+      const s = summarizePod(p);
+      const stuck = s.containers.find((c) => c.reason && c.state !== "running");
+      return {
+        name: s.name,
+        ready: s.phase === "Running" && s.readyContainers === s.totalContainers,
+        phase: s.phase,
+        reason: stuck?.reason,
+        createdAt: s.createdAt,
+        workload: s.workload,
+      };
+    }),
+    podLabelValues,
   };
 }
 

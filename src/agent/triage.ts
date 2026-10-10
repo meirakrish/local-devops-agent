@@ -13,6 +13,7 @@ Rules:
   replicas and the crashing pods of that Deployment are ONE problem; use the pod issue as primary
   because pods have logs and events.
 - Several pods of the same Deployment failing the same way are ONE problem.
+- A Service without ready endpoints and the failing pods it selects are ONE problem; use the pod issue as primary.
 - Prefer critical issues, then warnings. Skip info issues unless nothing else is wrong.
 - Use only issue ids from the list, exactly as written.`;
 
@@ -48,7 +49,8 @@ const CONTROL_PLANE_CATEGORIES = new Set([
  * which have logs and events.
  */
 function primaryRank(i: Issue): number {
-  const notPod = i.resource.kind === "Pod" ? 0 : 1;
+  // A controller that cannot create pods has no pods to look at; its events explain why.
+  const notPod = i.resource.kind === "Pod" || i.category === "pod-create-failed" ? 0 : 1;
   if (CONTROL_PLANE_CATEGORIES.has(i.category)) {
     const name = i.resource.name;
     if (name === "etcd" || name.startsWith("etcd-")) return 0 + notPod;
@@ -72,9 +74,13 @@ function deploymentOfPod(podName: string): string | undefined {
   return m?.[1];
 }
 
-/** Issues with the same key belong to the same workload (a Deployment and its pods). */
+/**
+ * Issues with the same key belong to the same workload: a Deployment, StatefulSet or
+ * DaemonSet, its pods, a Service in front of them, and failures to create its pods.
+ */
 export function groupKey(i: Issue): string {
   if (CONTROL_PLANE_CATEGORIES.has(i.category)) return "control-plane";
+  if (i.workload) return i.workload;
   if (i.resource.kind === "Pod") {
     return `${i.resource.namespace}/${deploymentOfPod(i.resource.name) ?? i.resource.name}`;
   }
@@ -135,6 +141,23 @@ export function buildProblems(
   return problems.sort((a, b) => compareSeverity(a.severity, b.severity));
 }
 
+/**
+ * Adds critical issues the LLM left out, while there is room under the limit. With many
+ * issues, the model sometimes returns fewer problems than allowed and skips critical ones
+ * (in testing: an OOM-killed pod and an unreachable webhook). Warnings stay its choice.
+ */
+export function addMissedCritical(problems: Problem[], issues: Issue[], maxProblems: number): Problem[] {
+  const room = maxProblems - problems.length;
+  if (room <= 0) return problems;
+  const used = new Set(problems.flatMap((p) => [p.primary, ...p.related].map((i) => i.id)));
+  const unused = issues.filter((i) => !used.has(i.id));
+  // Critical groups come first in the fallback, so taking `room` of them keeps the most severe.
+  const missed = fallbackTriage(unused, room)
+    .filter((p) => p.severity === "critical")
+    .map((p) => ({ ...p, reason: "added: critical issue not chosen by the LLM" }));
+  return [...problems, ...missed].sort((a, b) => compareSeverity(a.severity, b.severity));
+}
+
 export async function triage(
   llm: LlmClient,
   overview: ClusterOverview,
@@ -168,7 +191,11 @@ export async function triage(
       "triage",
     );
     const problems = buildProblems(result.problems, issues, maxProblems);
-    if (problems.length > 0) return problems;
+    if (problems.length > 0) {
+      const completed = addMissedCritical(problems, issues, maxProblems);
+      if (completed.length > problems.length) log(`triage: added ${completed.length - problems.length} critical problem(s) the LLM left out`);
+      return completed;
+    }
     log("triage: LLM returned no usable problems, using fallback");
   } catch (err) {
     log(`triage: LLM failed (${err instanceof Error ? err.message : String(err)}), using fallback`);

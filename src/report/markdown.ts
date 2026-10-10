@@ -117,6 +117,9 @@ export function renderMarkdownReport({
   const readyNodes = overview.nodes.filter((n) => n.ready).length;
   const runningPods = overview.pods.filter((p) => p.phase === "Running").length;
   const healthyDeployments = overview.deployments.filter((d) => d.ready >= d.desired).length;
+  const healthyWorkloads = overview.workloads.filter((w) => w.ready >= w.desired).length;
+  const servicesDown = overview.services.filter((s) => s.readyEndpoints === 0).length;
+  const dns = overview.dns.service;
 
   const out: string[] = [
     "# Kubernetes Health Report",
@@ -133,6 +136,9 @@ export function renderMarkdownReport({
     `| Nodes ready | ${readyNodes}/${overview.nodes.length} |`,
     `| Pods running | ${runningPods}/${overview.pods.length} |`,
     `| Deployments fully ready | ${healthyDeployments}/${overview.deployments.length} |`,
+    `| DaemonSets and StatefulSets fully ready | ${healthyWorkloads}/${overview.workloads.length} |`,
+    `| Services without ready endpoints | ${servicesDown} of ${overview.services.length} |`,
+    `| Cluster DNS | ${dns ? `${dns.readyEndpoints}/${dns.readyEndpoints + dns.notReadyEndpoints} endpoints ready` : "not visible"} |`,
     `| Warning events (recent) | ${overview.warningEvents.length} |`,
     ...controlPlaneRows(overview, issues, new Date(overview.scannedAt)),
     `| Issues | ${count("critical")} critical, ${count("warning")} warning, ${count("info")} info |`,
@@ -182,6 +188,7 @@ export function renderMarkdownReport({
   out.push("## Scan notes", "");
   for (const err of overview.errors) out.push(`- Scan error: ${err}`);
   for (const note of overview.controlPlane.notVisible) out.push(`- Not checked: ${note}`);
+  if (overview.dns.notVisible) out.push(`- Not checked: cluster DNS: ${overview.dns.notVisible}`);
   if (ollama) {
     if (!ollama.reachable) out.push(`- LLM: ${ollama.error}`);
     else if (!ollama.modelAvailable)

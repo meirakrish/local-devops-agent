@@ -71,6 +71,13 @@ export function toolTarget(issue: Issue): string {
   if (kind === "ControlPlane") {
     return `call k8s_cluster_health with section="${name === "etcd" ? "etcd" : "control-plane"}"`;
   }
+  if (kind === "Deployment" || kind === "StatefulSet" || kind === "DaemonSet") {
+    return `k8s_get_workload with kind="${kind}" namespace="${namespace}" name="${name}"`;
+  }
+  if (kind === "ReplicaSet" && issue.workload) {
+    return `k8s_get_workload with kind="Deployment" namespace="${namespace}" name="${issue.workload.split("/")[1]}"`;
+  }
+  if (kind === "Service") return `k8s_get_service with namespace="${namespace}" name="${name}"`;
   return `namespace="${namespace}" name="${name}"`;
 }
 
@@ -113,7 +120,17 @@ export function dropNullArgs(args: Record<string, unknown>): Record<string, unkn
 export function seedCall(issue: Issue): { name: string; args: Record<string, unknown> } | undefined {
   const { kind, namespace, name } = issue.resource;
   if (kind === "Pod" && namespace) return { name: "k8s_describe_pod", args: { namespace, name } };
-  if (kind === "Deployment" && namespace) return { name: "k8s_get_deployment", args: { namespace, name } };
+  if ((kind === "Deployment" || kind === "StatefulSet" || kind === "DaemonSet") && namespace) {
+    return { name: "k8s_get_workload", args: { kind, namespace, name } };
+  }
+  // A ReplicaSet's FailedCreate events show up in its Deployment's controller events.
+  if (kind === "ReplicaSet" && namespace && issue.workload) {
+    return { name: "k8s_get_workload", args: { kind: "Deployment", namespace, name: issue.workload.split("/")[1] } };
+  }
+  if (kind === "Service" && namespace) return { name: "k8s_get_service", args: { namespace, name } };
+  if (namespace && issue.category === "pod-create-failed") {
+    return { name: "k8s_list_events", args: { namespace, objectName: name, objectKind: kind } };
+  }
   if (kind === "Node") return { name: "k8s_list_nodes", args: {} };
   if (kind.endsWith("WebhookConfiguration")) return { name: "k8s_cluster_health", args: { section: "webhooks" } };
   if (kind === "ControlPlane") {

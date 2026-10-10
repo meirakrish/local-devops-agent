@@ -250,6 +250,15 @@ describe("deployment rules", () => {
     const issues = deploymentIssues(summarizeDeployment(deployment(2, 2, "ProgressDeadlineExceeded")));
     expect(issues.map((i) => i.category)).toEqual(["rollout-stuck"]);
   });
+
+  it("points at FailedCreate when the ReplicaSet cannot create pods", () => {
+    const d = deployment(1, 0);
+    d.status!.conditions = [{ type: "ReplicaFailure", status: "True", reason: "FailedCreate", message: 'pods "api-1" is forbidden: exceeded quota' }];
+    const [issue] = deploymentIssues(summarizeDeployment(d));
+    expect(issue?.evidence[1]).toBe('ReplicaFailure (FailedCreate): pods "api-1" is forbidden: exceeded quota');
+    expect(issue?.hint).toContain("FailedCreate events");
+    expect(issue?.workload).toBe("shop/api");
+  });
 });
 
 describe("detectIssues", () => {
@@ -269,6 +278,10 @@ describe("detectIssues", () => {
         ),
       ],
       deployments: [],
+      workloads: [],
+      services: [],
+      dns: {},
+      podCreateFailures: [],
       warningEvents: [],
       controlPlane: { notVisible: [] },
       webhooks: [],

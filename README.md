@@ -24,13 +24,15 @@ $ pnpm demo:check --verbose
 
 - **One command, no questions:** `pnpm check` scans the cluster and prints a report.
 - **Finds common failures with rules:** crashlooping, OOMKilled, unschedulable and
-  image-pull failures in workloads, plus cluster-level risks: failing API server and etcd
+  image-pull failures in workloads, Deployments, StatefulSets and DaemonSets without ready
+  pods, pods the API server refuses to create (quota, Pod Security, webhooks), Services
+  that route to no ready pod, and cluster DNS outages, plus cluster-level risks: failing API server and etcd
   health checks, control-plane components that are down or recently restarted or failing
   probes, etcd nearing its storage quota, expiring API server certificates, stale kubelet
   heartbeats, full nodes, unsupported version skew, and admission webhooks that block
   requests. See [What it checks](#what-it-checks).
 - **Investigates like an SRE:** a local LLM groups related issues, then uses read-only
-  tools (describe, logs, events, deployments) to find the root cause and suggest a fix.
+  tools (describe, logs, events, workloads, services) to find the root cause and suggest a fix.
 - **Read-only by construction:** write, delete and exec operations are blocked in code,
   not just by prompt instructions (see [Safety](#safety)).
 - **Works without the LLM:** if Ollama is down, or with `--no-llm`, you still get the
@@ -60,9 +62,9 @@ pnpm demo:up
 pnpm demo:check --verbose
 ```
 
-`demo:up` creates a two-node [kind](https://kind.sigs.k8s.io/) cluster, deploys four
-broken workloads, one healthy one and a broken admission webhook, and waits until each has
-actually failed. The first
+`demo:up` creates a two-node [kind](https://kind.sigs.k8s.io/) cluster, deploys five
+broken workloads, one healthy one, two broken Services and a broken admission webhook, and
+waits until each has actually failed. The first
 run downloads kind and its node image, so it takes a few minutes. `demo:check` runs the
 agent and prints the report. Delete the cluster with `pnpm demo:down`.
 
@@ -140,6 +142,11 @@ The rules run on every scan, with or without the LLM. Severity decides the exit 
 | Pods | CrashLoopBackOff, image pull errors, config errors, OOMKilled, unschedulable | critical |
 | Pods | Pending too long, failed or evicted, not ready, high restart count | warning |
 | Deployments | No ready replicas or rollout stuck / some replicas unavailable | critical / warning |
+| DaemonSets, StatefulSets | No ready pods / some pods not ready (with the StatefulSet's rollout revision) | critical / warning |
+| Pod creation | A ReplicaSet, StatefulSet, DaemonSet or Job cannot create pods (`FailedCreate`): quota exceeded, Pod Security, admission webhook, LimitRange, missing ServiceAccount | critical |
+| Services | Selected pods exist but none is ready (requests fail) | critical |
+| Services | Selector matches no pods; the report lists the label values pods actually have, to expose typos | warning |
+| Cluster DNS | `kube-system/kube-dns` has no ready endpoints / only some ready (checked even with `--namespace`) | critical / warning |
 
 **When a check cannot run, the report says so.** Managed clusters (EKS, GKE, AKS) usually
 hide etcd, and a restricted kubeconfig may not be allowed to read `/metrics`. These show
@@ -147,7 +154,7 @@ as "not visible" in the summary and "Not checked: ..." in the notes, never as he
 
 ### Tools
 
-The agent can call seven tools. All are read-only and built on the guarded client:
+The agent can call eight tools. All are read-only and built on the guarded client:
 
 | Tool | Returns |
 | --- | --- |
@@ -156,7 +163,8 @@ The agent can call seven tools. All are read-only and built on the guarded clien
 | `k8s_describe_pod` | Conditions, container states and last termination, image, resources, env var **names**, probes, recent events |
 | `k8s_get_logs` | The last N lines of a container's logs. After a restart, it adds the previous (crashed) run, and falls back to the current run when the previous run's logs are gone |
 | `k8s_list_events` | Warning events, filtered by namespace, object name and kind |
-| `k8s_get_deployment` | Desired vs ready replicas, rollout conditions, images, and the status of its pods |
+| `k8s_get_workload` | A Deployment, StatefulSet or DaemonSet: desired vs ready pods, rollout status, images, its pods with their nodes, and its controller's warning events (e.g. `FailedCreate`) |
+| `k8s_get_service` | Selector, ports, ready and not-ready endpoints, the matching pods; the label values pods have when nothing matches, and a note when a `targetPort` is not a declared container port |
 | `k8s_cluster_health` | By section. `control-plane`: API server version, certificate expiry, `/readyz` checks, and control-plane pods with recent restarts and probe failures. `etcd`: health check, database size vs quota, largest object counts. `webhooks`: admission webhooks and whether their service can answer |
 
 ### Design choices for a small local model
@@ -173,9 +181,19 @@ several failure modes, and each fix moved responsibility from the prompt into co
   that, plus the rule's hint, to the model. Before this, the model read the same numbers
   and suggested *raising* the CPU request.
 - **The first tool call is made in code.** Each investigation starts with the obvious
-  call already done: `k8s_describe_pod` for a pod, `k8s_cluster_health` with the matching
-  section for a webhook or control-plane issue. The model used to skip it sometimes and
+  call already done: `k8s_describe_pod` for a pod, `k8s_get_workload` for a workload (or
+  for the Deployment of a ReplicaSet that cannot create pods), `k8s_get_service` for a
+  Service, `k8s_cluster_health` with the matching section for a webhook or control-plane
+  issue. The model used to skip it sometimes and
   wander, for example into the logs of an unrelated pod.
+- **Skipped critical problems are added back.** With many issues, the model sometimes
+  returned fewer problems than allowed and left out critical ones (an OOM-killed pod, an
+  unreachable webhook). Code fills the remaining slots with the critical issues it skipped;
+  skipping warnings stays the model's choice.
+- **Workloads are grouped in code.** Each issue records its workload, taken from the pod's
+  owner, so a Deployment, StatefulSet or DaemonSet, its failing pods, the Service in front
+  of them and any `FailedCreate` errors become one problem. Pod names alone could not group
+  StatefulSet pods (`db-0`) or a Deployment whose pods were never created.
 - **Control-plane incidents are grouped in code.** Failures cascade: a slow etcd makes
   the API server time out, so the scheduler and controller-manager lose leader election
   and restart. All control-plane health issues become one problem, investigated from the
@@ -212,14 +230,16 @@ src/
   k8s/raw.ts            GET-only reader for /readyz, /livez, /version and /metrics
   llm/model.ts          LlmClient interface and Ollama implementation
   llm/ollama.ts         Ollama connection check
-  tools/k8s-tools.ts    The seven read-only tools
+  tools/k8s-tools.ts    The eight read-only tools
   tools/truncate.ts     Output truncation
   scan/                 Cluster overview, summaries, quantities and rules
-                        (rules.ts: workloads and nodes; cluster-rules.ts: control plane, etcd, webhooks)
+                        (rules.ts: pods, Deployments and nodes; workload-rules.ts: DaemonSets,
+                        StatefulSets, Services, cluster DNS, pod creation failures;
+                        cluster-rules.ts: control plane, etcd, webhooks)
   report/markdown.ts    Markdown report renderer
 test/                   Unit tests (fake cluster and scripted fake LLM; no Ollama needed)
 test/e2e/               End-to-end tests against the demo cluster
-demo/workloads.yaml     Four broken deployments, one healthy one, and a broken admission webhook
+demo/workloads.yaml     Five broken deployments, one healthy one, two broken Services and a broken admission webhook
 demo/kind-cluster.yaml  kind cluster definition (1 control plane + 1 worker)
 scripts/demo.sh         Demo cluster lifecycle: up, check, status, reset, down
 docs/                   Example report
@@ -458,7 +478,7 @@ The agent must never change the cluster. This is enforced in code, in two layers
    send GET, and only to `/readyz`, `/livez`, `/version` and `/metrics`. Paths are
    normalized before the check, so tricks like `/readyz/../api/v1/secrets` are rejected.
 
-On top of that, the investigate loop only runs tools from its own registry of six
+On top of that, the investigate loop only runs tools from its own registry of eight
 read-only tools. If the model asks for any other tool, it gets an error message back and
 nothing runs.
 
