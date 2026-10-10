@@ -1,4 +1,5 @@
-import { formatPercent } from "./quantity.js";
+import { formatBytes, formatPercent } from "./quantity.js";
+import { minutesSince } from "./time.js";
 import type { ControlPlanePod, ControlPlaneSummary, Issue, WebhookSummary } from "./types.js";
 
 /** Rules for cluster-level health: control plane, etcd and admission webhooks. */
@@ -14,10 +15,6 @@ export const CLUSTER_THRESHOLDS = {
   /** Probe failures of a control-plane pod within the event window before warning. */
   probeFailureWarning: 3,
 };
-
-function formatBytes(bytes: number): string {
-  return bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(2)} GiB` : `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
-}
 
 export function controlPlaneIssues(cp: ControlPlaneSummary, now: Date): Issue[] {
   const issues: Issue[] = [];
@@ -136,8 +133,9 @@ const COMPONENT_HINTS: Record<string, string> = {
     "The controller-manager exits when it loses leader election, usually because the API server or etcd was slow or unavailable. Check its previous logs for \"leaderelection lost\", then check kube-apiserver health first.",
 };
 
+/** Whole minutes since `iso`, for messages. */
 function minutesAgo(iso: string, now: Date): number {
-  return Math.round((now.getTime() - Date.parse(iso)) / 60_000);
+  return Math.round(minutesSince(iso, now));
 }
 
 /**

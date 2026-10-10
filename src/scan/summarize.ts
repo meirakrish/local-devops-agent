@@ -1,6 +1,7 @@
 import type {
   CoreV1Event,
   V1Container,
+  V1Endpoint,
   V1ContainerStatus,
   V1DaemonSet,
   V1Deployment,
@@ -85,16 +86,40 @@ export function podRequests(containers: V1Container[], initContainers: V1Contain
   return { cpu: total("cpu"), memory: total("memory") };
 }
 
+/** {app: "web", tier: "fe"} -> "app=web,tier=fe", as used in label selectors. */
+export function formatLabels(labels: Record<string, string>): string {
+  return Object.entries(labels)
+    .map(([k, v]) => `${k}=${v}`)
+    .join(",");
+}
+
+/** An endpoint without a "ready" condition counts as ready (API convention). */
+export function isEndpointReady(e: V1Endpoint): boolean {
+  return e.conditions?.ready !== false;
+}
+
+/** Sort comparator for events (or anything with `lastSeen`): newest first. */
+export function byNewest(a: { lastSeen?: string }, b: { lastSeen?: string }): number {
+  return (b.lastSeen ?? "").localeCompare(a.lastSeen ?? "");
+}
+
 /**
- * The workload a pod belongs to. A ReplicaSet is named "<deployment>-<pod-template-hash>",
- * so its Deployment is the name without that suffix.
+ * The Deployment that owns a ReplicaSet. A ReplicaSet is named
+ * "<deployment>-<pod-template-hash>"; pass the hash when known (from the pod's
+ * pod-template-hash label), otherwise the suffix is recognized by its shape.
  */
+export function deploymentOfReplicaSet(replicaSet: string, hash?: string): string {
+  if (hash) return replicaSet.endsWith(`-${hash}`) ? replicaSet.slice(0, -hash.length - 1) : replicaSet;
+  return /^(.+)-[a-z0-9]{6,10}$/.exec(replicaSet)?.[1] ?? replicaSet;
+}
+
+/** The workload a pod belongs to: the Deployment of its ReplicaSet, else its owner. */
 export function podWorkload(pod: V1Pod): string | undefined {
   const owner = pod.metadata?.ownerReferences?.find((o) => o.controller) ?? pod.metadata?.ownerReferences?.[0];
   if (!owner) return undefined;
   if (owner.kind !== "ReplicaSet") return owner.name;
   const hash = pod.metadata?.labels?.["pod-template-hash"];
-  return hash && owner.name.endsWith(`-${hash}`) ? owner.name.slice(0, -hash.length - 1) : owner.name;
+  return hash ? deploymentOfReplicaSet(owner.name, hash) : owner.name;
 }
 
 export function summarizePod(pod: V1Pod): PodSummary {
@@ -185,8 +210,7 @@ export function summarizeService(svc: V1Service, slices: V1EndpointSlice[], pods
   const endpoints = slices
     .filter((s) => s.metadata?.namespace === namespace && s.metadata?.labels?.["kubernetes.io/service-name"] === name)
     .flatMap((s) => s.endpoints ?? []);
-  // An endpoint without a "ready" condition counts as ready (API convention).
-  const ready = endpoints.filter((e) => e.conditions?.ready !== false).length;
+  const ready = endpoints.filter(isEndpointReady).length;
 
   const live = pods.filter(
     (p) => p.metadata?.namespace === namespace && p.status?.phase !== "Succeeded" && p.status?.phase !== "Failed",

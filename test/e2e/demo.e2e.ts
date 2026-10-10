@@ -32,7 +32,7 @@ beforeAll(async () => {
     eventWindowMinutes: 60,
     now,
   });
-  issues = detectIssues(overview, { restartThreshold: 5, now });
+  issues = detectIssues(overview, { restartThreshold: 5, now, windowMinutes: 60 });
 });
 
 describe("demo cluster scan", () => {

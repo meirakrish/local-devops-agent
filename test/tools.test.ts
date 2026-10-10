@@ -85,14 +85,14 @@ function fakeK8s(logCalls: unknown[] = []): K8sClients {
 }
 
 function getTool(k8s: K8sClients, name: string) {
-  const t = createK8sTools(k8s, { maxChars: 4000 }).find((x) => x.name === name);
+  const t = createK8sTools(k8s, { maxChars: 4000, windowMinutes: 60 }).find((x) => x.name === name);
   if (!t) throw new Error(`no tool ${name}`);
   return t;
 }
 
 describe("k8s tools", () => {
   it("exposes exactly the eight read-only tools", () => {
-    expect(createK8sTools(fakeK8s(), { maxChars: 4000 }).map((t) => t.name)).toEqual([
+    expect(createK8sTools(fakeK8s(), { maxChars: 4000, windowMinutes: 60 }).map((t) => t.name)).toEqual([
       "k8s_list_nodes",
       "k8s_list_pods",
       "k8s_describe_pod",

@@ -7,18 +7,10 @@ import type {
   ServiceSummary,
   WorkloadSummary,
 } from "./types.js";
+import { byNewest, deploymentOfReplicaSet, formatLabels } from "./summarize.js";
+import { minutesSince } from "./time.js";
 
 /** Rules for Deployments, DaemonSets, StatefulSets, Services, cluster DNS and pod creation failures. */
-
-function ageMinutes(createdAt: string | undefined, now: Date): number {
-  if (!createdAt) return Number.POSITIVE_INFINITY;
-  return (now.getTime() - new Date(createdAt).getTime()) / 60_000;
-}
-
-const formatSelector = (selector: Record<string, string>) =>
-  Object.entries(selector)
-    .map(([k, v]) => `${k}=${v}`)
-    .join(",");
 
 function podState(p: ServicePod): string {
   return `${p.name} (${p.ready ? "ready" : (p.reason ?? p.phase)})`;
@@ -104,7 +96,7 @@ export function serviceIssues(svc: ServiceSummary, now: Date, graceMinutes = 5):
   if (svc.readyEndpoints > 0) return [];
   const { namespace, name } = svc;
   const resource = { kind: "Service", namespace, name };
-  const selector = formatSelector(svc.selector);
+  const selector = formatLabels(svc.selector);
 
   if (svc.pods.length === 0) {
     const values = Object.entries(svc.podLabelValues).map(
@@ -126,7 +118,7 @@ export function serviceIssues(svc: ServiceSummary, now: Date, graceMinutes = 5):
     ];
   }
 
-  if (svc.pods.every((p) => ageMinutes(p.createdAt, now) < graceMinutes)) return [];
+  if (svc.pods.every((p) => minutesSince(p.createdAt, now) < graceMinutes)) return [];
   const readyPods = svc.pods.filter((p) => p.ready);
   const workload = singleWorkload(namespace, svc.pods);
   if (readyPods.length > 0) {
@@ -163,7 +155,7 @@ export function dnsIssues(dns: DnsSummary): Issue[] {
   const svc = dns.service;
   if (!svc) return [];
   const resource = { kind: "Service", namespace: svc.namespace, name: svc.name };
-  const pods = svc.pods.length > 0 ? svc.pods.map(podState).join(", ") : `none (selector ${formatSelector(svc.selector)} matches no running pods)`;
+  const pods = svc.pods.length > 0 ? svc.pods.map(podState).join(", ") : `none (selector ${formatLabels(svc.selector)} matches no running pods)`;
   const workload = singleWorkload(svc.namespace, svc.pods);
   const total = svc.readyEndpoints + svc.notReadyEndpoints;
 
@@ -237,12 +229,6 @@ const CREATE_FAILURE_CAUSES: { pattern: RegExp; label: string; hint: string }[] 
   },
 ];
 
-/** "web-7db8d69f68" is a ReplicaSet of Deployment "web". */
-function workloadOf(kind: string, name: string): string {
-  if (kind !== "ReplicaSet") return name;
-  return /^(.+)-[a-z0-9]{6,10}$/.exec(name)?.[1] ?? name;
-}
-
 /**
  * One issue per controller that failed to create pods. Without this, a Deployment whose
  * pods are rejected (quota, Pod Security, webhook) shows 0 ready replicas but no pod
@@ -255,7 +241,7 @@ export function podCreateFailureIssues(events: EventSummary[]): Issue[] {
     byObject.set(key, [...(byObject.get(key) ?? []), e]);
   }
   return [...byObject.values()].map((group) => {
-    const latest = [...group].sort((a, b) => (b.lastSeen ?? "").localeCompare(a.lastSeen ?? ""))[0]!;
+    const latest = [...group].sort(byNewest)[0]!;
     const kind = latest.involvedKind ?? "?";
     const namespace = latest.namespace ?? "default";
     const name = latest.involvedName ?? "?";
@@ -270,7 +256,7 @@ export function podCreateFailureIssues(events: EventSummary[]): Issue[] {
       title: `${kind} ${namespace}/${name} cannot create pods: ${cause?.label ?? "the API server rejected them"}`,
       evidence: [`FailedCreate x${count}, last at ${latest.lastSeen ?? "?"}: ${message.slice(0, 500)}`],
       hint: cause?.hint ?? "The event message says why the API server rejected the pod; fix the pod template or the policy it violates.",
-      workload: `${namespace}/${workloadOf(kind, name)}`,
+      workload: `${namespace}/${kind === "ReplicaSet" ? deploymentOfReplicaSet(name) : name}`,
     };
   });
 }

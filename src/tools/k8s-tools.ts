@@ -2,8 +2,10 @@ import type { V1Container, V1LabelSelector } from "@kubernetes/client-node";
 import { tool, type StructuredToolInterface } from "@langchain/core/tools";
 import { z } from "zod";
 import type { K8sClients } from "../k8s/client.js";
-import { k8sErrorMessage } from "../k8s/errors.js";
+import { isNotFound, k8sErrorMessage } from "../k8s/errors.js";
 import {
+  byNewest,
+  formatLabels,
   summarizeDaemonSet,
   summarizeDeployment,
   summarizeEvent,
@@ -13,7 +15,7 @@ import {
   summarizeStatefulSet,
 } from "../scan/summarize.js";
 import { addNodeUsage, collectControlPlane, collectWebhooks } from "../scan/collect-cluster.js";
-import { formatMemory } from "../scan/quantity.js";
+import { formatBytes } from "../scan/quantity.js";
 import type { EventSummary, PodSummary } from "../scan/types.js";
 import { describePodText, eventLine, nodeLine, podLine } from "./format.js";
 import { truncateMiddle } from "./truncate.js";
@@ -32,7 +34,7 @@ type WorkloadKind = (typeof WORKLOAD_KINDS)[number];
 export interface ToolOptions {
   maxChars: number;
   /** Window for "recent" control-plane restarts and probe failures (EVENT_WINDOW_MINUTES). */
-  windowMinutes?: number;
+  windowMinutes: number;
   defaultTailLines?: number;
   maxListItems?: number;
 }
@@ -68,7 +70,7 @@ async function missingNamespaceHint(k8s: K8sClients, namespace: string): Promise
     await k8s.core.readNamespace({ name: namespace });
     return undefined;
   } catch (err) {
-    if ((err as { code?: number }).code !== 404) return undefined;
+    if (!isNotFound(err)) return undefined;
     const names = (await k8s.core.listNamespace().catch(() => ({ items: [] }))).items
       .map((n) => n.metadata?.name)
       .filter(Boolean);
@@ -85,7 +87,7 @@ function safe<A extends object>(k8s: K8sClients, maxChars: number, fn: (args: A)
     try {
       return truncateMiddle(await fn(args), maxChars);
     } catch (err) {
-      if ((err as { code?: number }).code === 404) {
+      if (isNotFound(err)) {
         const target = args as { namespace?: string; name?: string; pod?: string };
         const hint = target.namespace ? await missingNamespaceHint(k8s, target.namespace) : undefined;
         if (hint) return `Error: ${hint}`;
@@ -97,6 +99,10 @@ function safe<A extends object>(k8s: K8sClients, maxChars: number, fn: (args: A)
   };
 }
 
+/**
+ * Builds the eight read-only tools the investigate loop may call. Each tool returns text,
+ * truncated to `opts.maxChars`; API errors come back as "Error: ..." text, not exceptions.
+ */
 export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredToolInterface[] {
   const maxItems = opts.maxListItems ?? 60;
   const defaultTail = opts.defaultTailLines ?? 50;
@@ -108,7 +114,7 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
     });
     return list.items
       .map(summarizeEvent)
-      .sort((a, b) => (b.lastSeen ?? "").localeCompare(a.lastSeen ?? ""))
+      .sort(byNewest)
       .slice(0, 15);
   }
 
@@ -277,7 +283,7 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
           : await k8s.core.listEventForAllNamespaces({ fieldSelector });
         const events = list.items
           .map(summarizeEvent)
-          .sort((a, b) => (b.lastSeen ?? "").localeCompare(a.lastSeen ?? ""))
+          .sort(byNewest)
           .slice(0, maxItems);
         if (events.length > 0) return events.map(eventLine).join("\n");
         const hint = namespace ? await missingNamespaceHint(k8s, namespace) : undefined;
@@ -305,14 +311,14 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
           (e.involvedKind === kind && e.involvedName === name) ||
           (kind === "Deployment" && e.involvedKind === "ReplicaSet" && (e.involvedName ?? "").startsWith(`${name}-`)),
       )
-      .sort((a, b) => (b.lastSeen ?? "").localeCompare(a.lastSeen ?? ""))
+      .sort(byNewest)
       .slice(0, 10);
   }
 
   async function podsOf(namespace: string, selector: V1LabelSelector | undefined): Promise<string[]> {
     const matchLabels = selector?.matchLabels;
     if (!matchLabels) return [];
-    const labelSelector = Object.entries(matchLabels).map(([k, v]) => `${k}=${v}`).join(",");
+    const labelSelector = formatLabels(matchLabels);
     const pods = (await k8s.core.listNamespacedPod({ namespace, labelSelector })).items.map(summarizePod);
     return ["Pods:", ...(pods.length > 0 ? pods.map((p) => `- ${podLine(p)}`) : ["- (none)"])];
   }
@@ -397,7 +403,7 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
         return lines.join("\n");
       }
       lines.push(
-        `Selector: ${Object.entries(s.selector).map(([k, v]) => `${k}=${v}`).join(",")}`,
+        `Selector: ${formatLabels(s.selector)}`,
         `Endpoints: ${s.readyEndpoints} ready, ${s.notReadyEndpoints} not ready`,
         ...endpointLines,
       );
@@ -438,7 +444,7 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
       const want = (s: HealthSection) => section === "all" || section === s;
       const problems: string[] = [];
       const [cp, webhooks] = await Promise.all([
-        collectControlPlane(k8s, opts.windowMinutes ?? 60),
+        collectControlPlane(k8s, opts.windowMinutes),
         want("webhooks")
           ? collectWebhooks(k8s).catch((err: unknown) => {
               problems.push(`admission webhooks: ${k8sErrorMessage(err)}`);
@@ -459,7 +465,7 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
           );
         }
         if (cp.pods) {
-          lines.push(`Control-plane pods (restarts and probe failures within the last ${opts.windowMinutes ?? 60} min):`);
+          lines.push(`Control-plane pods (restarts and probe failures within the last ${opts.windowMinutes} min):`);
           for (const p of cp.pods) {
             const parts = [`- ${p.component} (${p.name})`, p.ready ? "ready" : `NOT READY${p.stateReason ? ` (${p.stateReason})` : ""}`, `restarts=${p.restarts}`];
             if (p.lastRestart) {
@@ -478,7 +484,7 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
         if (cp.etcd) {
           const size = cp.etcd.dbSizeBytes;
           lines.push(
-            `etcd database: ${size !== undefined ? `${formatMemory(size)} of ${formatMemory(cp.etcd.quotaBytes)} quota (${Math.round((size / cp.etcd.quotaBytes) * 100)}%)` : "size not exposed"}${cp.etcd.quotaSource === "default" ? ", default quota assumed" : ""}`,
+            `etcd database: ${size !== undefined ? `${formatBytes(size)} of ${formatBytes(cp.etcd.quotaBytes)} quota (${Math.round((size / cp.etcd.quotaBytes) * 100)}%)` : "size not exposed"}${cp.etcd.quotaSource === "default" ? ", default quota assumed" : ""}`,
             `etcd largest object counts: ${cp.etcd.objectCounts.slice(0, 8).map((o) => `${o.resource}=${o.count}`).join(", ") || "unknown"}`,
           );
         }

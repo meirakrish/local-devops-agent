@@ -1,5 +1,6 @@
 import { formatCpu, formatMemory, parseQuantity } from "./quantity.js";
 import { compareSeverity, worstSeverity } from "./severity.js";
+import { minutesSince } from "./time.js";
 import type { ContainerSummary, Issue, NodeSummary, PodSummary, Severity } from "./types.js";
 
 /** Rules for pods and their containers. */
@@ -121,17 +122,12 @@ export function capacityFinding(pod: PodSummary, nodes: NodeSummary[]): { eviden
   return undefined;
 }
 
-function ageMinutes(createdAt: string | undefined, now: Date): number {
-  if (!createdAt) return Number.POSITIVE_INFINITY;
-  return (now.getTime() - new Date(createdAt).getTime()) / 60_000;
-}
-
 export function podIssues(pod: PodSummary, opts: PodRuleOptions): Issue[] {
   // Completed Job pods are healthy.
   if (pod.phase === "Succeeded") return [];
 
   const grace = opts.gracePeriodMinutes ?? 5;
-  const oldEnough = ageMinutes(pod.createdAt, opts.now) >= grace;
+  const oldEnough = minutesSince(pod.createdAt, opts.now) >= grace;
   const findings: PodFinding[] = pod.containers.flatMap((c) =>
     containerFindings(c, opts.restartThreshold),
   );

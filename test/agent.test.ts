@@ -19,10 +19,11 @@ function issue(id: string, kind: string, name: string, severity: Issue["severity
   };
 }
 
-const webPod1 = issue("pod/shop/web-7db8d69f68-4f2n7:crashloop", "Pod", "web-7db8d69f68-4f2n7");
-const webPod2 = issue("pod/shop/web-7db8d69f68-q5rls:crashloop", "Pod", "web-7db8d69f68-q5rls");
-const webDeploy = issue("deployment/shop/web:unavailable", "Deployment", "web");
-const payPod = issue("pod/shop/payments-9877b44c9-hql6z:image-pull", "Pod", "payments-9877b44c9-hql6z");
+// Like the rules, pod and Deployment issues record their workload, which triage groups by.
+const webPod1 = { ...issue("pod/shop/web-7db8d69f68-4f2n7:crashloop", "Pod", "web-7db8d69f68-4f2n7"), workload: "shop/web" };
+const webPod2 = { ...issue("pod/shop/web-7db8d69f68-q5rls:crashloop", "Pod", "web-7db8d69f68-q5rls"), workload: "shop/web" };
+const webDeploy = { ...issue("deployment/shop/web:unavailable", "Deployment", "web"), workload: "shop/web" };
+const payPod = { ...issue("pod/shop/payments-9877b44c9-hql6z:image-pull", "Pod", "payments-9877b44c9-hql6z"), workload: "shop/payments" };
 const cordoned = issue("node/n1:cordoned", "Node", "n1", "info");
 const ALL = [webDeploy, webPod1, webPod2, payPod, cordoned];
 

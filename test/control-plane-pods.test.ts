@@ -159,13 +159,13 @@ describe("control-plane pods in detectIssues and the report", () => {
   };
 
   it("reports a crashing control-plane pod once, from the control-plane rule", () => {
-    const issues = detectIssues(overview, { restartThreshold: 5, now: NOW });
+    const issues = detectIssues(overview, { restartThreshold: 5, now: NOW, windowMinutes: 60 });
     expect(issues.map((i) => i.category)).toEqual(["controlplane-pod-down"]);
     expect(issues[0]?.evidence[0]).toContain("CrashLoopBackOff");
   });
 
   it("shows a summary row, or 'not visible' on managed clusters", () => {
-    const issues = detectIssues(overview, { restartThreshold: 5, now: NOW });
+    const issues = detectIssues(overview, { restartThreshold: 5, now: NOW, windowMinutes: 60 });
     expect(renderMarkdownReport({ overview, issues })).toContain("| Control-plane pods | 0/1 ready |");
     const managed = { ...overview, controlPlane: { notVisible: ["control-plane pods: none found in kube-system (managed control plane?)"] } };
     expect(renderMarkdownReport({ overview: managed, issues: [] })).toContain("| Control-plane pods | not visible |");

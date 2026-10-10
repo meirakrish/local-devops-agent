@@ -8,6 +8,7 @@ import {
 import type { StructuredToolInterface } from "@langchain/core/tools";
 import { Annotation, END, MessagesAnnotation, START, StateGraph } from "@langchain/langgraph";
 import { z } from "zod";
+import { errorMessage } from "../errors.js";
 import type { LlmClient } from "../llm/model.js";
 import type { Issue } from "../scan/types.js";
 import type { Finding, Problem } from "./types.js";
@@ -58,26 +59,26 @@ export interface InvestigateDeps {
   log?: (message: string) => void;
 }
 
-/** Exact tool arguments for a resource, so the model does not have to split "ns/name". */
+/**
+ * Exact tool arguments for a resource, so the model does not have to split "ns/name".
+ * Pods and nodes get plain arguments, since several tools apply; other resources name
+ * the tool and arguments of their seed call.
+ */
 export function toolTarget(issue: Issue): string {
   const { kind, namespace, name } = issue.resource;
-  if (kind === "Pod" && namespace === "kube-system" && issue.category.startsWith("controlplane-")) {
-    return `namespace="kube-system" name="${name}" (for k8s_get_logs: pod="${name}"); k8s_cluster_health with section="control-plane" shows all control-plane components`;
+  if (kind === "Pod") {
+    const pod = `namespace="${namespace}" name="${name}" (for k8s_get_logs: pod="${name}")`;
+    return issue.category.startsWith("controlplane-")
+      ? `${pod}; k8s_cluster_health with section="control-plane" shows all control-plane components`
+      : pod;
   }
-  if (kind === "Pod") return `namespace="${namespace}" name="${name}" (for k8s_get_logs: pod="${name}")`;
   if (kind === "Node") return `name="${name}" (k8s_list_nodes shows heartbeat, versions and requests)`;
-  // Name the health section, so a small model gets only the relevant part of the output.
-  if (kind.endsWith("WebhookConfiguration")) return 'call k8s_cluster_health with section="webhooks"';
-  if (kind === "ControlPlane") {
-    return `call k8s_cluster_health with section="${name === "etcd" ? "etcd" : "control-plane"}"`;
+  const seed = seedCall(issue);
+  if (seed) {
+    return `${seed.name} with ${Object.entries(seed.args)
+      .map(([k, v]) => `${k}="${String(v)}"`)
+      .join(" ")}`;
   }
-  if (kind === "Deployment" || kind === "StatefulSet" || kind === "DaemonSet") {
-    return `k8s_get_workload with kind="${kind}" namespace="${namespace}" name="${name}"`;
-  }
-  if (kind === "ReplicaSet" && issue.workload) {
-    return `k8s_get_workload with kind="Deployment" namespace="${namespace}" name="${issue.workload.split("/")[1]}"`;
-  }
-  if (kind === "Service") return `k8s_get_service with namespace="${namespace}" name="${name}"`;
   return `namespace="${namespace}" name="${name}"`;
 }
 
@@ -132,11 +133,22 @@ export function seedCall(issue: Issue): { name: string; args: Record<string, unk
     return { name: "k8s_list_events", args: { namespace, objectName: name, objectKind: kind } };
   }
   if (kind === "Node") return { name: "k8s_list_nodes", args: {} };
+  // Name the health section, so a small model gets only the relevant part of the output.
   if (kind.endsWith("WebhookConfiguration")) return { name: "k8s_cluster_health", args: { section: "webhooks" } };
   if (kind === "ControlPlane") {
     return { name: "k8s_cluster_health", args: { section: name === "etcd" ? "etcd" : "control-plane" } };
   }
   return undefined;
+}
+
+/** Runs a tool; a failure (usually invalid arguments) becomes an error text for the model. */
+async function runTool(tool: StructuredToolInterface, args: Record<string, unknown>): Promise<string> {
+  try {
+    return String(await tool.invoke(args));
+  } catch (err) {
+    // The zod details come after the first line, so keep the whole message, on one line.
+    return `Error: ${errorMessage(err).replace(/\s+/g, " ").trim().slice(0, 500)}`;
+  }
 }
 
 function callSignature(name: string, args: unknown): string {
@@ -194,15 +206,7 @@ export function buildInvestigationGraph({ llm, tools, maxSteps, log = () => {} }
         log(`    ↺ ${signature} (repeated, not run)`);
       } else {
         const started = Date.now();
-        let output: string;
-        try {
-          output = String(await tool.invoke(args));
-        } catch (err) {
-          // Usually invalid arguments. The zod details come after the first line, so keep
-          // the whole message (on one line) for the model to fix its call.
-          const message = err instanceof Error ? err.message : String(err);
-          output = `Error: ${message.replace(/\s+/g, " ").trim().slice(0, 500)}`;
-        }
+        const output = await runTool(tool, args);
         reply(output);
         log(`    → ${signature} (${output.length} chars, ${Date.now() - started}ms)`);
       }
@@ -253,12 +257,7 @@ export async function investigate(problem: Problem, deps: InvestigateDeps): Prom
     if (seed && seedTool && deps.maxSteps > 0) {
       const signature = callSignature(seed.name, seed.args);
       const started = Date.now();
-      let output: string;
-      try {
-        output = String(await seedTool.invoke(seed.args));
-      } catch (err) {
-        output = `Error: ${(err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ").slice(0, 500)}`;
-      }
+      const output = await runTool(seedTool, seed.args);
       (deps.log ?? (() => {}))(`    → ${signature} (${output.length} chars, ${Date.now() - started}ms, seed)`);
       messages.push(
         new AIMessage({ content: "", tool_calls: [{ id: "seed-0", name: seed.name, args: seed.args, type: "tool_call" }] }),
@@ -280,7 +279,7 @@ export async function investigate(problem: Problem, deps: InvestigateDeps): Prom
       confidence: "low",
       toolCalls: 0,
       usage: deps.llm.takeUsage?.(),
-      error: err instanceof Error ? err.message : String(err),
+      error: errorMessage(err),
     };
   }
 }

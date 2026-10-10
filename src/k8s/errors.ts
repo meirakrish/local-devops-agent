@@ -1,3 +1,8 @@
+/** True for a Kubernetes API "404 Not Found" error. */
+export function isNotFound(err: unknown): boolean {
+  return (err as { code?: number } | undefined)?.code === 404;
+}
+
 /** Short, human-readable message for a Kubernetes API error (or any thrown value). */
 export function k8sErrorMessage(err: unknown): string {
   if (err && typeof err === "object") {

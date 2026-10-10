@@ -8,7 +8,7 @@ import { summarizeDeployment, summarizeNode, summarizePod } from "../src/scan/su
 import type { ClusterOverview } from "../src/scan/types.js";
 
 const NOW = new Date("2026-01-01T12:00:00Z");
-const OPTS = { restartThreshold: 5, now: NOW };
+const OPTS = { restartThreshold: 5, now: NOW, windowMinutes: 60 };
 const minutesAgo = (m: number) => new Date(NOW.getTime() - m * 60_000);
 
 function pod(

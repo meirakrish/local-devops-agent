@@ -1,10 +1,12 @@
 import type { Finding } from "../agent/types.js";
 import { addUsage, emptyUsage, type LlmUsage } from "../llm/model.js";
 import type { OllamaStatus } from "../llm/ollama.js";
+import { formatBytes } from "../scan/quantity.js";
 import type { ClusterOverview, Issue, Severity } from "../scan/types.js";
 
 export type OverallStatus = "HEALTHY" | "DEGRADED" | "CRITICAL";
 
+/** Overall status from rule severities only (the LLM cannot change it); sets the exit code. */
 export function overallStatus(issues: Issue[]): OverallStatus {
   if (issues.some((i) => i.severity === "critical")) return "CRITICAL";
   if (issues.some((i) => i.severity === "warning")) return "DEGRADED";
@@ -52,9 +54,8 @@ function controlPlaneRows(overview: ClusterOverview, issues: Issue[], now: Date)
     rows.push("| API server health checks | not visible |");
   }
   if (cp.etcd?.dbSizeBytes !== undefined) {
-    const size = (b: number) => (b >= 1024 ** 3 ? `${(b / 1024 ** 3).toFixed(1)} GiB` : `${(b / 1024 ** 2).toFixed(1)} MiB`);
     const ratio = Math.round((cp.etcd.dbSizeBytes / cp.etcd.quotaBytes) * 100);
-    rows.push(`| etcd database | ${size(cp.etcd.dbSizeBytes)} of ${size(cp.etcd.quotaBytes)} quota (${ratio}%)${cp.etcd.quotaSource === "default" ? ", default quota assumed" : ""} |`);
+    rows.push(`| etcd database | ${formatBytes(cp.etcd.dbSizeBytes)} of ${formatBytes(cp.etcd.quotaBytes)} quota (${ratio}%)${cp.etcd.quotaSource === "default" ? ", default quota assumed" : ""} |`);
   } else {
     rows.push("| etcd database | not visible |");
   }
@@ -129,6 +130,10 @@ export interface ReportInput {
   llmSkipped?: string;
 }
 
+/**
+ * Renders the report: summary table, LLM findings, the remaining rule-based issues by
+ * severity, recent warning events, and scan notes (what could not be checked, LLM status).
+ */
 export function renderMarkdownReport({
   overview,
   issues,

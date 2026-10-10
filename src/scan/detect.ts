@@ -18,12 +18,12 @@ import {
  */
 
 export interface RuleOptions extends PodRuleOptions {
-  /** How far back restarts and probe failures count as recent (default 60). */
-  windowMinutes?: number;
+  /** How far back restarts and probe failures count as recent (EVENT_WINDOW_MINUTES). */
+  windowMinutes: number;
 }
 
 export function detectIssues(overview: ClusterOverview, opts: RuleOptions): Issue[] {
-  const cpPodIssues = controlPlanePodIssues(overview.controlPlane.pods ?? [], opts.now, opts.windowMinutes ?? 60);
+  const cpPodIssues = controlPlanePodIssues(overview.controlPlane.pods ?? [], opts.now, opts.windowMinutes);
   // A control-plane pod gets one issue from the control-plane rule, which includes its
   // current state, instead of a second one from the generic pod rules.
   const covered = new Set(cpPodIssues.map((i) => i.resource.name));

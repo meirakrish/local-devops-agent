@@ -25,6 +25,11 @@ export function formatMemory(bytes: number): string {
   return `${Math.round(bytes / 2 ** 20)}Mi`;
 }
 
+/** Byte counts for prose: "3.7 MiB", "2.0 GiB". (formatMemory uses Kubernetes units.) */
+export function formatBytes(bytes: number): string {
+  return bytes >= 2 ** 30 ? `${(bytes / 2 ** 30).toFixed(1)} GiB` : `${(bytes / 2 ** 20).toFixed(1)} MiB`;
+}
+
 /** 0.734 -> "73%". */
 export function formatPercent(ratio: number): string {
   return `${Math.round(ratio * 100)}%`;

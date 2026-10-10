@@ -1,8 +1,9 @@
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { z } from "zod";
+import { errorMessage } from "../errors.js";
 import type { LlmClient } from "../llm/model.js";
-import { compareSeverity } from "../scan/severity.js";
-import type { ClusterOverview, Issue, Severity } from "../scan/types.js";
+import { compareSeverity, worstSeverity } from "../scan/severity.js";
+import type { ClusterOverview, Issue } from "../scan/types.js";
 import type { Problem } from "./types.js";
 
 const SYSTEM_PROMPT = `You are a Kubernetes SRE triaging the results of a cluster health check.
@@ -17,6 +18,7 @@ Rules:
 - Prefer critical issues, then warnings. Skip info issues unless nothing else is wrong.
 - Use only issue ids from the list, exactly as written.`;
 
+/** One line per issue (id, severity, title, first evidence), kept short for the model. */
 export function formatIssuesForPrompt(overview: ClusterOverview, issues: Issue[]): string {
   const lines = [
     `Cluster: ${overview.nodes.length} nodes, ${overview.pods.length} pods, ${overview.deployments.length} deployments.`,
@@ -24,10 +26,6 @@ export function formatIssuesForPrompt(overview: ClusterOverview, issues: Issue[]
     ...issues.map((i) => `- id=${i.id} severity=${i.severity} :: ${i.title} :: ${i.evidence[0] ?? ""}`.slice(0, 400)),
   ];
   return lines.join("\n");
-}
-
-function worstSeverity(issues: Issue[]): Severity {
-  return issues.map((i) => i.severity).sort(compareSeverity)[0] ?? "info";
 }
 
 /**
@@ -65,27 +63,18 @@ function makeProblem(chosen: Issue, others: Issue[], reason: string): Problem {
   const all = [chosen, ...others];
   const primary = all.reduce((best, i) => (primaryRank(i) < primaryRank(best) ? i : best));
   const related = all.filter((i) => i !== primary);
-  return { primary, related, reason, severity: worstSeverity(all) };
-}
-
-/** "web-7db8d69f68-4f2n7" belongs to Deployment "web" (ReplicaSet hash + pod suffix). */
-function deploymentOfPod(podName: string): string | undefined {
-  const m = /^(.+)-[a-z0-9]{6,10}-[a-z0-9]{5}$/.exec(podName);
-  return m?.[1];
+  return { primary, related, reason, severity: worstSeverity(all.map((i) => i.severity)) };
 }
 
 /**
  * Issues with the same key belong to the same workload: a Deployment, StatefulSet or
  * DaemonSet, its pods, a Service in front of them, and failures to create its pods.
+ * The rules set `workload` from the pods' owners; anything else stands alone.
  */
 export function groupKey(i: Issue): string {
   if (CONTROL_PLANE_CATEGORIES.has(i.category)) return "control-plane";
   if (i.workload) return i.workload;
-  if (i.resource.kind === "Pod") {
-    return `${i.resource.namespace}/${deploymentOfPod(i.resource.name) ?? i.resource.name}`;
-  }
-  if (i.resource.kind === "Deployment") return `${i.resource.namespace}/${i.resource.name}`;
-  return `${i.resource.kind}/${i.resource.name}`;
+  return `${i.resource.kind}/${i.resource.namespace ?? ""}/${i.resource.name}`;
 }
 
 /**
@@ -158,6 +147,10 @@ export function addMissedCritical(problems: Problem[], issues: Issue[], maxProbl
   return [...problems, ...missed].sort((a, b) => compareSeverity(a.severity, b.severity));
 }
 
+/**
+ * Asks the LLM which problems to investigate, then fixes up its answer in code (merging,
+ * adding missed critical issues). Falls back to rule-based grouping if the LLM fails.
+ */
 export async function triage(
   llm: LlmClient,
   overview: ClusterOverview,
@@ -198,7 +191,7 @@ export async function triage(
     }
     log("triage: LLM returned no usable problems, using fallback");
   } catch (err) {
-    log(`triage: LLM failed (${err instanceof Error ? err.message : String(err)}), using fallback`);
+    log(`triage: LLM failed (${errorMessage(err)}), using fallback`);
   }
   return fallbackTriage(issues, maxProblems);
 }

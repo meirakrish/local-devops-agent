@@ -273,7 +273,7 @@ describe("detectIssues with workloads, services and DNS", () => {
           { kind: "Validating", configName: "p", name: "w", failurePolicy: "Fail", service: { namespace: "shop", name: "policy" }, status: "no-ready-endpoints" },
         ],
       },
-      { restartThreshold: 5, now: NOW },
+      { restartThreshold: 5, now: NOW, windowMinutes: 60 },
     );
     expect(issues.map((i) => i.id).sort()).toEqual([
       "service/kube-system/kube-dns:dns-down",
@@ -294,7 +294,7 @@ describe("detectIssues with workloads, services and DNS", () => {
     };
     const deployment = (ready: number) => ({ namespace: "shop", name: "api", desired: 2, ready, available: ready, updated: 2, conditions: [] });
     const run = (ready: number) =>
-      detectIssues({ ...base, deployments: [deployment(ready)], podCreateFailures: [failure] }, { restartThreshold: 5, now: NOW }).map((i) => i.category);
+      detectIssues({ ...base, deployments: [deployment(ready)], podCreateFailures: [failure] }, { restartThreshold: 5, now: NOW, windowMinutes: 60 }).map((i) => i.category);
     expect(run(2)).toEqual([]);
     expect(run(0).sort()).toEqual(["pod-create-failed", "replicas-unavailable"]);
   });

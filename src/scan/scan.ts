@@ -2,6 +2,7 @@ import type { K8sClients } from "../k8s/client.js";
 import { k8sErrorMessage } from "../k8s/errors.js";
 import { addNodeUsage, collectControlPlane, collectDns, collectWebhooks } from "./collect-cluster.js";
 import {
+  byNewest,
   summarizeDaemonSet,
   summarizeDeployment,
   summarizeEvent,
@@ -29,7 +30,7 @@ export function recentEvents(
   const cutoff = now.getTime() - windowMinutes * 60_000;
   return events
     .filter((e) => !e.lastSeen || new Date(e.lastSeen).getTime() >= cutoff)
-    .sort((a, b) => (b.lastSeen ?? "").localeCompare(a.lastSeen ?? ""))
+    .sort(byNewest)
     .slice(0, max);
 }
 
