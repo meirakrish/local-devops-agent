@@ -25,12 +25,15 @@ $ pnpm demo:check --verbose
 - **One command, no questions:** `pnpm check` scans the cluster and prints a report.
 - **Finds common failures with rules:** crashlooping, OOMKilled, unschedulable and
   image-pull failures in workloads, Deployments, StatefulSets and DaemonSets without ready
-  pods, pods the API server refuses to create (quota, Pod Security, webhooks), Services
-  that route to no ready pod, and cluster DNS outages, plus cluster-level risks: failing API server and etcd
-  health checks, control-plane components that are down or recently restarted or failing
-  probes, etcd nearing its storage quota, expiring API server certificates, stale kubelet
-  heartbeats, full nodes, unsupported version skew, and admission webhooks that block
-  requests. See [What it checks](#what-it-checks).
+  pods, pods the API server refuses to create (quota, Pod Security, webhooks), failed Jobs
+  and CronJobs whose last run failed, PersistentVolumeClaims that do not bind and pods
+  stuck on volume mounts, Services that route to no ready pod, and cluster DNS outages,
+  plus cluster-level risks: failing API server and etcd health checks, control-plane
+  components that are down or recently restarted or failing probes, a scheduler or
+  controller-manager without an active leader, etcd nearing its storage quota, expiring
+  API server certificates, stale kubelet heartbeats, full nodes, unsupported version skew,
+  admission webhooks that block requests, unavailable aggregated APIs (e.g.
+  metrics-server) and namespaces stuck Terminating. See [What it checks](#what-it-checks).
 - **Investigates like an SRE:** a local LLM groups related issues, then uses read-only
   tools (describe, logs, events, workloads, services) to find the root cause and suggest a fix.
 - **Read-only by construction:** write, delete and exec operations are blocked in code,
@@ -133,6 +136,9 @@ The rules run on every scan, with or without the LLM. Severity decides the exit 
 | Control plane | API server certificate expires within 7 days / 30 days | critical / warning |
 | Control plane | Component pod (etcd, kube-apiserver, scheduler, controller-manager) not ready | critical |
 | Control plane | Component restarted, or failed 3+ health probes, within `EVENT_WINDOW_MINUTES` | warning |
+| Control plane | Leader-election Lease of kube-scheduler or kube-controller-manager not renewed for its `leaseDurationSeconds` + 60 s: nothing schedules / nothing reconciles (works on managed clusters; a missing Lease is "not visible") | critical |
+| Aggregated APIs | APIService backed by a Service (e.g. `v1beta1.metrics.k8s.io`) `Available=False` for longer than the grace period | critical |
+| Namespaces | Stuck Terminating longer than the grace period, with the blocking conditions; grouped with an unavailable APIService when discovery is what blocks it | warning |
 | etcd | Database at 90% / 70% of its quota (a full etcd makes the cluster read-only) | critical / warning |
 | etcd | More than 100,000 objects of one resource | warning |
 | Nodes | NotReady | critical |
@@ -143,13 +149,22 @@ The rules run on every scan, with or without the LLM. Severity decides the exit 
 | Webhooks | Service missing or without ready endpoints, `failurePolicy: Fail` (blocks requests) | critical |
 | Webhooks | Same, with `failurePolicy: Ignore` (policy silently skipped) | warning |
 | Pods | CrashLoopBackOff, image pull errors, config errors, OOMKilled, unschedulable | critical |
+| Pods | Stuck before start (e.g. ContainerCreating) with `FailedMount` / `FailedAttachVolume` events: missing ConfigMap/Secret, Multi-Attach, unbound claim | critical |
 | Pods | Pending too long, failed or evicted, not ready, high restart count | warning |
+| PersistentVolumeClaims | `Lost` / `Pending` past the grace period while a pod waits for it (names a missing StorageClass, quotes `ProvisioningFailed`) | critical |
+| PersistentVolumeClaims | `Pending` past the grace period, not used by a pod (unused `WaitForFirstConsumer` claims are skipped) | warning |
+| Jobs | `Failed=True` (`BackoffLimitExceeded`, `DeadlineExceeded`); failed pods of a Job that later completed are ignored | warning |
+| CronJobs | Most recent finished run failed (an old failure followed by a successful run is ignored) | warning |
+| CronJobs | Suspended / last scheduled run not recorded as successful and its Job is gone | info |
 | Deployments | No ready replicas or rollout stuck / some replicas unavailable | critical / warning |
 | DaemonSets, StatefulSets | No ready pods / some pods not ready (with the StatefulSet's rollout revision) | critical / warning |
 | Pod creation | A ReplicaSet, StatefulSet, DaemonSet or Job cannot create pods (`FailedCreate`): quota exceeded, Pod Security, admission webhook, LimitRange, missing ServiceAccount | critical |
 | Services | Selected pods exist but none is ready (requests fail) | critical |
 | Services | Selector matches no pods; the report lists the label values pods actually have, to expose typos | warning |
 | Cluster DNS | `kube-system/kube-dns` has no ready endpoints / only some ready (checked even with `--namespace`) | critical / warning |
+
+Storage, Job and CronJob issues carry the workload of the pods involved (a CronJob's
+failed pods belong to the CronJob), so triage investigates them as one problem.
 
 **When a check cannot run, the report says so.** Managed clusters (EKS, GKE, AKS) usually
 hide etcd, and a restricted kubeconfig may not be allowed to read `/metrics`. These show
@@ -163,12 +178,12 @@ The agent can call eight tools. All are read-only and built on the guarded clien
 | --- | --- |
 | `k8s_list_nodes` | Ready status, pressure conditions, kubelet version, seconds since the last heartbeat, and requested vs allocatable CPU, memory and pods |
 | `k8s_list_pods` | Phase, ready containers, restarts and waiting reason (optional namespace and problems-only filter) |
-| `k8s_describe_pod` | Conditions, container states and last termination, image, resources, env var **names**, probes, recent events |
+| `k8s_describe_pod` | Conditions, container states and last termination, image, resources, env var **names**, probes, its PersistentVolumeClaims (phase, StorageClass problems, warning events of unbound claims), recent events |
 | `k8s_get_logs` | The last N lines of a container's logs. After a restart, it adds the previous (crashed) run, and falls back to the current run when the previous run's logs are gone |
 | `k8s_list_events` | Warning events, filtered by namespace, object name and kind |
-| `k8s_get_workload` | A Deployment, StatefulSet or DaemonSet: desired vs ready pods, rollout status, images, its pods with their nodes, and its controller's warning events (e.g. `FailedCreate`) |
+| `k8s_get_workload` | A Deployment, StatefulSet, DaemonSet, Job or CronJob: desired vs ready pods (Job status and failure reason), rollout status, images, its pods with their nodes, and its controller's warning events (e.g. `FailedCreate`). A CronJob shows its schedule, last runs, its Jobs and the newest Job's pods |
 | `k8s_get_service` | Selector, ports, ready and not-ready endpoints, the matching pods; the label values pods have when nothing matches, and a note when a `targetPort` is not a declared container port |
-| `k8s_cluster_health` | By section. `control-plane`: API server version, certificate expiry, `/readyz` checks, and control-plane pods with recent restarts and probe failures. `etcd`: health check, database size vs quota, largest object counts. `webhooks`: admission webhooks and whether their service can answer |
+| `k8s_cluster_health` | By section. `control-plane`: API server version, certificate expiry, `/readyz` checks, control-plane pods with recent restarts and probe failures, and the scheduler and controller-manager leader-election leases. `etcd`: health check, database size vs quota, largest object counts. `webhooks`: admission webhooks and whether their service can answer. `apiservices`: aggregated APIs and their availability, and namespaces stuck Terminating with their conditions |
 
 ### Design choices for a small local model
 
@@ -184,10 +199,11 @@ several failure modes, and each fix moved responsibility from the prompt into co
   that, plus the rule's hint, to the model. Before this, the model read the same numbers
   and suggested *raising* the CPU request.
 - **The first tool call is made in code.** Each investigation starts with the obvious
-  call already done: `k8s_describe_pod` for a pod, `k8s_get_workload` for a workload (or
-  for the Deployment of a ReplicaSet that cannot create pods), `k8s_get_service` for a
-  Service, `k8s_cluster_health` with the matching section for a webhook or control-plane
-  issue. The model used to skip it sometimes and
+  call already done: `k8s_describe_pod` for a pod, `k8s_get_workload` for a workload, Job
+  or CronJob (or for the Deployment of a ReplicaSet that cannot create pods),
+  `k8s_get_service` for a Service, the claim's events for a PersistentVolumeClaim, and
+  `k8s_cluster_health` with the matching section for a webhook, control-plane, APIService
+  or stuck-namespace issue. The model used to skip it sometimes and
   wander, for example into the logs of an unrelated pod.
 - **Skipped critical problems are added back.** With many issues, the model sometimes
   returned fewer problems than allowed and left out critical ones (an OOM-killed pod, an
@@ -196,11 +212,16 @@ several failure modes, and each fix moved responsibility from the prompt into co
 - **Workloads are grouped in code.** Each issue records its workload, taken from the pod's
   owner, so a Deployment, StatefulSet or DaemonSet, its failing pods, the Service in front
   of them and any `FailedCreate` errors become one problem. Pod names alone could not group
-  StatefulSet pods (`db-0`) or a Deployment whose pods were never created.
+  StatefulSet pods (`db-0`) or a Deployment whose pods were never created. The same holds
+  for a PVC and the pods that mount it, and for a CronJob and the pods of its Jobs. Code
+  also drops the model's merges across two different workloads: it once folded three
+  unrelated broken Deployments into an OOM problem, splitting them from their own pods.
 - **Control-plane incidents are grouped in code.** Failures cascade: a slow etcd makes
   the API server time out, so the scheduler and controller-manager lose leader election
-  and restart. All control-plane health issues become one problem, investigated from the
-  top of the chain (etcd, then the API server).
+  and restart. All control-plane health issues, including a stale leader-election Lease,
+  become one problem, investigated from the top of the chain (etcd, then the API server).
+  Likewise, an unavailable aggregated API and the namespaces it keeps from deleting form
+  one problem led by the APIService.
 - **Focused tool output.** `k8s_cluster_health` returns only the requested section. With
   everything in one answer, the model blamed a webhook outage on unrelated control-plane
   problems.
@@ -268,19 +289,21 @@ src/
   tools/format.ts       Compact text for pods, nodes and events in tool output
   tools/truncate.ts     Output truncation
   scan/scan.ts          Cluster overview: lists everything in parallel
-  scan/collect-cluster.ts  Control plane, etcd, node usage, webhooks and DNS collection
+  scan/collect-cluster.ts  Control plane, etcd, leader leases, node usage, webhooks, DNS,
+                        aggregated APIs and terminating namespaces
   scan/summarize.ts     Raw Kubernetes objects to compact summaries (scan/types.ts)
   scan/apiserver-parse.ts  Parsers for /readyz, /metrics and versions
   scan/detect.ts        Runs every rule over the overview
   scan/*-rules.ts       The rules: pod-, node-, workload- (Deployments, StatefulSets,
-                        DaemonSets, Services, DNS, pod creation) and cluster-rules
-                        (control plane, etcd, webhooks)
+                        DaemonSets, Services, DNS, pod creation), job- (Jobs, CronJobs),
+                        storage- (PVCs, volume mounts) and cluster-rules (control plane,
+                        etcd, leader election, webhooks, APIServices, namespaces)
   report/markdown.ts    Markdown report renderer
   report/json.ts        JSON report (schema version 1)
   report/compare.ts     Changes since a previous JSON report (--compare)
 test/                   Unit tests (fake cluster and scripted fake LLM; no Ollama needed)
 test/e2e/               End-to-end tests against the demo cluster
-demo/workloads.yaml     Five broken deployments, one healthy one, two broken Services and a broken admission webhook
+demo/workloads.yaml     Seven broken deployments, one healthy one, a failing Job, an unbound PVC, two broken Services and a broken admission webhook
 demo/kind-cluster.yaml  kind cluster definition (1 control plane + 1 worker)
 scripts/demo.sh         Demo cluster lifecycle: up, check, status, reset, down
 docs/                   Example report
@@ -534,6 +557,9 @@ Docker containers. The demo deploys these workloads:
 | `payments` | Image tag `nginx:1.99.99-doesnotexist` | ImagePullBackOff: the image does not exist |
 | `cache` | Buffers `/dev/zero` under a 32Mi limit | OOMKilled (exit code 137) |
 | `batch` | Requests 1000 CPUs | Unschedulable; no node can ever fit it |
+| `db-migrate` | Job whose migration always exits 1 (`backoffLimit: 1`) | Job failed (BackoffLimitExceeded), grouped with its failed pods; the logs name the error |
+| `reports` | Mounts PVC `reports-data`, whose StorageClass `fast-ssd` does not exist | PVC not bound (names the missing StorageClass), grouped with the unschedulable pod |
+| `invoices` | Mounts ConfigMap `invoices-config`, which does not exist | Pod stuck in ContainerCreating; `FailedMount` says the ConfigMap is missing |
 | `frontend` | Nothing; it is healthy | No issue (shows that healthy workloads are ignored) |
 | `agent-demo-policy` | Validating webhook whose Service has no pods, `failurePolicy: Fail` | Webhook unreachable and blocking. It only matches creating CronJobs in `agent-test`, so it cannot break the demo cluster itself |
 
@@ -606,10 +632,13 @@ so treat reports as containing cluster data.
   value that happens to appear elsewhere in the data is not marked.
 - **A larger model helps.** Setting `MODEL=qwen2.5:14b-instruct` (or another
   tool-calling model) should improve the fixes, at the cost of speed and VRAM.
-- **Coverage:** the rules cover the control plane and its components, etcd, nodes,
-  admission webhooks, pods, Deployments, StatefulSets, DaemonSets, Services, cluster DNS
-  and pod creation failures. Failed Jobs, PersistentVolumeClaims and aggregated
-  APIServices are not checked yet.
+- **Coverage:** the rules cover the control plane and its components (including leader
+  election), etcd, nodes, admission webhooks, aggregated APIs, stuck namespaces, pods,
+  Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, PersistentVolumeClaims and volume
+  mounts, Services, cluster DNS and pod creation failures. CronJob checks use Job status
+  and the CronJob's last schedule/success times only (no cron parsing), so a CronJob that
+  silently stopped being scheduled is not detected. Ingresses, NetworkPolicies, HPAs and
+  certificates other than the API server's are not checked.
 - **Control-plane pods must be visible.** Restart and probe checks need the static pods in
   `kube-system` (kubeadm, kind, minikube). Managed control planes hide them, and the
   report says "not visible". Probe-failure counts come from aggregated events, so they

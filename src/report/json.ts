@@ -41,6 +41,7 @@ export interface JsonFinding {
 }
 
 const ratio = (ready: number, total: number) => ({ ready, total });
+const ratioOf = (bound: number, total: number) => ({ bound, total });
 
 export interface JsonReport {
   schemaVersion: typeof JSON_SCHEMA_VERSION;
@@ -63,6 +64,15 @@ export interface JsonReport {
     apiServerCertificateExpiresAt: string | null;
     admissionWebhooks: { unreachable: number; total: number };
     recentWarningEvents: number;
+    jobs: { failed: number; total: number };
+    cronJobs: { suspended: number; total: number };
+    persistentVolumeClaims: { bound: number; total: number };
+    /** null when not visible. */
+    aggregatedApis: { unavailable: number; total: number } | null;
+    /** Names of namespaces being deleted; null when not visible. */
+    terminatingNamespaces: string[] | null;
+    /** Scheduler and controller-manager leader-election leases; null when none is visible. */
+    leaderElection: { component: string; holder: string | null; renewTime: string | null }[] | null;
   };
   issues: JsonIssue[];
   findings: JsonFinding[];
@@ -93,6 +103,7 @@ export function buildJsonReport({
   comparisonNote,
 }: ReportInput): JsonReport {
   const cp = overview.controlPlane;
+  const apis = overview.apiHealth.apiServices;
   const dns = overview.dns.service;
   const usage = [triageUsage, ...findings.map((f) => f.usage)].reduce<LlmUsage>(
     (sum, u) => (u ? addUsage(sum, u) : sum),
@@ -135,6 +146,21 @@ export function buildJsonReport({
       apiServerCertificateExpiresAt: cp.certificate?.notAfter ?? null,
       admissionWebhooks: { unreachable, total: overview.webhooks.length },
       recentWarningEvents: overview.warningEvents.length,
+      jobs: { failed: overview.jobs.filter((j) => j.failedCondition).length, total: overview.jobs.length },
+      cronJobs: { suspended: overview.cronJobs.filter((c) => c.suspended).length, total: overview.cronJobs.length },
+      persistentVolumeClaims: ratioOf(
+        overview.persistentVolumeClaims.filter((c) => c.phase === "Bound").length,
+        overview.persistentVolumeClaims.length,
+      ),
+      aggregatedApis: apis ? { unavailable: apis.filter((a) => !a.available).length, total: apis.length } : null,
+      terminatingNamespaces: overview.apiHealth.terminatingNamespaces?.map((n) => n.name) ?? null,
+      leaderElection: cp.leaderLeases
+        ? cp.leaderLeases.map((l) => ({
+            component: l.component,
+            holder: l.holder ?? null,
+            renewTime: l.renewTime ?? null,
+          }))
+        : null,
     },
     issues: issues.map((i) => ({
       ...i,
@@ -165,7 +191,11 @@ export function buildJsonReport({
       : null,
     notes: {
       scanErrors: overview.errors,
-      notChecked: [...cp.notVisible, ...(overview.dns.notVisible ? [`cluster DNS: ${overview.dns.notVisible}`] : [])],
+      notChecked: [
+        ...cp.notVisible,
+        ...overview.apiHealth.notVisible,
+        ...(overview.dns.notVisible ? [`cluster DNS: ${overview.dns.notVisible}`] : []),
+      ],
       ...(comparisonNote ? { comparison: comparisonNote } : {}),
       llm: {
         ...(ollama?.reachable && ollama.modelAvailable ? { model: ollama.model } : {}),

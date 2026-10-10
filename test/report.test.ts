@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.js";
+import { buildJsonReport } from "../src/report/json.js";
 import type { Finding } from "../src/agent/types.js";
 import { fixStepNotes, overallStatus, renderMarkdownReport } from "../src/report/markdown.js";
 import { recentEvents } from "../src/scan/scan.js";
@@ -19,6 +20,11 @@ const overview: ClusterOverview = {
   warningEvents: [{ involvedKind: "Node", involvedName: "n1", reason: "Rebooted", message: "a | b", count: 1 }],
   controlPlane: { notVisible: [] },
   webhooks: [],
+  jobs: [],
+  cronJobs: [],
+  persistentVolumeClaims: [],
+  storageEvents: [],
+  apiHealth: { notVisible: [] },
   errors: ["list nodes: forbidden (check RBAC permissions)"],
 };
 
@@ -209,5 +215,85 @@ describe("config", () => {
 
   it("rejects invalid values with a readable error", () => {
     expect(() => loadConfig({ MAX_STEPS_PER_PROBLEM: "abc" })).toThrow(/MAX_STEPS_PER_PROBLEM/);
+  });
+});
+
+describe("report: jobs, storage, aggregated APIs and leader election", () => {
+  const extended: ClusterOverview = {
+    ...overview,
+    jobs: [
+      {
+        namespace: "ops",
+        name: "a",
+        active: 0,
+        succeeded: 0,
+        failed: 3,
+        complete: false,
+        failedCondition: { reason: "BackoffLimitExceeded" },
+      },
+      { namespace: "ops", name: "b", active: 0, succeeded: 1, failed: 0, complete: true },
+    ],
+    cronJobs: [{ namespace: "ops", name: "c", schedule: "@daily", suspended: true, active: 0 }],
+    persistentVolumeClaims: [
+      { namespace: "ops", name: "data", phase: "Pending" },
+      { namespace: "ops", name: "logs", phase: "Bound" },
+    ],
+    controlPlane: {
+      notVisible: ["kube-scheduler leader election: no Lease kube-system/kube-scheduler"],
+      leaderLeases: [
+        {
+          component: "kube-controller-manager",
+          holder: "cp",
+          renewTime: "2026-01-01T11:59:55.000Z",
+          leaseDurationSeconds: 15,
+        },
+      ],
+    },
+    apiHealth: {
+      apiServices: [
+        {
+          name: "v1beta1.metrics.k8s.io",
+          service: { namespace: "kube-system", name: "metrics-server" },
+          available: false,
+        },
+      ],
+      terminatingNamespaces: [{ name: "old-app", conditions: [], finalizers: [] }],
+      notVisible: [],
+    },
+  };
+
+  it("adds summary rows and says what is not visible", () => {
+    const md = renderMarkdownReport({ overview: extended, issues: [] });
+    expect(md).toContain("| Jobs failed | 1 of 2 (CronJobs: 1, 1 suspended) |");
+    expect(md).toContain("| PersistentVolumeClaims bound | 1/2 |");
+    expect(md).toContain("| Leader election | kube-controller-manager renewed 5s ago; not visible: kube-scheduler |");
+    expect(md).toContain("| Aggregated APIs | 1, 1 unavailable |");
+    expect(md).toContain("| Namespaces terminating | old-app |");
+    expect(md).toContain("- Not checked: kube-scheduler leader election: no Lease kube-system/kube-scheduler");
+
+    const hidden = renderMarkdownReport({
+      overview: { ...overview, apiHealth: { notVisible: ["aggregated APIs (APIServices): forbidden"] } },
+      issues: [],
+    });
+    expect(hidden).toContain("| Leader election | not visible |");
+    expect(hidden).toContain("| Aggregated APIs | not visible |");
+    expect(hidden).toContain("| Namespaces terminating | not visible |");
+    expect(hidden).toContain("- Not checked: aggregated APIs (APIServices): forbidden");
+  });
+
+  it("adds the new summary fields to the JSON report without changing the schema version", () => {
+    const json = buildJsonReport({ overview: extended, issues: [] });
+    expect(json.schemaVersion).toBe(1);
+    expect(json.summary.jobs).toEqual({ failed: 1, total: 2 });
+    expect(json.summary.cronJobs).toEqual({ suspended: 1, total: 1 });
+    expect(json.summary.persistentVolumeClaims).toEqual({ bound: 1, total: 2 });
+    expect(json.summary.aggregatedApis).toEqual({ unavailable: 1, total: 1 });
+    expect(json.summary.terminatingNamespaces).toEqual(["old-app"]);
+    expect(json.summary.leaderElection).toEqual([
+      { component: "kube-controller-manager", holder: "cp", renewTime: "2026-01-01T11:59:55.000Z" },
+    ]);
+    const hidden = buildJsonReport({ overview, issues: [] });
+    expect(hidden.summary.aggregatedApis).toBeNull();
+    expect(hidden.summary.leaderElection).toBeNull();
   });
 });

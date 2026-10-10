@@ -22,6 +22,11 @@ const overview: ClusterOverview = {
   warningEvents: [],
   controlPlane: { notVisible: ["etcd size: forbidden"] },
   webhooks: [],
+  jobs: [],
+  cronJobs: [],
+  persistentVolumeClaims: [],
+  storageEvents: [],
+  apiHealth: { notVisible: [] },
   errors: [],
 };
 

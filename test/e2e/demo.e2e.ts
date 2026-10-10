@@ -46,8 +46,10 @@ describe("demo cluster scan", () => {
       "batch",
       "cache",
       "frontend",
+      "invoices",
       "metrics-agent",
       "payments",
+      "reports",
       "web",
     ]);
   });
@@ -79,7 +81,7 @@ describe("demo cluster scan", () => {
       .filter((i) => i.resource.kind === "Deployment" && i.category === "replicas-unavailable")
       .map((i) => i.resource.name)
       .sort();
-    expect(unavailable).toEqual(["batch", "cache", "metrics-agent", "payments", "web"]);
+    expect(unavailable).toEqual(["batch", "cache", "invoices", "metrics-agent", "payments", "reports", "web"]);
   });
 
   it("explains that metrics-agent's pods are rejected by Pod Security", () => {
@@ -100,6 +102,33 @@ describe("demo cluster scan", () => {
     const svc = issues.find((i) => i.id === `service/${NAMESPACE}/storefront:no-pods`);
     expect(svc?.severity).toBe("warning");
     expect(svc?.evidence[1]).toContain("frontend");
+  });
+
+  it("flags the failed db-migrate Job and groups its failed pods with it", () => {
+    const job = issues.find((i) => i.id === `job/${NAMESPACE}/db-migrate:failed`);
+    expect(job?.severity).toBe("warning");
+    expect(job?.title).toContain("BackoffLimitExceeded");
+    expect(job?.workload).toBe(`${NAMESPACE}/db-migrate`);
+    const pods = podIssuesOf("db-migrate");
+    expect(pods.length).toBeGreaterThan(0);
+    expect(pods.every((i) => i.workload === `${NAMESPACE}/db-migrate`)).toBe(true);
+  });
+
+  it("flags the unbound PVC, names the missing StorageClass and ties it to the reports Deployment", () => {
+    const pvc = issues.find((i) => i.id === `pvc/${NAMESPACE}/reports-data:pending`);
+    expect(pvc?.severity).toBe("critical");
+    expect(pvc?.evidence.join("\n")).toContain('StorageClass "fast-ssd" does not exist');
+    expect(pvc?.workload).toBe(`${NAMESPACE}/reports`);
+    expect(podIssuesOf("reports").map((i) => i.category)).toEqual(["unschedulable"]);
+    expect(overview.persistentVolumeClaims.find((c) => c.name === "reports-data")?.phase).toBe("Pending");
+  });
+
+  it("explains the invoices pod stuck in ContainerCreating with its FailedMount event", () => {
+    const [issue, ...rest] = podIssuesOf("invoices");
+    expect(rest).toEqual([]);
+    expect(issue?.category).toBe("volume-mount-failed");
+    expect(issue?.evidence[0]).toContain('configmap "invoices-config" not found');
+    expect(issue?.workload).toBe(`${NAMESPACE}/invoices`);
   });
 
   it("does not flag the webhook's Service twice (the webhook rule covers it)", () => {
@@ -142,6 +171,21 @@ describe("demo cluster: cluster-level checks", () => {
     expect(overview.dns.service?.name).toBe("kube-dns");
     expect(overview.dns.service?.readyEndpoints).toBeGreaterThan(0);
     expect(issues.filter((i) => i.category.startsWith("dns-"))).toEqual([]);
+  });
+
+  it("reads both leader-election leases and finds them fresh", () => {
+    const leases = overview.controlPlane.leaderLeases ?? [];
+    expect(leases.map((l) => l.component)).toEqual(["kube-controller-manager", "kube-scheduler"]);
+    expect(leases.every((l) => l.holder !== undefined && l.renewTime !== undefined)).toBe(true);
+    expect(issues.filter((i) => i.category === "leader-election-stale")).toEqual([]);
+  });
+
+  it("checks aggregated APIs and terminating namespaces even with --namespace", () => {
+    // kind has no aggregated APIs (no metrics-server), only local APIServices, which are skipped.
+    expect(overview.apiHealth.notVisible).toEqual([]);
+    expect(overview.apiHealth.apiServices).toEqual([]);
+    expect(overview.apiHealth.terminatingNamespaces).toEqual([]);
+    expect(issues.filter((i) => i.resource.kind === "APIService" || i.resource.kind === "Namespace")).toEqual([]);
   });
 
   it("flags the demo webhook whose service has no endpoints as critical", () => {

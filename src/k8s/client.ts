@@ -1,10 +1,13 @@
 import {
   AdmissionregistrationV1Api,
+  ApiregistrationV1Api,
   AppsV1Api,
+  BatchV1Api,
   CoordinationV1Api,
   CoreV1Api,
   DiscoveryV1Api,
   KubeConfig,
+  StorageV1Api,
 } from "@kubernetes/client-node";
 import { delimiter } from "node:path";
 import { createRawReader, type RawReader } from "./raw.js";
@@ -62,6 +65,10 @@ export interface K8sClients {
   admission: ReadOnlyApi<AdmissionregistrationV1Api>;
   discovery: ReadOnlyApi<DiscoveryV1Api>;
   coordination: ReadOnlyApi<CoordinationV1Api>;
+  batch: ReadOnlyApi<BatchV1Api>;
+  storage: ReadOnlyApi<StorageV1Api>;
+  /** APIServices (aggregated APIs such as metrics-server). */
+  apiregistration: ReadOnlyApi<ApiregistrationV1Api>;
   /** GET-only access to /readyz, /livez, /version and /metrics (see raw.ts). */
   raw: RawReader;
 }
@@ -103,6 +110,9 @@ export function createK8sClients(kubeconfigPath?: string, context?: string): K8s
     admission: readOnly(kc.makeApiClient(AdmissionregistrationV1Api), "AdmissionregistrationV1Api"),
     discovery: readOnly(kc.makeApiClient(DiscoveryV1Api), "DiscoveryV1Api"),
     coordination: readOnly(kc.makeApiClient(CoordinationV1Api), "CoordinationV1Api"),
+    batch: readOnly(kc.makeApiClient(BatchV1Api), "BatchV1Api"),
+    storage: readOnly(kc.makeApiClient(StorageV1Api), "StorageV1Api"),
+    apiregistration: readOnly(kc.makeApiClient(ApiregistrationV1Api), "ApiregistrationV1Api"),
     raw: createRawReader(kc),
   };
 }

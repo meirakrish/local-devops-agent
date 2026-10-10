@@ -1,13 +1,16 @@
 import type { K8sClients } from "../k8s/client.js";
 import { k8sErrorMessage } from "../k8s/errors.js";
-import { addNodeUsage, collectControlPlane, collectDns, collectWebhooks } from "./collect-cluster.js";
+import { addNodeUsage, collectApiHealth, collectControlPlane, collectDns, collectWebhooks } from "./collect-cluster.js";
 import {
   byNewest,
+  summarizeCronJob,
   summarizeDaemonSet,
   summarizeDeployment,
   summarizeEvent,
+  summarizeJob,
   summarizeNode,
   summarizePod,
+  summarizePvc,
   summarizeService,
   summarizeStatefulSet,
 } from "./summarize.js";
@@ -35,6 +38,14 @@ const POD_CONTROLLERS = new Set(["ReplicaSet", "StatefulSet", "DaemonSet", "Job"
 export function podCreateFailures(events: EventSummary[], now: Date, windowMinutes: number): EventSummary[] {
   const failed = events.filter((e) => e.reason === "FailedCreate" && POD_CONTROLLERS.has(e.involvedKind ?? ""));
   return recentEvents(failed, now, windowMinutes, Number.POSITIVE_INFINITY);
+}
+
+/** Warning events that explain a volume that cannot be provisioned, attached or mounted. */
+export const STORAGE_EVENT_REASONS = new Set(["FailedMount", "FailedAttachVolume", "ProvisioningFailed"]);
+
+export function storageEvents(events: EventSummary[], now: Date, windowMinutes: number): EventSummary[] {
+  const storage = events.filter((e) => STORAGE_EVENT_REASONS.has(e.reason ?? ""));
+  return recentEvents(storage, now, windowMinutes, Number.POSITIVE_INFINITY);
 }
 
 /**
@@ -71,6 +82,11 @@ export async function scanCluster(k8s: K8sClients, opts: ScanOptions): Promise<C
     services,
     endpointSlices,
     dns,
+    jobs,
+    cronJobs,
+    pvcs,
+    storageClasses,
+    apiHealth,
   ] = await Promise.allSettled([
     k8s.core.listNode(),
     ns ? Promise.resolve({ items: [{ metadata: { name: ns } }] }) : k8s.core.listNamespace(),
@@ -89,6 +105,14 @@ export async function scanCluster(k8s: K8sClients, opts: ScanOptions): Promise<C
       : k8s.discovery.listEndpointSliceForAllNamespaces(),
     // Cluster DNS is cluster-level, so it is checked regardless of --namespace.
     collectDns(k8s),
+    ns ? k8s.batch.listNamespacedJob({ namespace: ns }) : k8s.batch.listJobForAllNamespaces(),
+    ns ? k8s.batch.listNamespacedCronJob({ namespace: ns }) : k8s.batch.listCronJobForAllNamespaces(),
+    ns
+      ? k8s.core.listNamespacedPersistentVolumeClaim({ namespace: ns })
+      : k8s.core.listPersistentVolumeClaimForAllNamespaces(),
+    k8s.storage.listStorageClass(),
+    // Aggregated APIs and stuck namespaces are cluster-level too.
+    collectApiHealth(k8s),
   ]);
 
   function items<T>(label: string, result: PromiseSettledResult<{ items: T[] }>): T[] {
@@ -122,6 +146,8 @@ export async function scanCluster(k8s: K8sClients, opts: ScanOptions): Promise<C
           .filter((s): s is ServiceSummary => s !== undefined)
       : [];
   const allEvents = items("events", events).map(summarizeEvent);
+  // Without StorageClasses, PVCs are still checked, but not whether their class exists.
+  const classes = items("storage classes", storageClasses);
 
   return {
     context: k8s.context,
@@ -147,6 +173,16 @@ export async function scanCluster(k8s: K8sClients, opts: ScanOptions): Promise<C
         ? controlPlane.value
         : { notVisible: [`control plane: ${k8sErrorMessage(controlPlane.reason)}`] },
     webhooks: webhooks.status === "fulfilled" ? webhooks.value : [],
+    jobs: items("jobs", jobs).map(summarizeJob),
+    cronJobs: items("cronjobs", cronJobs).map(summarizeCronJob),
+    persistentVolumeClaims: items("persistentvolumeclaims", pvcs).map((p) =>
+      summarizePvc(p, storageClasses.status === "fulfilled" ? classes : undefined),
+    ),
+    storageEvents: storageEvents(allEvents, now, opts.eventWindowMinutes),
+    apiHealth:
+      apiHealth.status === "fulfilled"
+        ? apiHealth.value
+        : { notVisible: [`aggregated APIs and namespaces: ${k8sErrorMessage(apiHealth.reason)}`] },
     errors,
   };
 }

@@ -15,6 +15,7 @@ Rules:
   because pods have logs and events.
 - Several pods of the same Deployment failing the same way are ONE problem.
 - A Service without ready endpoints and the failing pods it selects are ONE problem; use the pod issue as primary.
+- An unavailable APIService and namespaces stuck Terminating because of API discovery are ONE problem; use the APIService as primary.
 - Prefer critical issues, then warnings. Skip info issues unless nothing else is wrong.
 - Use only issue ids from the list, exactly as written.`;
 
@@ -39,7 +40,14 @@ const CONTROL_PLANE_CATEGORIES = new Set([
   "controlplane-pod-down",
   "controlplane-restart",
   "controlplane-probe-failures",
+  "leader-election-stale",
 ]);
+
+/**
+ * An unavailable aggregated API (APIService) blocks API discovery, which stops namespace
+ * deletion, so namespaces stuck on discovery form one problem with the broken APIServices.
+ */
+const AGGREGATED_API_CATEGORIES = new Set(["apiservice-unavailable", "namespace-terminating-api"]);
 
 /**
  * Lower is a better starting point. Within a control-plane incident, follow the
@@ -55,6 +63,8 @@ function primaryRank(i: Issue): number {
     if (name === "kube-apiserver" || name.startsWith("kube-apiserver-")) return 2 + notPod;
     return 4 + notPod;
   }
+  // The APIService is the cause; the stuck namespaces are the symptom.
+  if (i.category === "apiservice-unavailable") return 6;
   return 10 + notPod;
 }
 
@@ -73,6 +83,7 @@ function makeProblem(chosen: Issue, others: Issue[], reason: string): Problem {
  */
 export function groupKey(i: Issue): string {
   if (CONTROL_PLANE_CATEGORIES.has(i.category)) return "control-plane";
+  if (AGGREGATED_API_CATEGORIES.has(i.category)) return "aggregated-api";
   if (i.workload) return i.workload;
   return `${i.resource.kind}/${i.resource.namespace ?? ""}/${i.resource.name}`;
 }
@@ -120,9 +131,14 @@ export function buildProblems(
     const primary = byId.get(pick.issueId);
     if (!primary || used.has(primary.id)) continue;
     used.add(primary.id);
+    // Issues of two different workloads do not share a root cause the model can see; in
+    // testing it merged unrelated broken Deployments into an OOM problem, which split them
+    // from their own pods and storage issues. Those stay available for their own problem.
+    const otherWorkload = (i: Issue) =>
+      i.workload !== undefined && primary.workload !== undefined && i.workload !== primary.workload;
     const related = (pick.relatedIssueIds ?? [])
       .map((id) => byId.get(id))
-      .filter((i): i is Issue => i !== undefined && !used.has(i.id) && i !== primary);
+      .filter((i): i is Issue => i !== undefined && !used.has(i.id) && i !== primary && !otherWorkload(i));
     // Also absorb issues of the same workload, in case the model did not merge them.
     for (const i of issues) {
       if (!used.has(i.id) && i !== primary && !related.includes(i) && groupKey(i) === groupKey(primary)) {

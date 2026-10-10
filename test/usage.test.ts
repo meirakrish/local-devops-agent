@@ -18,6 +18,11 @@ const overview: ClusterOverview = {
   warningEvents: [],
   controlPlane: { notVisible: [] },
   webhooks: [],
+  jobs: [],
+  cronJobs: [],
+  persistentVolumeClaims: [],
+  storageEvents: [],
+  apiHealth: { notVisible: [] },
   errors: [],
 };
 

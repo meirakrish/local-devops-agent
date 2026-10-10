@@ -102,7 +102,7 @@ wait_for_failures() {
   info "Waiting for the workloads to reach their broken state (up to ${WAIT_SECONDS}s)"
   local deadline=$((SECONDS + WAIT_SECONDS))
   declare -A reached=()
-  local names=(web payments cache batch metrics-agent frontend storefront webhook)
+  local names=(web payments cache batch metrics-agent frontend storefront webhook db-migrate reports invoices)
   declare -A labels=(
     [web]="web: CrashLoopBackOff (missing DATABASE_URL)"
     [payments]="payments: ImagePullBackOff (image tag does not exist)"
@@ -112,6 +112,9 @@ wait_for_failures() {
     [frontend]="frontend: healthy (2/2 ready)"
     [storefront]="storefront: Service selector matches no pods (typo)"
     [webhook]="agent-demo-policy: webhook with no ready endpoints (failurePolicy=Fail)"
+    [db-migrate]="db-migrate: Job failed (BackoffLimitExceeded)"
+    [reports]="reports: PersistentVolumeClaim Pending (StorageClass fast-ssd does not exist)"
+    [invoices]="invoices: stuck in ContainerCreating (FailedMount: missing ConfigMap)"
   )
 
   while ((SECONDS < deadline)); do
@@ -128,6 +131,10 @@ wait_for_failures() {
         frontend) [[ "$(kubectl get deployment frontend -n "$NAMESPACE" -o 'jsonpath={.status.readyReplicas}' 2>/dev/null)" == "2" ]] && hit=1 ;;
         webhook) kubectl get validatingwebhookconfiguration agent-demo-policy >/dev/null 2>&1 &&
           kubectl get service policy-webhook -n "$NAMESPACE" >/dev/null 2>&1 && hit=1 ;;
+        db-migrate) [[ "$(kubectl get job db-migrate -n "$NAMESPACE" -o 'jsonpath={.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null)" == "True" ]] && hit=1 ;;
+        reports) [[ "$(kubectl get pvc reports-data -n "$NAMESPACE" -o 'jsonpath={.status.phase}' 2>/dev/null)" == "Pending" ]] &&
+          [[ "$(pods_of reports '{.items[*].status.conditions[?(@.type=="PodScheduled")].reason}')" =~ Unschedulable ]] && hit=1 ;;
+        invoices) [[ "$(kubectl get events -n "$NAMESPACE" --field-selector reason=FailedMount -o 'jsonpath={.items[*].involvedObject.name}' 2>/dev/null)" =~ invoices- ]] && hit=1 ;;
       esac
       if [[ -n "$hit" ]]; then
         reached[$name]=1

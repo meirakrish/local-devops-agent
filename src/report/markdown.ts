@@ -71,6 +71,18 @@ function controlPlaneRows(overview: ClusterOverview, issues: Issue[], now: Date)
   } else {
     rows.push("| etcd database | not visible |");
   }
+  if (cp.leaderLeases) {
+    const leases = cp.leaderLeases.map((l) => {
+      const age = l.renewTime ? Math.round((now.getTime() - Date.parse(l.renewTime)) / 1000) : undefined;
+      return `${l.component} renewed ${age !== undefined ? `${age}s ago` : "never"}`;
+    });
+    const missing = cp.notVisible.filter((n) => n.includes("leader election")).map((n) => n.split(" ")[0]);
+    rows.push(
+      `| Leader election | ${leases.join(", ")}${missing.length > 0 ? `; not visible: ${missing.join(", ")}` : ""} |`,
+    );
+  } else {
+    rows.push("| Leader election | not visible |");
+  }
   if (cp.certificate) {
     const days = Math.floor((Date.parse(cp.certificate.notAfter) - now.getTime()) / 86_400_000);
     rows.push(
@@ -82,6 +94,16 @@ function controlPlaneRows(overview: ClusterOverview, issues: Issue[], now: Date)
   );
   rows.push(
     `| Admission webhooks | ${overview.webhooks.length}${unreachable.length > 0 ? `, ${unreachable.length} unreachable` : ""} |`,
+  );
+  const apis = overview.apiHealth.apiServices;
+  rows.push(
+    apis
+      ? `| Aggregated APIs | ${apis.length}${apis.some((a) => !a.available) ? `, ${apis.filter((a) => !a.available).length} unavailable` : ""} |`
+      : "| Aggregated APIs | not visible |",
+  );
+  const terminating = overview.apiHealth.terminatingNamespaces;
+  rows.push(
+    `| Namespaces terminating | ${terminating ? terminating.map((n) => n.name).join(", ") || "none" : "not visible"} |`,
   );
   return rows;
 }
@@ -241,6 +263,8 @@ export function renderMarkdownReport({
     `| Deployments fully ready | ${healthyDeployments}/${overview.deployments.length} |`,
     `| DaemonSets and StatefulSets fully ready | ${healthyWorkloads}/${overview.workloads.length} |`,
     `| Services without ready endpoints | ${servicesDown} of ${overview.services.length} |`,
+    `| Jobs failed | ${overview.jobs.filter((j) => j.failedCondition).length} of ${overview.jobs.length} (CronJobs: ${overview.cronJobs.length}${overview.cronJobs.some((c) => c.suspended) ? `, ${overview.cronJobs.filter((c) => c.suspended).length} suspended` : ""}) |`,
+    `| PersistentVolumeClaims bound | ${overview.persistentVolumeClaims.filter((c) => c.phase === "Bound").length}/${overview.persistentVolumeClaims.length} |`,
     `| Cluster DNS | ${dns ? `${dns.readyEndpoints}/${dns.readyEndpoints + dns.notReadyEndpoints} endpoints ready` : "not visible"} |`,
     `| Warning events (recent) | ${overview.warningEvents.length} |`,
     ...controlPlaneRows(overview, issues, new Date(overview.scannedAt)),
@@ -298,6 +322,7 @@ export function renderMarkdownReport({
   out.push("## Scan notes", "");
   for (const err of overview.errors) out.push(`- Scan error: ${err}`);
   for (const note of overview.controlPlane.notVisible) out.push(`- Not checked: ${note}`);
+  for (const note of overview.apiHealth.notVisible) out.push(`- Not checked: ${note}`);
   if (overview.dns.notVisible) out.push(`- Not checked: cluster DNS: ${overview.dns.notVisible}`);
   if (ollama) {
     if (!ollama.reachable) out.push(`- LLM: ${ollama.error}`);

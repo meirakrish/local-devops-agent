@@ -289,3 +289,186 @@ describe("service and workload tools", () => {
     expect(eventQueries).toEqual([{ namespace: "ops", fieldSelector: "type=Warning" }]);
   });
 });
+
+describe("job, storage and API health tools", () => {
+  const ts = (iso: string) => new Date(iso);
+
+  it("get_workload shows a CronJob with its Jobs, the newest Job's pods and Job events", async () => {
+    const owner = [{ apiVersion: "batch/v1", kind: "CronJob", name: "report", uid: "1", controller: true }];
+    const podQueries: unknown[] = [];
+    const batch = {
+      readNamespacedCronJob: async () => ({
+        metadata: { name: "report", namespace: "ops" },
+        spec: {
+          schedule: "*/5 * * * *",
+          jobTemplate: { spec: { template: { spec: { containers: [{ name: "main", image: "busybox:1.36" }] } } } },
+        },
+        status: { lastScheduleTime: ts("2026-01-01T11:55:00Z"), lastSuccessfulTime: ts("2026-01-01T10:00:00Z") },
+      }),
+      listNamespacedJob: async () => ({
+        items: [
+          {
+            metadata: {
+              name: "report-1",
+              namespace: "ops",
+              ownerReferences: owner,
+              creationTimestamp: ts("2026-01-01T11:00:00Z"),
+            },
+            spec: { selector: { matchLabels: { "job-name": "report-1" } }, template: {} },
+            status: { succeeded: 1, conditions: [{ type: "Complete", status: "True" }] },
+          },
+          {
+            metadata: {
+              name: "report-2",
+              namespace: "ops",
+              ownerReferences: owner,
+              creationTimestamp: ts("2026-01-01T11:55:00Z"),
+            },
+            spec: { selector: { matchLabels: { "job-name": "report-2" } }, template: {} },
+            status: {
+              failed: 3,
+              conditions: [
+                { type: "Failed", status: "True", reason: "BackoffLimitExceeded", message: "backoff limit" },
+              ],
+            },
+          },
+          { metadata: { name: "unrelated", namespace: "ops" }, spec: { template: {} }, status: {} },
+        ],
+      }),
+    };
+    const core = {
+      listNamespacedPod: async (args: unknown) => {
+        podQueries.push(args);
+        return { items: [] };
+      },
+      listNamespacedEvent: async () => ({
+        items: [
+          {
+            metadata: {},
+            involvedObject: { kind: "Job", name: "report-2", namespace: "ops" },
+            reason: "BackoffLimitExceeded",
+            message: "Job has reached the specified backoff limit",
+            count: 1,
+          },
+        ],
+      }),
+    };
+    const k8s = { context: "test", core, batch, apps: {} } as unknown as K8sClients;
+    const out = String(
+      await getTool(k8s, "k8s_get_workload").invoke({ kind: "CronJob", namespace: "ops", name: "report" }),
+    );
+    expect(out).toContain('Schedule: "*/5 * * * *"');
+    expect(out).toContain("Last successful: 2026-01-01T10:00:00.000Z");
+    expect(out).toMatch(/- report-2: FAILED \(BackoffLimitExceeded: backoff limit\) active=0 succeeded=0 failed=3/);
+    expect(out.indexOf("report-2:")).toBeLessThan(out.indexOf("report-1:"));
+    expect(out).not.toContain("unrelated");
+    expect(out).toContain("Newest Job: report-2");
+    expect(out).toContain("Job/report-2 BackoffLimitExceeded");
+    expect(podQueries).toEqual([{ namespace: "ops", labelSelector: "job-name=report-2" }]);
+  });
+
+  it("describe_pod shows a pending PVC with its missing StorageClass and events", async () => {
+    const pod: V1Pod = {
+      metadata: { name: "db-0", namespace: "shop" },
+      spec: {
+        containers: [{ name: "db" }],
+        volumes: [{ name: "data", persistentVolumeClaim: { claimName: "data" } }],
+      },
+      status: { phase: "Pending" },
+    };
+    const core = {
+      readNamespacedPod: async () => pod,
+      readNamespacedPersistentVolumeClaim: async () => ({
+        metadata: { name: "data", namespace: "shop" },
+        spec: { storageClassName: "nope", resources: { requests: { storage: "1Gi" } } },
+        status: { phase: "Pending" },
+      }),
+      listNamespacedEvent: async ({ fieldSelector }: { fieldSelector: string }) => ({
+        items: fieldSelector.includes("PersistentVolumeClaim")
+          ? [
+              {
+                metadata: {},
+                involvedObject: { kind: "PersistentVolumeClaim", name: "data", namespace: "shop" },
+                reason: "ProvisioningFailed",
+                message: 'storageclass.storage.k8s.io "nope" not found',
+                count: 7,
+              },
+            ]
+          : [],
+      }),
+    };
+    const storage = {
+      listStorageClass: async () => ({ items: [{ metadata: { name: "standard" }, provisioner: "x" }] }),
+    };
+    const k8s = { context: "test", core, storage, apps: {} } as unknown as K8sClients;
+    const out = String(await getTool(k8s, "k8s_describe_pod").invoke({ namespace: "shop", name: "db-0" }));
+    expect(out).toContain("PersistentVolumeClaims:\n- data: Pending storageClass=nope size=1Gi");
+    expect(out).toContain('problem: StorageClass "nope" does not exist (existing: standard)');
+    expect(out).toContain(
+      'PersistentVolumeClaim/data ProvisioningFailed (x7): storageclass.storage.k8s.io "nope" not found',
+    );
+  });
+
+  it("cluster_health shows aggregated APIs, stuck namespaces and leader leases", async () => {
+    const recent = new Date(Date.now() - 3000);
+    const k8s = {
+      context: "test",
+      raw: { get: async () => ({ status: 403, body: "" }) },
+      core: {
+        listNamespacedPod: async () => ({ items: [] }),
+        listNamespacedEvent: async () => ({ items: [] }),
+        listNamespace: async () => ({
+          items: [
+            {
+              metadata: { name: "old-app", deletionTimestamp: ts("2026-01-01T11:00:00Z") },
+              status: {
+                phase: "Terminating",
+                conditions: [
+                  {
+                    type: "NamespaceDeletionDiscoveryFailure",
+                    status: "True",
+                    reason: "DiscoveryFailed",
+                    message: "metrics.k8s.io/v1beta1: stale",
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+      },
+      coordination: {
+        readNamespacedLease: async ({ name }: { name: string }) => ({
+          spec: { holderIdentity: `${name}-cp`, renewTime: recent, leaseDurationSeconds: 15 },
+        }),
+      },
+      apiregistration: {
+        listAPIService: async () => ({
+          items: [
+            { metadata: { name: "v1.apps" }, spec: {} },
+            {
+              metadata: { name: "v1beta1.metrics.k8s.io" },
+              spec: { service: { namespace: "kube-system", name: "metrics-server" } },
+              status: {
+                conditions: [
+                  { type: "Available", status: "False", reason: "MissingEndpoints", message: "no addresses" },
+                ],
+              },
+            },
+          ],
+        }),
+      },
+    } as unknown as K8sClients;
+    const health = getTool(k8s, "k8s_cluster_health");
+    const apis = String(await health.invoke({ section: "apiservices" }));
+    expect(apis).toContain("Aggregated APIs (APIServices backed by a Service): 1, 1 unavailable");
+    expect(apis).toContain(
+      "- v1beta1.metrics.k8s.io (metrics.k8s.io/v1beta1) service=kube-system/metrics-server UNAVAILABLE (MissingEndpoints): no addresses",
+    );
+    expect(apis).toContain("- old-app deleting since 2026-01-01T11:00:00.000Z");
+    expect(apis).toContain("NamespaceDeletionDiscoveryFailure (DiscoveryFailed): metrics.k8s.io/v1beta1: stale");
+    expect(apis).not.toContain("Leader election");
+    const cp = String(await health.invoke({ section: "control-plane" }));
+    expect(cp).toMatch(/- kube-scheduler: holder=kube-scheduler-cp renewed \ds ago \(leaseDurationSeconds=15\)/);
+    expect(cp).not.toContain("Aggregated APIs");
+  });
+});

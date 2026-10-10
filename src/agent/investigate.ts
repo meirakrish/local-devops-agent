@@ -15,7 +15,7 @@ Use the tools to gather evidence, then stop calling tools once you know the root
 Guidelines:
 - Tools are read-only. You can never change the cluster; only suggest fixes.
 - For a failing pod, start with k8s_describe_pod, then k8s_get_logs.
-- For a Deployment, StatefulSet or DaemonSet, k8s_get_workload shows its pods and controller events.
+- For a Deployment, StatefulSet, DaemonSet, Job or CronJob, k8s_get_workload shows its pods and controller events.
 - Copy namespace and name exactly from "tool arguments" or from tool results. Never put
   "namespace/name" in one field, and never guess names.
 - Do not repeat a tool call with the same arguments.
@@ -129,7 +129,10 @@ export function dropNullArgs(args: Record<string, unknown>): Record<string, unkn
 export function seedCall(issue: Issue): { name: string; args: Record<string, unknown> } | undefined {
   const { kind, namespace, name } = issue.resource;
   if (kind === "Pod" && namespace) return { name: "k8s_describe_pod", args: { namespace, name } };
-  if ((kind === "Deployment" || kind === "StatefulSet" || kind === "DaemonSet") && namespace) {
+  if (
+    (kind === "Deployment" || kind === "StatefulSet" || kind === "DaemonSet" || kind === "Job" || kind === "CronJob") &&
+    namespace
+  ) {
     return { name: "k8s_get_workload", args: { kind, namespace, name } };
   }
   // A ReplicaSet's FailedCreate events show up in its Deployment's controller events.
@@ -137,12 +140,18 @@ export function seedCall(issue: Issue): { name: string; args: Record<string, unk
     return { name: "k8s_get_workload", args: { kind: "Deployment", namespace, name: issue.workload.split("/")[1] } };
   }
   if (kind === "Service" && namespace) return { name: "k8s_get_service", args: { namespace, name } };
+  if (kind === "PersistentVolumeClaim" && namespace) {
+    return { name: "k8s_list_events", args: { namespace, objectName: name, objectKind: kind } };
+  }
   if (namespace && issue.category === "pod-create-failed") {
     return { name: "k8s_list_events", args: { namespace, objectName: name, objectKind: kind } };
   }
   if (kind === "Node") return { name: "k8s_list_nodes", args: {} };
   // Name the health section, so a small model gets only the relevant part of the output.
   if (kind.endsWith("WebhookConfiguration")) return { name: "k8s_cluster_health", args: { section: "webhooks" } };
+  if (kind === "APIService" || kind === "Namespace") {
+    return { name: "k8s_cluster_health", args: { section: "apiservices" } };
+  }
   if (kind === "ControlPlane") {
     return { name: "k8s_cluster_health", args: { section: name === "etcd" ? "etcd" : "control-plane" } };
   }

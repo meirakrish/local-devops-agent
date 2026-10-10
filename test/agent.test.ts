@@ -50,6 +50,11 @@ const overview: ClusterOverview = {
   warningEvents: [],
   controlPlane: { notVisible: [] },
   webhooks: [],
+  jobs: [],
+  cronJobs: [],
+  persistentVolumeClaims: [],
+  storageEvents: [],
+  apiHealth: { notVisible: [] },
   errors: [],
 };
 
@@ -104,6 +109,14 @@ describe("triage", () => {
     expect(problems.map((p) => p.primary.id)).toEqual([webPod1.id, payPod.id]);
     expect(problems[0]?.related.map((i) => i.id).sort()).toEqual([webDeploy.id, webPod2.id].sort());
     expect(problems[1]?.related).toEqual([]);
+  });
+
+  it("buildProblems keeps another workload's issues out of a problem, so they can form their own", () => {
+    const problems = buildProblems([{ issueId: payPod.id, relatedIssueIds: [webDeploy.id, cordoned.id] }], ALL, 5);
+    // The node issue has no workload, so the model's merge is kept; the web Deployment is not.
+    expect(problems[0]?.related.map((i) => i.id)).toEqual([cordoned.id]);
+    const completed = addMissedCritical(problems, ALL, 5);
+    expect(completed.map((p) => p.primary.id)).toContain(webPod1.id);
   });
 
   it("makes the pod the primary issue even when the LLM picks the deployment", async () => {
@@ -429,7 +442,7 @@ describe("investigate loop", () => {
     });
   });
 
-  it("seeds a ReplicaSet's FailedCreate with its Deployment, and a Job's with its events", () => {
+  it("seeds a ReplicaSet's FailedCreate with its Deployment, and a Job's with the Job (its events included)", () => {
     const rs = {
       ...issue("replicaset/shop/web-7db8d69f68:create-failed", "ReplicaSet", "web-7db8d69f68"),
       category: "pod-create-failed",
@@ -445,9 +458,41 @@ describe("investigate loop", () => {
       workload: "shop/backup",
     };
     expect(seedCall(job)).toEqual({
-      name: "k8s_list_events",
-      args: { namespace: "shop", objectName: "backup", objectKind: "Job" },
+      name: "k8s_get_workload",
+      args: { kind: "Job", namespace: "shop", name: "backup" },
     });
+  });
+
+  it("seeds Jobs, CronJobs, PVCs, APIServices and stuck namespaces with the matching tool", () => {
+    const cronJob = {
+      ...issue("cronjob/shop/report:last-run-failed", "CronJob", "report"),
+      category: "cronjob-failed",
+    };
+    expect(seedCall(cronJob)).toEqual({
+      name: "k8s_get_workload",
+      args: { kind: "CronJob", namespace: "shop", name: "report" },
+    });
+    const pvc = { ...issue("pvc/shop/data:pending", "PersistentVolumeClaim", "data"), category: "pvc-pending" };
+    expect(seedCall(pvc)).toEqual({
+      name: "k8s_list_events",
+      args: { namespace: "shop", objectName: "data", objectKind: "PersistentVolumeClaim" },
+    });
+    const api: Issue = {
+      ...issue("apiservice/v1beta1.metrics.k8s.io:unavailable", "APIService", "v1beta1.metrics.k8s.io"),
+      resource: { kind: "APIService", name: "v1beta1.metrics.k8s.io" },
+    };
+    const ns: Issue = {
+      ...issue("namespace/old:stuck-terminating", "Namespace", "old"),
+      resource: { kind: "Namespace", name: "old" },
+    };
+    for (const i of [api, ns]) {
+      expect(seedCall(i)).toEqual({ name: "k8s_cluster_health", args: { section: "apiservices" } });
+    }
+    const lease: Issue = {
+      ...issue("controlplane/kube-scheduler:leader-stale", "ControlPlane", "kube-scheduler"),
+      resource: { kind: "ControlPlane", name: "kube-scheduler" },
+    };
+    expect(seedCall(lease)).toEqual({ name: "k8s_cluster_health", args: { section: "control-plane" } });
   });
 
   it("reports a failed investigation instead of throwing", async () => {
@@ -486,5 +531,105 @@ describe("triage grouping by workload", () => {
     const problems = fallbackTriage([apiDeploy, rs], 5);
     expect(problems).toHaveLength(1);
     expect(problems[0]?.primary).toBe(rs);
+  });
+
+  it("groups a pending PVC with the pods that wait for it, led by a pod", () => {
+    const pvc: Issue = {
+      ...issue("pvc/shop/data-db-0:pending", "PersistentVolumeClaim", "data-db-0"),
+      category: "pvc-pending",
+      workload: "shop/db",
+    };
+    const problems = fallbackTriage([pvc, sts, stsPod], 5);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]?.primary).toBe(stsPod);
+    expect(problems[0]?.related.map((i) => i.id).sort()).toEqual([pvc.id, sts.id].sort());
+  });
+
+  it("groups a failing CronJob with the failed pods of its Jobs", () => {
+    const cronJob: Issue = {
+      ...issue("cronjob/shop/report:last-run-failed", "CronJob", "report", "warning"),
+      category: "cronjob-failed",
+      workload: "shop/report",
+    };
+    const jobPod: Issue = {
+      ...issue("pod/shop/report-29123-abcde:pod-failed", "Pod", "report-29123-abcde", "warning"),
+      category: "pod-failed",
+      workload: "shop/report",
+    };
+    const problems = fallbackTriage([cronJob, jobPod], 5);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]?.primary).toBe(jobPod);
+  });
+});
+
+describe("triage grouping of cluster-level issues", () => {
+  const cluster = (id: string, kind: string, name: string, category: string, severity: Issue["severity"]): Issue => ({
+    id,
+    severity,
+    category,
+    resource: { kind, name },
+    title: `${kind} ${name}`,
+    evidence: [],
+  });
+  const api = cluster(
+    "apiservice/v1beta1.metrics.k8s.io:unavailable",
+    "APIService",
+    "v1beta1.metrics.k8s.io",
+    "apiservice-unavailable",
+    "critical",
+  );
+  const stuckOnApi = cluster(
+    "namespace/old-app:stuck-terminating",
+    "Namespace",
+    "old-app",
+    "namespace-terminating-api",
+    "warning",
+  );
+  const stuckOnFinalizer = cluster(
+    "namespace/operator:stuck-terminating",
+    "Namespace",
+    "operator",
+    "namespace-terminating",
+    "warning",
+  );
+
+  it("merges an unavailable APIService and the namespaces it keeps from deleting, led by the APIService", () => {
+    const problems = fallbackTriage([stuckOnApi, stuckOnFinalizer, api], 5);
+    expect(problems).toHaveLength(2);
+    expect(problems[0]?.primary).toBe(api);
+    expect(problems[0]?.related).toEqual([stuckOnApi]);
+    expect(problems[1]?.primary).toBe(stuckOnFinalizer);
+  });
+
+  it("merges the APIService group even when the LLM picks the namespace", () => {
+    const problems = buildProblems([{ issueId: stuckOnApi.id }], [api, stuckOnApi], 5);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]?.primary).toBe(api);
+  });
+
+  it("treats a stale leader lease as part of the control-plane incident", () => {
+    const lease = cluster(
+      "controlplane/kube-scheduler:leader-stale",
+      "ControlPlane",
+      "kube-scheduler",
+      "leader-election-stale",
+      "critical",
+    );
+    const etcd: Issue = {
+      ...cluster(
+        "pod/kube-system/etcd-cp:controlplane-pod-down",
+        "Pod",
+        "etcd-cp",
+        "controlplane-pod-down",
+        "critical",
+      ),
+      resource: { kind: "Pod", namespace: "kube-system", name: "etcd-cp" },
+    };
+    const problems = fallbackTriage([lease, etcd], 5);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]?.primary).toBe(etcd);
+    expect(problems[0]?.related).toEqual([lease]);
+    // On its own (managed cluster, no pods visible), the lease leads the problem.
+    expect(fallbackTriage([lease], 5)[0]?.primary).toBe(lease);
   });
 });
