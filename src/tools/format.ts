@@ -34,7 +34,9 @@ export function nodeLine(n: NodeSummary, now: Date): string {
     n.ready ? "Ready" : `NotReady${n.readyMessage ? ` (${n.readyMessage})` : ""}`,
     `roles=${n.roles.join(",")}`,
     `kubelet=${n.kubeletVersion ?? "?"}`,
-    n.heartbeat ? `heartbeat=${Math.round((now.getTime() - Date.parse(n.heartbeat)) / 1000)}s ago` : "heartbeat=unknown",
+    n.heartbeat
+      ? `heartbeat=${Math.round((now.getTime() - Date.parse(n.heartbeat)) / 1000)}s ago`
+      : "heartbeat=unknown",
     `pressure=${n.pressures.join(",") || "none"}`,
     n.unschedulable ? "cordoned" : "",
     n.requested
@@ -54,7 +56,11 @@ function formatResources(c: V1Container): string | undefined {
   const r = c.resources;
   if (!r?.requests && !r?.limits) return undefined;
   const fmt = (m?: Record<string, string>) =>
-    m ? Object.entries(m).map(([k, v]) => `${k}=${v}`).join(",") : "none";
+    m
+      ? Object.entries(m)
+          .map(([k, v]) => `${k}=${v}`)
+          .join(",")
+      : "none";
   return `requests(${fmt(r.requests)}) limits(${fmt(r.limits)})`;
 }
 
@@ -96,7 +102,8 @@ export function describePodText(pod: V1Pod, events: EventSummary[]): string {
   ];
   if (s.message) lines.push(`Message: ${s.message}`);
   const conds = (pod.status?.conditions ?? []).map(
-    (c) => `${c.type}=${c.status}${c.reason ? ` (${c.reason})` : ""}${c.status === "False" && c.message ? `: ${c.message}` : ""}`,
+    (c) =>
+      `${c.type}=${c.status}${c.reason ? ` (${c.reason})` : ""}${c.status === "False" && c.message ? `: ${c.message}` : ""}`,
   );
   if (conds.length > 0) lines.push(`Conditions: ${conds.join("; ")}`);
   if (pod.spec?.nodeSelector) lines.push(`NodeSelector: ${JSON.stringify(pod.spec.nodeSelector)}`);
@@ -108,14 +115,21 @@ export function describePodText(pod: V1Pod, events: EventSummary[]): string {
   lines.push("Containers:");
   for (const { c, init } of specs) {
     const st = s.containers.find((x) => x.name === c.name && x.init === init);
-    lines.push(`- ${init ? "[init] " : ""}${c.name} image=${c.image ?? "?"} ready=${st?.ready ?? false} restarts=${st?.restarts ?? 0}`);
+    lines.push(
+      `- ${init ? "[init] " : ""}${c.name} image=${c.image ?? "?"} ready=${st?.ready ?? false} restarts=${st?.restarts ?? 0}`,
+    );
     if (st) {
-      lines.push(`  state: ${st.state}${st.reason ? ` ${st.reason}` : ""}${st.exitCode !== undefined ? ` exitCode=${st.exitCode}` : ""}${st.message ? `: ${st.message}` : ""}`);
+      lines.push(
+        `  state: ${st.state}${st.reason ? ` ${st.reason}` : ""}${st.exitCode !== undefined ? ` exitCode=${st.exitCode}` : ""}${st.message ? `: ${st.message}` : ""}`,
+      );
       if (st.lastTerminationReason) {
         lines.push(`  last termination: ${st.lastTerminationReason} exitCode=${st.lastExitCode ?? "?"}`);
       }
     }
-    if (c.command || c.args) lines.push(`  command: ${[...(c.command ?? []), ...(c.args ?? [])].join(" ").replace(/\s+/g, " ").slice(0, 300)}`);
+    if (c.command || c.args)
+      lines.push(
+        `  command: ${[...(c.command ?? []), ...(c.args ?? [])].join(" ").replace(/\s+/g, " ").slice(0, 300)}`,
+      );
     const res = formatResources(c);
     if (res) lines.push(`  resources: ${res}`);
     lines.push(`  env: ${formatEnv(c)}`);

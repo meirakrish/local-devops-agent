@@ -9,14 +9,21 @@ import { dnsIssues, podCreateFailureIssues, serviceIssues, workloadIssues } from
 const NOW = new Date("2026-01-01T12:00:00Z");
 const minutesAgo = (m: number) => new Date(NOW.getTime() - m * 60_000);
 
-function pod(name: string, labels: Record<string, string>, ready: boolean, opts: { createdMinutesAgo?: number; rs?: string } = {}): V1Pod {
+function pod(
+  name: string,
+  labels: Record<string, string>,
+  ready: boolean,
+  opts: { createdMinutesAgo?: number; rs?: string } = {},
+): V1Pod {
   return {
     metadata: {
       name,
       namespace: "shop",
       labels,
       creationTimestamp: minutesAgo(opts.createdMinutesAgo ?? 60),
-      ownerReferences: opts.rs ? [{ apiVersion: "apps/v1", kind: "ReplicaSet", name: opts.rs, uid: "1", controller: true }] : undefined,
+      ownerReferences: opts.rs
+        ? [{ apiVersion: "apps/v1", kind: "ReplicaSet", name: opts.rs, uid: "1", controller: true }]
+        : undefined,
     },
     spec: { containers: [{ name: "app" }] },
     status: {
@@ -59,7 +66,9 @@ describe("pod workload", () => {
 
   it("uses the owner name for other controllers", () => {
     const p = pod("db-0", {}, true);
-    p.metadata!.ownerReferences = [{ apiVersion: "apps/v1", kind: "StatefulSet", name: "db", uid: "1", controller: true }];
+    p.metadata!.ownerReferences = [
+      { apiVersion: "apps/v1", kind: "StatefulSet", name: "db", uid: "1", controller: true },
+    ];
     expect(podWorkload(p)).toBe("db");
   });
 });
@@ -70,10 +79,11 @@ describe("service rules", () => {
   });
 
   it("flags a selector that matches no pods and shows the label values pods actually have", () => {
-    const s = summarizeService(service("frontend", { app: "fronted" }), [], [
-      pod("frontend-1", { app: "frontend" }, true),
-      ...webPods,
-    ])!;
+    const s = summarizeService(
+      service("frontend", { app: "fronted" }),
+      [],
+      [pod("frontend-1", { app: "frontend" }, true), ...webPods],
+    )!;
     const [issue, ...rest] = serviceIssues(s, NOW);
     expect(rest).toHaveLength(0);
     expect(issue?.severity).toBe("warning");
@@ -96,12 +106,20 @@ describe("service rules", () => {
   });
 
   it("ignores healthy Services, endpoint slices of other Services, and pods that are still starting", () => {
-    const healthy = summarizeService(service("web", { app: "web" }), [slice("web", [true, false]), slice("other", [false])], webPods)!;
+    const healthy = summarizeService(
+      service("web", { app: "web" }),
+      [slice("web", [true, false]), slice("other", [false])],
+      webPods,
+    )!;
     expect(healthy.readyEndpoints).toBe(1);
     expect(healthy.notReadyEndpoints).toBe(1);
     expect(serviceIssues(healthy, NOW)).toEqual([]);
 
-    const starting = summarizeService(service("web", { app: "web" }), [], [pod("web-1", { app: "web" }, false, { createdMinutesAgo: 1 })])!;
+    const starting = summarizeService(
+      service("web", { app: "web" }),
+      [],
+      [pod("web-1", { app: "web" }, false, { createdMinutesAgo: 1 })],
+    )!;
     expect(serviceIssues(starting, NOW)).toEqual([]);
   });
 
@@ -126,7 +144,9 @@ describe("cluster DNS rule", () => {
   });
 
   it("is critical when kube-dns has no ready endpoints", () => {
-    const pods = [{ name: "coredns-abc-1", ready: false, phase: "Running", reason: "CrashLoopBackOff", workload: "coredns" }];
+    const pods = [
+      { name: "coredns-abc-1", ready: false, phase: "Running", reason: "CrashLoopBackOff", workload: "coredns" },
+    ];
     const [issue] = dnsIssues({ service: dnsService(0, 2, pods) });
     expect(issue?.severity).toBe("critical");
     expect(issue?.category).toBe("dns-down");
@@ -143,7 +163,14 @@ describe("cluster DNS rule", () => {
 });
 
 describe("DaemonSet and StatefulSet rules", () => {
-  const ds: WorkloadSummary = { kind: "DaemonSet", namespace: "kube-system", name: "kube-proxy", desired: 3, ready: 2, updated: 3 };
+  const ds: WorkloadSummary = {
+    kind: "DaemonSet",
+    namespace: "kube-system",
+    name: "kube-proxy",
+    desired: 3,
+    ready: 2,
+    updated: 3,
+  };
 
   it("warns when some DaemonSet pods are not ready and mentions networking in kube-system", () => {
     const [issue] = workloadIssues(ds);
@@ -176,7 +203,13 @@ describe("DaemonSet and StatefulSet rules", () => {
 });
 
 describe("pod creation failures", () => {
-  const event = (kind: string, name: string, message: string, lastSeen = minutesAgo(5).toISOString(), count = 3): EventSummary => ({
+  const event = (
+    kind: string,
+    name: string,
+    message: string,
+    lastSeen = minutesAgo(5).toISOString(),
+    count = 3,
+  ): EventSummary => ({
     namespace: "shop",
     involvedKind: kind,
     involvedName: name,
@@ -188,7 +221,11 @@ describe("pod creation failures", () => {
 
   it("explains the cause and ties a ReplicaSet to its Deployment", () => {
     const [issue] = podCreateFailureIssues([
-      event("ReplicaSet", "api-5f6d7c8b9", 'Error creating: pods "api-5f6d7c8b9-x" is forbidden: exceeded quota: compute, requested: requests.cpu=2, used: requests.cpu=3, limited: requests.cpu=4'),
+      event(
+        "ReplicaSet",
+        "api-5f6d7c8b9",
+        'Error creating: pods "api-5f6d7c8b9-x" is forbidden: exceeded quota: compute, requested: requests.cpu=2, used: requests.cpu=3, limited: requests.cpu=4',
+      ),
     ]);
     expect(issue?.id).toBe("replicaset/shop/api-5f6d7c8b9:create-failed");
     expect(issue?.severity).toBe("critical");
@@ -199,9 +236,17 @@ describe("pod creation failures", () => {
   it("recognizes Pod Security, webhooks and missing service accounts", () => {
     const titles = podCreateFailureIssues([
       event("ReplicaSet", "a-5f6d7c8b9", 'pods "a" is forbidden: violates PodSecurity "baseline:latest": privileged'),
-      event("DaemonSet", "b", 'Internal error occurred: failed calling webhook "x.example.com": no endpoints available'),
+      event(
+        "DaemonSet",
+        "b",
+        'Internal error occurred: failed calling webhook "x.example.com": no endpoints available',
+      ),
       event("StatefulSet", "c", 'admission webhook "policy.example.com" denied the request: images must be signed'),
-      event("Job", "d", 'pods "d-1" is forbidden: error looking up service account shop/backup: serviceaccount "backup" not found'),
+      event(
+        "Job",
+        "d",
+        'pods "d-1" is forbidden: error looking up service account shop/backup: serviceaccount "backup" not found',
+      ),
     ]).map((i) => i.title.split(": ").slice(1).join(": "));
     expect(titles).toEqual([
       "rejected by Pod Security admission",
@@ -270,7 +315,14 @@ describe("detectIssues with workloads, services and DNS", () => {
         services: [noPods("shop", "policy"), noPods("kube-system", "kube-dns"), noPods("shop", "orphan")],
         dns: { service: noPods("kube-system", "kube-dns") },
         webhooks: [
-          { kind: "Validating", configName: "p", name: "w", failurePolicy: "Fail", service: { namespace: "shop", name: "policy" }, status: "no-ready-endpoints" },
+          {
+            kind: "Validating",
+            configName: "p",
+            name: "w",
+            failurePolicy: "Fail",
+            service: { namespace: "shop", name: "policy" },
+            status: "no-ready-endpoints",
+          },
         ],
       },
       { restartThreshold: 5, now: NOW, windowMinutes: 60 },
@@ -292,9 +344,20 @@ describe("detectIssues with workloads, services and DNS", () => {
       count: 1,
       lastSeen: minutesAgo(5).toISOString(),
     };
-    const deployment = (ready: number) => ({ namespace: "shop", name: "api", desired: 2, ready, available: ready, updated: 2, conditions: [] });
+    const deployment = (ready: number) => ({
+      namespace: "shop",
+      name: "api",
+      desired: 2,
+      ready,
+      available: ready,
+      updated: 2,
+      conditions: [],
+    });
     const run = (ready: number) =>
-      detectIssues({ ...base, deployments: [deployment(ready)], podCreateFailures: [failure] }, { restartThreshold: 5, now: NOW, windowMinutes: 60 }).map((i) => i.category);
+      detectIssues(
+        { ...base, deployments: [deployment(ready)], podCreateFailures: [failure] },
+        { restartThreshold: 5, now: NOW, windowMinutes: 60 },
+      ).map((i) => i.category);
     expect(run(2)).toEqual([]);
     expect(run(0).sort()).toEqual(["pod-create-failed", "replicas-unavailable"]);
   });

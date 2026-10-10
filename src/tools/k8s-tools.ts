@@ -47,7 +47,10 @@ const NAME_PATTERN = /^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$/;
 const k8sName = (what: string) =>
   z
     .string()
-    .regex(NAME_PATTERN, `${what} must be a bare Kubernetes name such as "web-7db8d69f68-4f2n7", without a "namespace/" prefix`)
+    .regex(
+      NAME_PATTERN,
+      `${what} must be a bare Kubernetes name such as "web-7db8d69f68-4f2n7", without a "namespace/" prefix`,
+    )
     .describe(`Exact ${what}`);
 const namespaceField = z
   .string()
@@ -112,10 +115,7 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
       namespace,
       fieldSelector: `involvedObject.kind=Pod,involvedObject.name=${name}`,
     });
-    return list.items
-      .map(summarizeEvent)
-      .sort(byNewest)
-      .slice(0, 15);
+    return list.items.map(summarizeEvent).sort(byNewest).slice(0, 15);
   }
 
   const listNodes = tool(
@@ -153,10 +153,7 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
       description: "List pods with phase, ready containers, restart count and waiting reason.",
       schema: z.object({
         namespace: namespaceField.optional().describe("Namespace to list; omit for all namespaces"),
-        onlyProblems: z
-          .boolean()
-          .optional()
-          .describe("If true, only pods that are not Running+Ready or have restarts"),
+        onlyProblems: z.boolean().optional().describe("If true, only pods that are not Running+Ready or have restarts"),
       }),
     },
   );
@@ -210,7 +207,9 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
             appContainers[0] ??
             summary.containers[0];
           if (summary.containers.length > 1 && target) {
-            notes.push(`(container not specified; showing "${target.name}" of ${summary.containers.map((c) => c.name).join(", ")})`);
+            notes.push(
+              `(container not specified; showing "${target.name}" of ${summary.containers.map((c) => c.name).join(", ")})`,
+            );
           }
         }
         if (!target) return "Pod has no container statuses yet (it may not be scheduled).";
@@ -244,10 +243,12 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
         // Between restarts the crashed run is the *current* one (state: terminated) and the
         // run before it may already be garbage-collected, so fall back to the current run.
         if (previous !== true || previousUnavailable) {
-          const exited =
-            target.state === "terminated" ? `, already exited with code ${target.exitCode ?? "?"}` : "";
+          const exited = target.state === "terminated" ? `, already exited with code ${target.exitCode ?? "?"}` : "";
           const why = previous === true ? " (previous run's logs are not available)" : "";
-          sections.push(`=== current run of ${target.name}${exited} (last ${lines} lines)${why} ===`, await read(false));
+          sections.push(
+            `=== current run of ${target.name}${exited} (last ${lines} lines)${why} ===`,
+            await read(false),
+          );
         }
         return sections.join("\n");
       },
@@ -260,7 +261,12 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
         namespace: namespaceField,
         pod: k8sName("pod name"),
         container: z.string().optional().describe("Container name; omit to pick the failing container"),
-        tailLines: z.number().int().positive().optional().describe(`Number of lines (default ${defaultTail}, max ${MAX_TAIL_LINES})`),
+        tailLines: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe(`Number of lines (default ${defaultTail}, max ${MAX_TAIL_LINES})`),
         previous: z
           .boolean()
           .optional()
@@ -273,7 +279,15 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
     safe(
       k8s,
       opts.maxChars,
-      async ({ namespace, objectName, objectKind }: { namespace?: string; objectName?: string; objectKind?: string }) => {
+      async ({
+        namespace,
+        objectName,
+        objectKind,
+      }: {
+        namespace?: string;
+        objectName?: string;
+        objectKind?: string;
+      }) => {
         const selectors = ["type=Warning"];
         if (objectName) selectors.push(`involvedObject.name=${objectName}`);
         if (objectKind) selectors.push(`involvedObject.kind=${objectKind}`);
@@ -281,10 +295,7 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
         const list = namespace
           ? await k8s.core.listNamespacedEvent({ namespace, fieldSelector })
           : await k8s.core.listEventForAllNamespaces({ fieldSelector });
-        const events = list.items
-          .map(summarizeEvent)
-          .sort(byNewest)
-          .slice(0, maxItems);
+        const events = list.items.map(summarizeEvent).sort(byNewest).slice(0, maxItems);
         if (events.length > 0) return events.map(eventLine).join("\n");
         const hint = namespace ? await missingNamespaceHint(k8s, namespace) : undefined;
         return hint ? `Error: ${hint}` : "No warning events found.";
@@ -324,50 +335,56 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
   }
 
   const getWorkload = tool(
-    safe(k8s, opts.maxChars, async ({ kind = "Deployment", namespace, name }: { kind?: WorkloadKind; namespace: string; name: string }) => {
-      const images = (containers: V1Container[] | undefined) =>
-        `Images: ${(containers ?? []).map((c) => `${c.name}=${c.image}`).join(", ")}`;
-      const lines: string[] = [];
-      let selector: V1LabelSelector | undefined;
-      if (kind === "Deployment") {
-        const d = await k8s.apps.readNamespacedDeployment({ namespace, name });
-        const s = summarizeDeployment(d);
-        selector = d.spec?.selector;
-        lines.push(
-          `Deployment ${s.namespace}/${s.name}`,
-          `Replicas: desired=${s.desired} ready=${s.ready} available=${s.available} updated=${s.updated}`,
-          `Strategy: ${d.spec?.strategy?.type ?? "RollingUpdate"}  Generation: ${d.metadata?.generation ?? "?"} observed=${d.status?.observedGeneration ?? "?"}`,
-          images(d.spec?.template.spec?.containers),
-          "Conditions:",
-          ...s.conditions.map((c) => `- ${c.type}=${c.status}${c.reason ? ` (${c.reason})` : ""}${c.message ? `: ${c.message}` : ""}`),
-        );
-      } else if (kind === "StatefulSet") {
-        const st = await k8s.apps.readNamespacedStatefulSet({ namespace, name });
-        const s = summarizeStatefulSet(st);
-        selector = st.spec?.selector;
-        lines.push(
-          `StatefulSet ${s.namespace}/${s.name}`,
-          `Replicas: desired=${s.desired} ready=${s.ready} updated=${s.updated}`,
-          `Revisions: current=${s.currentRevision ?? "?"} update=${s.updateRevision ?? "?"}  Pod management: ${st.spec?.podManagementPolicy ?? "OrderedReady"}`,
-          images(st.spec?.template.spec?.containers),
-          `Volume claim templates: ${(st.spec?.volumeClaimTemplates ?? []).map((v) => v.metadata?.name).join(", ") || "(none)"}`,
-        );
-      } else {
-        const ds = await k8s.apps.readNamespacedDaemonSet({ namespace, name });
-        const s = summarizeDaemonSet(ds);
-        selector = ds.spec?.selector;
-        lines.push(
-          `DaemonSet ${s.namespace}/${s.name}`,
-          `Pods: desired=${s.desired} current=${ds.status?.currentNumberScheduled ?? 0} ready=${s.ready} updated=${s.updated} available=${ds.status?.numberAvailable ?? 0} misscheduled=${ds.status?.numberMisscheduled ?? 0}`,
-          images(ds.spec?.template.spec?.containers),
-          `NodeSelector: ${JSON.stringify(ds.spec?.template.spec?.nodeSelector ?? {})}  Tolerations: ${(ds.spec?.template.spec?.tolerations ?? []).map((t) => t.key ?? (t.operator === "Exists" ? "<all>" : "?")).join(", ") || "(none)"}`,
-        );
-      }
-      lines.push(...(await podsOf(namespace, selector)));
-      const events = await controllerEvents(kind, namespace, name);
-      if (events.length > 0) lines.push("Controller warning events (newest first):", ...events.map(eventLine));
-      return lines.join("\n");
-    }),
+    safe(
+      k8s,
+      opts.maxChars,
+      async ({ kind = "Deployment", namespace, name }: { kind?: WorkloadKind; namespace: string; name: string }) => {
+        const images = (containers: V1Container[] | undefined) =>
+          `Images: ${(containers ?? []).map((c) => `${c.name}=${c.image}`).join(", ")}`;
+        const lines: string[] = [];
+        let selector: V1LabelSelector | undefined;
+        if (kind === "Deployment") {
+          const d = await k8s.apps.readNamespacedDeployment({ namespace, name });
+          const s = summarizeDeployment(d);
+          selector = d.spec?.selector;
+          lines.push(
+            `Deployment ${s.namespace}/${s.name}`,
+            `Replicas: desired=${s.desired} ready=${s.ready} available=${s.available} updated=${s.updated}`,
+            `Strategy: ${d.spec?.strategy?.type ?? "RollingUpdate"}  Generation: ${d.metadata?.generation ?? "?"} observed=${d.status?.observedGeneration ?? "?"}`,
+            images(d.spec?.template.spec?.containers),
+            "Conditions:",
+            ...s.conditions.map(
+              (c) => `- ${c.type}=${c.status}${c.reason ? ` (${c.reason})` : ""}${c.message ? `: ${c.message}` : ""}`,
+            ),
+          );
+        } else if (kind === "StatefulSet") {
+          const st = await k8s.apps.readNamespacedStatefulSet({ namespace, name });
+          const s = summarizeStatefulSet(st);
+          selector = st.spec?.selector;
+          lines.push(
+            `StatefulSet ${s.namespace}/${s.name}`,
+            `Replicas: desired=${s.desired} ready=${s.ready} updated=${s.updated}`,
+            `Revisions: current=${s.currentRevision ?? "?"} update=${s.updateRevision ?? "?"}  Pod management: ${st.spec?.podManagementPolicy ?? "OrderedReady"}`,
+            images(st.spec?.template.spec?.containers),
+            `Volume claim templates: ${(st.spec?.volumeClaimTemplates ?? []).map((v) => v.metadata?.name).join(", ") || "(none)"}`,
+          );
+        } else {
+          const ds = await k8s.apps.readNamespacedDaemonSet({ namespace, name });
+          const s = summarizeDaemonSet(ds);
+          selector = ds.spec?.selector;
+          lines.push(
+            `DaemonSet ${s.namespace}/${s.name}`,
+            `Pods: desired=${s.desired} current=${ds.status?.currentNumberScheduled ?? 0} ready=${s.ready} updated=${s.updated} available=${ds.status?.numberAvailable ?? 0} misscheduled=${ds.status?.numberMisscheduled ?? 0}`,
+            images(ds.spec?.template.spec?.containers),
+            `NodeSelector: ${JSON.stringify(ds.spec?.template.spec?.nodeSelector ?? {})}  Tolerations: ${(ds.spec?.template.spec?.tolerations ?? []).map((t) => t.key ?? (t.operator === "Exists" ? "<all>" : "?")).join(", ") || "(none)"}`,
+          );
+        }
+        lines.push(...(await podsOf(namespace, selector)));
+        const events = await controllerEvents(kind, namespace, name);
+        if (events.length > 0) lines.push("Controller warning events (newest first):", ...events.map(eventLine));
+        return lines.join("\n");
+      },
+    ),
     {
       name: "k8s_get_workload",
       description:
@@ -387,7 +404,9 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
         k8s.discovery.listNamespacedEndpointSlice({ namespace, labelSelector: `kubernetes.io/service-name=${name}` }),
         k8s.core.listNamespacedPod({ namespace }),
       ]);
-      const ports = (svc.spec?.ports ?? []).map((p) => `${p.name ? `${p.name}:` : ""}${p.port}->${p.targetPort ?? p.port}/${p.protocol ?? "TCP"}`);
+      const ports = (svc.spec?.ports ?? []).map(
+        (p) => `${p.name ? `${p.name}:` : ""}${p.port}->${p.targetPort ?? p.port}/${p.protocol ?? "TCP"}`,
+      );
       const lines = [
         `Service ${namespace}/${name} type=${svc.spec?.type ?? "ClusterIP"} clusterIP=${svc.spec?.clusterIP ?? "?"}`,
         `Ports: ${ports.join(", ") || "(none)"}`,
@@ -395,11 +414,18 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
       const endpoints = slices.items.flatMap((s) => s.endpoints ?? []);
       const endpointLines = endpoints
         .slice(0, 20)
-        .map((e) => `- ${e.targetRef?.name ?? e.addresses.join(",")} ${e.conditions?.ready === false ? "NOT READY" : "ready"}`);
+        .map(
+          (e) =>
+            `- ${e.targetRef?.name ?? e.addresses.join(",")} ${e.conditions?.ready === false ? "NOT READY" : "ready"}`,
+        );
 
       const s = summarizeService(svc, slices.items, pods.items);
       if (!s) {
-        lines.push("No selector: endpoints are managed manually (or this is an ExternalName Service).", `Endpoints: ${endpoints.length}`, ...endpointLines);
+        lines.push(
+          "No selector: endpoints are managed manually (or this is an ExternalName Service).",
+          `Endpoints: ${endpoints.length}`,
+          ...endpointLines,
+        );
         return lines.join("\n");
       }
       lines.push(
@@ -411,7 +437,9 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
       if (matching.length === 0) {
         lines.push(
           "Pods matching the selector: (none)",
-          `Label values on running pods in ${namespace}: ${Object.entries(s.podLabelValues).map(([k, vs]) => `${k}: ${vs.join(", ") || "(no pod has this label)"}`).join("; ")}`,
+          `Label values on running pods in ${namespace}: ${Object.entries(s.podLabelValues)
+            .map(([k, vs]) => `${k}: ${vs.join(", ") || "(no pod has this label)"}`)
+            .join("; ")}`,
         );
         return lines.join("\n");
       }
@@ -419,7 +447,9 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
       // A targetPort the pods do not declare is a common cause of refused connections.
       const declared = matching[0]!.spec?.containers.flatMap((c) => c.ports ?? []) ?? [];
       if (declared.length > 0) {
-        lines.push(`Container ports (first pod): ${declared.map((p) => `${p.containerPort}${p.name ? `(${p.name})` : ""}`).join(", ")}`);
+        lines.push(
+          `Container ports (first pod): ${declared.map((p) => `${p.containerPort}${p.name ? `(${p.name})` : ""}`).join(", ")}`,
+        );
         for (const p of svc.spec?.ports ?? []) {
           const target = p.targetPort ?? p.port;
           const found = declared.some((d) => d.containerPort === target || d.name === target);
@@ -456,7 +486,8 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
       const lines: string[] = [];
       if (want("control-plane")) {
         lines.push(`API server version: ${cp.serverVersion ?? "unknown"}`);
-        if (cp.certificate) lines.push(`API server certificate: ${cp.certificate.subject}, valid until ${cp.certificate.notAfter}`);
+        if (cp.certificate)
+          lines.push(`API server certificate: ${cp.certificate.subject}, valid until ${cp.certificate.notAfter}`);
         if (cp.readyz) {
           const failing = cp.readyz.filter((c) => !c.ok);
           lines.push(
@@ -467,12 +498,20 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
         if (cp.pods) {
           lines.push(`Control-plane pods (restarts and probe failures within the last ${opts.windowMinutes} min):`);
           for (const p of cp.pods) {
-            const parts = [`- ${p.component} (${p.name})`, p.ready ? "ready" : `NOT READY${p.stateReason ? ` (${p.stateReason})` : ""}`, `restarts=${p.restarts}`];
+            const parts = [
+              `- ${p.component} (${p.name})`,
+              p.ready ? "ready" : `NOT READY${p.stateReason ? ` (${p.stateReason})` : ""}`,
+              `restarts=${p.restarts}`,
+            ];
             if (p.lastRestart) {
-              parts.push(`last restart ${p.lastRestart.finishedAt}${p.lastRestart.reason ? ` ${p.lastRestart.reason}` : ""}${p.lastRestart.exitCode !== undefined ? ` exit ${p.lastRestart.exitCode}` : ""}`);
+              parts.push(
+                `last restart ${p.lastRestart.finishedAt}${p.lastRestart.reason ? ` ${p.lastRestart.reason}` : ""}${p.lastRestart.exitCode !== undefined ? ` exit ${p.lastRestart.exitCode}` : ""}`,
+              );
             }
             if (p.probeFailures) {
-              parts.push(`probe failures (up to)=${p.probeFailures.count} last ${p.probeFailures.lastSeen}: ${p.probeFailures.lastMessage}`);
+              parts.push(
+                `probe failures (up to)=${p.probeFailures.count} last ${p.probeFailures.lastSeen}: ${p.probeFailures.lastMessage}`,
+              );
             }
             lines.push(parts.join(" "));
           }
@@ -480,19 +519,29 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
       }
       if (want("etcd")) {
         const etcdCheck = cp.readyz?.find((c) => c.name === "etcd");
-        if (etcdCheck) lines.push(`etcd health check (/readyz): ${etcdCheck.ok ? "ok" : `FAILING${etcdCheck.reason ? `: ${etcdCheck.reason}` : ""}`}`);
+        if (etcdCheck)
+          lines.push(
+            `etcd health check (/readyz): ${etcdCheck.ok ? "ok" : `FAILING${etcdCheck.reason ? `: ${etcdCheck.reason}` : ""}`}`,
+          );
         if (cp.etcd) {
           const size = cp.etcd.dbSizeBytes;
           lines.push(
             `etcd database: ${size !== undefined ? `${formatBytes(size)} of ${formatBytes(cp.etcd.quotaBytes)} quota (${Math.round((size / cp.etcd.quotaBytes) * 100)}%)` : "size not exposed"}${cp.etcd.quotaSource === "default" ? ", default quota assumed" : ""}`,
-            `etcd largest object counts: ${cp.etcd.objectCounts.slice(0, 8).map((o) => `${o.resource}=${o.count}`).join(", ") || "unknown"}`,
+            `etcd largest object counts: ${
+              cp.etcd.objectCounts
+                .slice(0, 8)
+                .map((o) => `${o.resource}=${o.count}`)
+                .join(", ") || "unknown"
+            }`,
           );
         }
       }
       if (want("webhooks")) {
         lines.push(`Admission webhooks: ${webhooks.length}`);
         for (const w of webhooks) {
-          lines.push(`- ${w.kind} ${w.configName}/${w.name} failurePolicy=${w.failurePolicy} status=${w.status}${w.detail ? ` (${w.detail})` : ""}`);
+          lines.push(
+            `- ${w.kind} ${w.configName}/${w.name} failurePolicy=${w.failurePolicy} status=${w.status}${w.detail ? ` (${w.detail})` : ""}`,
+          );
         }
       }
       for (const n of [...cp.notVisible, ...problems]) lines.push(`Not visible: ${n}`);

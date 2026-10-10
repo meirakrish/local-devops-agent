@@ -65,7 +65,8 @@ function isContextOverflow(err: unknown): err is Error {
 /** Ollama's overflow error is a JSON blob; say what happened and what to change. */
 function explainOverflow(err: unknown): never {
   if (!isContextOverflow(err)) throw err;
-  const [, prompt, ctx] = /request \((\d+) tokens\) exceeds the available context size \((\d+) tokens\)/.exec(err.message) ?? [];
+  const [, prompt, ctx] =
+    /request \((\d+) tokens\) exceeds the available context size \((\d+) tokens\)/.exec(err.message) ?? [];
   throw new Error(
     `prompt${prompt ? ` (${prompt} tokens)` : ""} does not fit in NUM_CTX${ctx ? ` (${ctx})` : ""}; raise NUM_CTX or lower TOOL_OUTPUT_MAX_CHARS`,
   );

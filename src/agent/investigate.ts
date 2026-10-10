@@ -1,10 +1,4 @@
-import {
-  AIMessage,
-  type BaseMessage,
-  HumanMessage,
-  SystemMessage,
-  ToolMessage,
-} from "@langchain/core/messages";
+import { AIMessage, type BaseMessage, HumanMessage, SystemMessage, ToolMessage } from "@langchain/core/messages";
 import type { StructuredToolInterface } from "@langchain/core/tools";
 import { Annotation, END, MessagesAnnotation, START, StateGraph } from "@langchain/langgraph";
 import { z } from "zod";
@@ -253,14 +247,21 @@ export async function investigate(problem: Problem, deps: InvestigateDeps): Prom
     // then its result. It counts as one step and as a "seen" call.
     const seed = seedCall(problem.primary);
     const seedTool = seed ? deps.tools.find((t) => t.name === seed.name) : undefined;
-    const initial: { messages: BaseMessage[]; steps: number; seenCalls: string[] } = { messages, steps: 0, seenCalls: [] };
+    const initial: { messages: BaseMessage[]; steps: number; seenCalls: string[] } = {
+      messages,
+      steps: 0,
+      seenCalls: [],
+    };
     if (seed && seedTool && deps.maxSteps > 0) {
       const signature = callSignature(seed.name, seed.args);
       const started = Date.now();
       const output = await runTool(seedTool, seed.args);
       (deps.log ?? (() => {}))(`    → ${signature} (${output.length} chars, ${Date.now() - started}ms, seed)`);
       messages.push(
-        new AIMessage({ content: "", tool_calls: [{ id: "seed-0", name: seed.name, args: seed.args, type: "tool_call" }] }),
+        new AIMessage({
+          content: "",
+          tool_calls: [{ id: "seed-0", name: seed.name, args: seed.args, type: "tool_call" }],
+        }),
         new ToolMessage({ content: output, tool_call_id: "seed-0", name: seed.name }),
       );
       initial.steps = 1;

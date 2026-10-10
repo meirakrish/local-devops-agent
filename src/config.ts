@@ -34,9 +34,7 @@ export interface Config {
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   // Empty values in .env (e.g. `KUBECONFIG=`) mean "not set", so defaults apply.
-  const nonEmpty = Object.fromEntries(
-    Object.entries(env).filter(([, v]) => v !== undefined && v.trim() !== ""),
-  );
+  const nonEmpty = Object.fromEntries(Object.entries(env).filter(([, v]) => v !== undefined && v.trim() !== ""));
   const parsed = ConfigSchema.safeParse(nonEmpty);
   if (!parsed.success) {
     throw new Error(`Invalid configuration:\n${z.prettifyError(parsed.error)}`);

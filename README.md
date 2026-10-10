@@ -538,6 +538,7 @@ so treat reports as containing cluster data.
 | `pnpm test` | Unit tests (vitest; no cluster or Ollama needed) |
 | `pnpm test:e2e` | End-to-end tests against the demo cluster (`pnpm demo:up` first) |
 | `pnpm typecheck` | Type-check `src/` and `test/` |
+| `pnpm format` | Format the code with Prettier (`pnpm format:check` only reports) |
 | `pnpm build` | Compile `src/` to `dist/` |
 
 The unit tests feed the rules fake broken pods, nodes and deployments, run the tools

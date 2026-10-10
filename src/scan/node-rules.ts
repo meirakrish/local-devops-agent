@@ -64,7 +64,9 @@ export function nodeCapacityIssues(node: NodeSummary, now: Date, serverVersion?:
         category: "node-heartbeat",
         resource,
         title: `Node ${node.name} kubelet has not sent a heartbeat for ${Math.round(ageSeconds)}s`,
-        evidence: [`Lease kube-node-lease/${node.name} was last renewed at ${node.heartbeat} (kubelets renew it about every 10s)`],
+        evidence: [
+          `Lease kube-node-lease/${node.name} was last renewed at ${node.heartbeat} (kubelets renew it about every 10s)`,
+        ],
         hint: "The kubelet is down, hung, or cannot reach the API server; check the node, its kubelet service and its network. If every node shows this, check the clock of the machine running this check.",
       });
     }
@@ -74,7 +76,12 @@ export function nodeCapacityIssues(node: NodeSummary, now: Date, serverVersion?:
     const checks = [
       { name: "cpu", used: node.requested.cpu, total: parseQuantity(node.allocatable.cpu), fmt: formatCpu },
       { name: "memory", used: node.requested.memory, total: parseQuantity(node.allocatable.memory), fmt: formatMemory },
-      { name: "pods", used: node.requested.pods, total: parseQuantity(node.allocatable.pods), fmt: (n: number) => String(n) },
+      {
+        name: "pods",
+        used: node.requested.pods,
+        total: parseQuantity(node.allocatable.pods),
+        fmt: (n: number) => String(n),
+      },
     ];
     const full = checks.filter((c) => c.total && c.used / c.total >= NODE_THRESHOLDS.nodeRequestRatio);
     if (full.length > 0) {
@@ -104,7 +111,9 @@ export function nodeCapacityIssues(node: NodeSummary, now: Date, serverVersion?:
           behind < 0
             ? `Node ${node.name} kubelet ${node.kubeletVersion} is newer than the API server ${serverVersion}`
             : `Node ${node.name} kubelet ${node.kubeletVersion} is ${behind} minor versions behind the API server ${serverVersion}`,
-        evidence: [`kubelet ${node.kubeletVersion}, API server ${serverVersion}; supported: kubelet up to ${NODE_THRESHOLDS.maxKubeletMinorsBehind} minor versions older, never newer`],
+        evidence: [
+          `kubelet ${node.kubeletVersion}, API server ${serverVersion}; supported: kubelet up to ${NODE_THRESHOLDS.maxKubeletMinorsBehind} minor versions older, never newer`,
+        ],
         hint: "Finish the upgrade: upgrade the control plane first, then the nodes, one minor version at a time.",
       });
     }

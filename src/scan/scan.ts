@@ -21,12 +21,7 @@ export interface ScanOptions {
 }
 
 /** Keeps warning events inside the time window, newest first. */
-export function recentEvents(
-  events: EventSummary[],
-  now: Date,
-  windowMinutes: number,
-  max: number,
-): EventSummary[] {
+export function recentEvents(events: EventSummary[], now: Date, windowMinutes: number, max: number): EventSummary[] {
   const cutoff = now.getTime() - windowMinutes * 60_000;
   return events
     .filter((e) => !e.lastSeen || new Date(e.lastSeen).getTime() >= cutoff)
@@ -80,9 +75,7 @@ export async function scanCluster(k8s: K8sClients, opts: ScanOptions): Promise<C
     k8s.core.listNode(),
     ns ? Promise.resolve({ items: [{ metadata: { name: ns } }] }) : k8s.core.listNamespace(),
     ns ? k8s.core.listNamespacedPod({ namespace: ns }) : k8s.core.listPodForAllNamespaces(),
-    ns
-      ? k8s.apps.listNamespacedDeployment({ namespace: ns })
-      : k8s.apps.listDeploymentForAllNamespaces(),
+    ns ? k8s.apps.listNamespacedDeployment({ namespace: ns }) : k8s.apps.listDeploymentForAllNamespaces(),
     ns
       ? k8s.core.listNamespacedEvent({ namespace: ns, ...warningOnly })
       : k8s.core.listEventForAllNamespaces(warningOnly),

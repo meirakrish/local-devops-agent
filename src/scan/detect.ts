@@ -59,7 +59,5 @@ export function detectIssues(overview: ClusterOverview, opts: RuleOptions): Issu
     ...dnsIssues(overview.dns),
     ...podCreateFailureIssues(overview.podCreateFailures).filter((i) => !i.workload || !fullyReady.has(i.workload)),
   ];
-  return issues.sort(
-    (a, b) => compareSeverity(a.severity, b.severity) || a.id.localeCompare(b.id),
-  );
+  return issues.sort((a, b) => compareSeverity(a.severity, b.severity) || a.id.localeCompare(b.id));
 }

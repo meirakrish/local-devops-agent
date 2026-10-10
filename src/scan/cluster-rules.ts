@@ -24,7 +24,8 @@ export function controlPlaneIssues(cp: ControlPlaneSummary, now: Date): Issue[] 
   const failed = (cp.readyz ?? []).filter((c) => !c.ok);
   const etcdFailed = failed.filter((c) => c.name.startsWith("etcd"));
   const otherFailed = failed.filter((c) => !c.name.startsWith("etcd"));
-  const describe = (c: { name: string; reason?: string }) => `readyz check "${c.name}" failed${c.reason ? `: ${c.reason}` : ""}`;
+  const describe = (c: { name: string; reason?: string }) =>
+    `readyz check "${c.name}" failed${c.reason ? `: ${c.reason}` : ""}`;
   if (etcdFailed.length > 0) {
     issues.push({
       id: "controlplane/etcd:unhealthy",
@@ -60,7 +61,9 @@ export function controlPlaneIssues(cp: ControlPlaneSummary, now: Date): Issue[] 
         title: expired
           ? "API server certificate has expired"
           : `API server certificate expires in ${Math.floor(daysLeft)} day(s)`,
-        evidence: [`certificate ${cp.certificate.subject} (issuer ${cp.certificate.issuer}) is valid until ${cp.certificate.notAfter}`],
+        evidence: [
+          `certificate ${cp.certificate.subject} (issuer ${cp.certificate.issuer}) is valid until ${cp.certificate.notAfter}`,
+        ],
         hint: "On kubeadm clusters, run `kubeadm certs check-expiration` and `kubeadm certs renew all` on each control-plane node, then restart the control-plane pods. Managed clusters rotate certificates automatically.",
       });
     }
@@ -69,7 +72,10 @@ export function controlPlaneIssues(cp: ControlPlaneSummary, now: Date): Issue[] 
   if (cp.etcd?.dbSizeBytes !== undefined) {
     const ratio = cp.etcd.dbSizeBytes / cp.etcd.quotaBytes;
     if (ratio >= CLUSTER_THRESHOLDS.etcdWarningRatio) {
-      const top = cp.etcd.objectCounts.slice(0, 3).map((o) => `${o.resource}=${o.count}`).join(", ");
+      const top = cp.etcd.objectCounts
+        .slice(0, 3)
+        .map((o) => `${o.resource}=${o.count}`)
+        .join(", ");
       issues.push({
         id: "controlplane/etcd:db-size",
         severity: ratio >= CLUSTER_THRESHOLDS.etcdCriticalRatio ? "critical" : "warning",
@@ -94,7 +100,9 @@ export function controlPlaneIssues(cp: ControlPlaneSummary, now: Date): Issue[] 
       category: "etcd-object-count",
       resource: etcd,
       title: `${o.count} ${o.resource} objects stored in etcd`,
-      evidence: [`apiserver object count for ${o.resource} is ${o.count} (warning at ${CLUSTER_THRESHOLDS.objectCountWarning})`],
+      evidence: [
+        `apiserver object count for ${o.resource} is ${o.count} (warning at ${CLUSTER_THRESHOLDS.objectCountWarning})`,
+      ],
       hint: "Large object counts slow down the API server and fill etcd. Look for a controller or job that creates objects without cleaning them up.",
     });
   }
@@ -126,11 +134,11 @@ export function webhookIssues(w: WebhookSummary): Issue[] {
 const COMPONENT_HINTS: Record<string, string> = {
   "kube-apiserver":
     "Check the kube-apiserver logs and etcd health (k8s_cluster_health). A readiness probe answering HTTP 500 means one of its /readyz checks failed, often etcd. Also check CPU and memory pressure on the control-plane node.",
-  etcd: "Check the etcd logs for slow disk warnings (\"apply request took too long\"), leader elections or a NOSPACE alarm. etcd needs fast, uncontended disks.",
+  etcd: 'Check the etcd logs for slow disk warnings ("apply request took too long"), leader elections or a NOSPACE alarm. etcd needs fast, uncontended disks.',
   "kube-scheduler":
-    "The scheduler exits when it loses leader election, usually because the API server or etcd was slow or unavailable. Check its previous logs for \"leaderelection lost\", then check kube-apiserver health first.",
+    'The scheduler exits when it loses leader election, usually because the API server or etcd was slow or unavailable. Check its previous logs for "leaderelection lost", then check kube-apiserver health first.',
   "kube-controller-manager":
-    "The controller-manager exits when it loses leader election, usually because the API server or etcd was slow or unavailable. Check its previous logs for \"leaderelection lost\", then check kube-apiserver health first.",
+    'The controller-manager exits when it loses leader election, usually because the API server or etcd was slow or unavailable. Check its previous logs for "leaderelection lost", then check kube-apiserver health first.',
 };
 
 /** Whole minutes since `iso`, for messages. */
@@ -150,14 +158,26 @@ export function controlPlanePodIssues(pods: ControlPlanePod[], now: Date, window
     const recentRestart =
       pod.lastRestart && minutesAgo(pod.lastRestart.finishedAt, now) <= windowMinutes ? pod.lastRestart : undefined;
     const probes =
-      pod.probeFailures && pod.probeFailures.count >= CLUSTER_THRESHOLDS.probeFailureWarning ? pod.probeFailures : undefined;
+      pod.probeFailures && pod.probeFailures.count >= CLUSTER_THRESHOLDS.probeFailureWarning
+        ? pod.probeFailures
+        : undefined;
     if (!down && !recentRestart && !probes) continue;
 
     const evidence: string[] = [];
-    if (down) evidence.push(`${pod.component} is ${pod.phase}${pod.stateReason ? ` (${pod.stateReason})` : ""} and not ready on node ${pod.nodeName ?? "?"}`);
+    if (down)
+      evidence.push(
+        `${pod.component} is ${pod.phase}${pod.stateReason ? ` (${pod.stateReason})` : ""} and not ready on node ${pod.nodeName ?? "?"}`,
+      );
     if (recentRestart) {
-      const how = [recentRestart.reason, recentRestart.exitCode !== undefined ? `exit code ${recentRestart.exitCode}` : undefined].filter(Boolean).join(", ");
-      evidence.push(`last restart ${minutesAgo(recentRestart.finishedAt, now)} min ago${how ? ` (${how})` : ""}; ${pod.restarts} restart(s) in total`);
+      const how = [
+        recentRestart.reason,
+        recentRestart.exitCode !== undefined ? `exit code ${recentRestart.exitCode}` : undefined,
+      ]
+        .filter(Boolean)
+        .join(", ");
+      evidence.push(
+        `last restart ${minutesAgo(recentRestart.finishedAt, now)} min ago${how ? ` (${how})` : ""}; ${pod.restarts} restart(s) in total`,
+      );
     }
     if (probes) {
       evidence.push(
@@ -165,7 +185,11 @@ export function controlPlanePodIssues(pods: ControlPlanePod[], now: Date, window
       );
     }
 
-    const category = down ? "controlplane-pod-down" : recentRestart ? "controlplane-restart" : "controlplane-probe-failures";
+    const category = down
+      ? "controlplane-pod-down"
+      : recentRestart
+        ? "controlplane-restart"
+        : "controlplane-probe-failures";
     const title = down
       ? `Control-plane component ${pod.component} is not ready${pod.stateReason ? ` (${pod.stateReason})` : ""}`
       : recentRestart
@@ -186,4 +210,3 @@ export function controlPlanePodIssues(pods: ControlPlanePod[], now: Date, window
   }
   return issues;
 }
-

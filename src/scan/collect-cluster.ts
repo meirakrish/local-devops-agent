@@ -45,7 +45,9 @@ export function summarizeControlPlanePods(
         return e.involvedObject.name === name && seen !== undefined && Date.parse(seen) >= cutoff;
       });
       const latest = [...recent].sort((a, b) => (eventLastSeen(b) ?? "").localeCompare(eventLastSeen(a) ?? ""))[0];
-      const kinds = [...new Set(recent.map((e) => /^(\w+) probe failed/.exec(e.message ?? "")?.[1]).filter((k): k is string => !!k))];
+      const kinds = [
+        ...new Set(recent.map((e) => /^(\w+) probe failed/.exec(e.message ?? "")?.[1]).filter((k): k is string => !!k)),
+      ];
 
       return {
         name,
@@ -56,7 +58,11 @@ export function summarizeControlPlanePods(
         stateReason: current?.waiting?.reason ?? current?.terminated?.reason,
         restarts: statuses.reduce((sum, c) => sum + (c.restartCount ?? 0), 0),
         lastRestart: restarted
-          ? { finishedAt: new Date(restarted.finishedAt!).toISOString(), reason: restarted.reason, exitCode: restarted.exitCode }
+          ? {
+              finishedAt: new Date(restarted.finishedAt!).toISOString(),
+              reason: restarted.reason,
+              exitCode: restarted.exitCode,
+            }
           : undefined,
         probeFailures: latest
           ? {
@@ -116,7 +122,9 @@ export async function collectControlPlane(
     }
     summary.certificate = version.value.peerCertificate;
   } else {
-    notVisible.push(`API server version: ${version.status === "fulfilled" ? rawProblem(version.value.status) : k8sErrorMessage(version.reason)}`);
+    notVisible.push(
+      `API server version: ${version.status === "fulfilled" ? rawProblem(version.value.status) : k8sErrorMessage(version.reason)}`,
+    );
   }
   if (!summary.certificate && version.status === "fulfilled") {
     notVisible.push("API server certificate: not available (plain HTTP or a proxy in between)");
@@ -128,7 +136,9 @@ export async function collectControlPlane(
     if (checks.length > 0) summary.readyz = checks;
     else notVisible.push("API server health checks: unexpected /readyz output");
   } else {
-    notVisible.push(`API server health checks: ${readyz.status === "fulfilled" ? rawProblem(readyz.value.status) : k8sErrorMessage(readyz.reason)}`);
+    notVisible.push(
+      `API server health checks: ${readyz.status === "fulfilled" ? rawProblem(readyz.value.status) : k8sErrorMessage(readyz.reason)}`,
+    );
   }
 
   if (metrics.status === "fulfilled" && metrics.value.status === 200) {
@@ -150,7 +160,9 @@ export async function collectControlPlane(
       notVisible.push("etcd size: not exposed by this API server (managed control plane?)");
     }
   } else {
-    notVisible.push(`etcd size and object counts: /metrics ${metrics.status === "fulfilled" ? rawProblem(metrics.value.status) : k8sErrorMessage(metrics.reason)}`);
+    notVisible.push(
+      `etcd size and object counts: /metrics ${metrics.status === "fulfilled" ? rawProblem(metrics.value.status) : k8sErrorMessage(metrics.reason)}`,
+    );
   }
   return summary;
 }
@@ -198,8 +210,12 @@ export async function collectWebhooks(k8s: K8sClients): Promise<WebhookSummary[]
     k8s.admission.listMutatingWebhookConfiguration(),
   ]);
   const entries = [
-    ...validating.items.flatMap((c) => (c.webhooks ?? []).map((w) => ({ kind: "Validating" as const, config: c.metadata?.name ?? "?", w }))),
-    ...mutating.items.flatMap((c) => (c.webhooks ?? []).map((w) => ({ kind: "Mutating" as const, config: c.metadata?.name ?? "?", w }))),
+    ...validating.items.flatMap((c) =>
+      (c.webhooks ?? []).map((w) => ({ kind: "Validating" as const, config: c.metadata?.name ?? "?", w })),
+    ),
+    ...mutating.items.flatMap((c) =>
+      (c.webhooks ?? []).map((w) => ({ kind: "Mutating" as const, config: c.metadata?.name ?? "?", w })),
+    ),
   ];
 
   // Several webhooks often share one Service; check each Service once.
@@ -241,7 +257,11 @@ export async function collectWebhooks(k8s: K8sClients): Promise<WebhookSummary[]
       const svc = w.clientConfig.service;
       const base = { kind, configName: config, name: w.name, failurePolicy: w.failurePolicy ?? "Fail" };
       if (!svc) return { ...base, status: "external" as const, detail: "URL-based webhook; reachability not checked" };
-      return { ...base, service: { namespace: svc.namespace, name: svc.name }, ...(await checkService(svc.namespace, svc.name)) };
+      return {
+        ...base,
+        service: { namespace: svc.namespace, name: svc.name },
+        ...(await checkService(svc.namespace, svc.name)),
+      };
     }),
   );
 }

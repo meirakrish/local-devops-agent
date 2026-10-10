@@ -4,7 +4,18 @@
  */
 
 const BINARY: Record<string, number> = { Ki: 2 ** 10, Mi: 2 ** 20, Gi: 2 ** 30, Ti: 2 ** 40, Pi: 2 ** 50, Ei: 2 ** 60 };
-const DECIMAL: Record<string, number> = { n: 1e-9, u: 1e-6, m: 1e-3, "": 1, k: 1e3, M: 1e6, G: 1e9, T: 1e12, P: 1e15, E: 1e18 };
+const DECIMAL: Record<string, number> = {
+  n: 1e-9,
+  u: 1e-6,
+  m: 1e-3,
+  "": 1,
+  k: 1e3,
+  M: 1e6,
+  G: 1e9,
+  T: 1e12,
+  P: 1e15,
+  E: 1e18,
+};
 
 export function parseQuantity(q: string | undefined): number | undefined {
   if (!q) return undefined;

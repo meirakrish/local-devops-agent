@@ -52,7 +52,9 @@ export function deploymentIssues(d: DeploymentSummary): Issue[] {
       title: `Deployment ${d.namespace}/${d.name} has ${d.ready}/${d.desired} replicas ready`,
       evidence: [
         `desired=${d.desired} ready=${d.ready} available=${d.available} updated=${d.updated}`,
-        ...(replicaFailure ? [`ReplicaFailure (${replicaFailure.reason ?? "?"}): ${replicaFailure.message ?? ""}`] : []),
+        ...(replicaFailure
+          ? [`ReplicaFailure (${replicaFailure.reason ?? "?"}): ${replicaFailure.message ?? ""}`]
+          : []),
       ],
       hint: replicaFailure
         ? "Its pods cannot be created; the ReplicaSet's FailedCreate events say why (quota, Pod Security, admission webhook)."
@@ -67,12 +69,16 @@ export function workloadIssues(w: WorkloadSummary): Issue[] {
   if (w.desired === 0 || w.ready >= w.desired) return [];
   const evidence = [`desired=${w.desired} ready=${w.ready} updated=${w.updated}`];
   if (w.kind === "StatefulSet" && w.updateRevision && w.currentRevision !== w.updateRevision) {
-    evidence.push(`rollout in progress: ${w.updated}/${w.desired} pods on revision ${w.updateRevision} (current ${w.currentRevision ?? "?"})`);
+    evidence.push(
+      `rollout in progress: ${w.updated}/${w.desired} pods on revision ${w.updateRevision} (current ${w.currentRevision ?? "?"})`,
+    );
   }
   const hint =
     w.kind === "DaemonSet"
       ? "A DaemonSet runs one pod per eligible node. Find the nodes without a ready pod (k8s_get_workload lists the pods with their nodes): either the pod there is failing, or the node has a problem (NotReady, pressure, taints)." +
-        (w.namespace === "kube-system" ? " In kube-system this is often the CNI or kube-proxy, so pods on those nodes may lose networking." : "")
+        (w.namespace === "kube-system"
+          ? " In kube-system this is often the CNI or kube-proxy, so pods on those nodes may lose networking."
+          : "")
       : "StatefulSet pods start one at a time, in order, so one failing pod blocks the ones after it. Start with the lowest-numbered pod that is not ready, and check that its PersistentVolumeClaim is Bound.";
   return [
     {
@@ -130,7 +136,10 @@ export function serviceIssues(svc: ServiceSummary, now: Date, graceMinutes = 5):
         category: "service-no-ready-endpoints",
         resource,
         title: `Service ${namespace}/${name} has no ready endpoints although ${readyPods.length} of its pods are ready`,
-        evidence: [`selector ${selector} matches: ${svc.pods.map(podState).join(", ")}`, `endpoints: ${svc.readyEndpoints} ready, ${svc.notReadyEndpoints} not ready`],
+        evidence: [
+          `selector ${selector} matches: ${svc.pods.map(podState).join(", ")}`,
+          `endpoints: ${svc.readyEndpoints} ready, ${svc.notReadyEndpoints} not ready`,
+        ],
         hint: "The endpoint controller (part of kube-controller-manager) may be behind or down; check control-plane health.",
         workload,
       },
@@ -143,7 +152,9 @@ export function serviceIssues(svc: ServiceSummary, now: Date, graceMinutes = 5):
       category: "service-no-ready-endpoints",
       resource,
       title: `Service ${namespace}/${name} has no ready endpoints: none of its ${svc.pods.length} pod(s) is ready`,
-      evidence: [`selector ${selector} matches ${svc.pods.length} pod(s), none ready: ${svc.pods.map(podState).join(", ")}`],
+      evidence: [
+        `selector ${selector} matches ${svc.pods.length} pod(s), none ready: ${svc.pods.map(podState).join(", ")}`,
+      ],
       hint: "Requests to this Service fail until at least one of its pods passes its readiness probe. The cause is in the pods; see the pod issues of the same workload.",
       workload,
     },
@@ -155,7 +166,10 @@ export function dnsIssues(dns: DnsSummary): Issue[] {
   const svc = dns.service;
   if (!svc) return [];
   const resource = { kind: "Service", namespace: svc.namespace, name: svc.name };
-  const pods = svc.pods.length > 0 ? svc.pods.map(podState).join(", ") : `none (selector ${formatLabels(svc.selector)} matches no running pods)`;
+  const pods =
+    svc.pods.length > 0
+      ? svc.pods.map(podState).join(", ")
+      : `none (selector ${formatLabels(svc.selector)} matches no running pods)`;
   const workload = singleWorkload(svc.namespace, svc.pods);
   const total = svc.readyEndpoints + svc.notReadyEndpoints;
 
@@ -255,7 +269,9 @@ export function podCreateFailureIssues(events: EventSummary[]): Issue[] {
       resource: { kind, namespace, name },
       title: `${kind} ${namespace}/${name} cannot create pods: ${cause?.label ?? "the API server rejected them"}`,
       evidence: [`FailedCreate x${count}, last at ${latest.lastSeen ?? "?"}: ${message.slice(0, 500)}`],
-      hint: cause?.hint ?? "The event message says why the API server rejected the pod; fix the pod template or the policy it violates.",
+      hint:
+        cause?.hint ??
+        "The event message says why the API server rejected the pod; fix the pod template or the policy it violates.",
       workload: `${namespace}/${kind === "ReplicaSet" ? deploymentOfReplicaSet(name) : name}`,
     };
   });

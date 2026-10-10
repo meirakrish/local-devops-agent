@@ -88,9 +88,7 @@ describe("pod rules", () => {
     const [issue] = issuesFor(
       pod({
         phase: "Pending",
-        containerStatuses: [
-          container({ state: { waiting: { reason: "ImagePullBackOff", message: "not found" } } }),
-        ],
+        containerStatuses: [container({ state: { waiting: { reason: "ImagePullBackOff", message: "not found" } } })],
       }),
     );
     expect(issue?.category).toBe("image-pull");
@@ -135,14 +133,35 @@ describe("pod rules", () => {
 
   describe("unschedulable capacity check", () => {
     const nodes = [
-      { name: "n1", ready: true, roles: ["worker"], pressures: [], unschedulable: false, allocatable: { cpu: "12", memory: "16Gi" } },
-      { name: "n2", ready: true, roles: ["worker"], pressures: [], unschedulable: false, allocatable: { cpu: "8", memory: "8Gi" } },
+      {
+        name: "n1",
+        ready: true,
+        roles: ["worker"],
+        pressures: [],
+        unschedulable: false,
+        allocatable: { cpu: "12", memory: "16Gi" },
+      },
+      {
+        name: "n2",
+        ready: true,
+        roles: ["worker"],
+        pressures: [],
+        unschedulable: false,
+        allocatable: { cpu: "8", memory: "8Gi" },
+      },
     ];
     const pendingPod = (cpu: string) =>
       summarizePod({
         ...pod({
           phase: "Pending",
-          conditions: [{ type: "PodScheduled", status: "False", reason: "Unschedulable", message: "0/2 nodes are available: 2 Insufficient cpu." }],
+          conditions: [
+            {
+              type: "PodScheduled",
+              status: "False",
+              reason: "Unschedulable",
+              message: "0/2 nodes are available: 2 Insufficient cpu.",
+            },
+          ],
         }),
         spec: { containers: [{ name: "app", resources: { requests: { cpu } } }] },
       });
@@ -195,9 +214,7 @@ describe("pod rules", () => {
 
   it("ignores healthy and completed pods", () => {
     expect(
-      issuesFor(
-        pod({ phase: "Running", containerStatuses: [container({ ready: true, state: { running: {} } })] }),
-      ),
+      issuesFor(pod({ phase: "Running", containerStatuses: [container({ ready: true, state: { running: {} } })] })),
     ).toEqual([]);
     expect(issuesFor(pod({ phase: "Succeeded" }))).toEqual([]);
   });
@@ -212,7 +229,12 @@ describe("node rules", () => {
 
   it("flags NotReady nodes and pressure conditions", () => {
     const issues = nodeIssues(
-      summarizeNode(node([{ type: "Ready", status: "False" }, { type: "MemoryPressure", status: "True" }])),
+      summarizeNode(
+        node([
+          { type: "Ready", status: "False" },
+          { type: "MemoryPressure", status: "True" },
+        ]),
+      ),
     );
     expect(issues.map((i) => [i.category, i.severity])).toEqual([
       ["node-not-ready", "critical"],
@@ -233,9 +255,7 @@ describe("deployment rules", () => {
     spec: { replicas, selector: {}, template: {} },
     status: {
       readyReplicas: ready,
-      conditions: progressingReason
-        ? [{ type: "Progressing", status: "False", reason: progressingReason }]
-        : [],
+      conditions: progressingReason ? [{ type: "Progressing", status: "False", reason: progressingReason }] : [],
     },
   });
 
@@ -256,7 +276,14 @@ describe("deployment rules", () => {
 
   it("points at FailedCreate when the ReplicaSet cannot create pods", () => {
     const d = deployment(1, 0);
-    d.status!.conditions = [{ type: "ReplicaFailure", status: "True", reason: "FailedCreate", message: 'pods "api-1" is forbidden: exceeded quota' }];
+    d.status!.conditions = [
+      {
+        type: "ReplicaFailure",
+        status: "True",
+        reason: "FailedCreate",
+        message: 'pods "api-1" is forbidden: exceeded quota',
+      },
+    ];
     const [issue] = deploymentIssues(summarizeDeployment(d));
     expect(issue?.evidence[1]).toBe('ReplicaFailure (FailedCreate): pods "api-1" is forbidden: exceeded quota');
     expect(issue?.hint).toContain("FailedCreate events");
@@ -275,7 +302,10 @@ describe("detectIssues", () => {
         summarizePod(pod({ phase: "Pending" }, { name: "a-old-pending", createdMinutesAgo: 30 })),
         summarizePod(
           pod(
-            { phase: "Running", containerStatuses: [container({ state: { waiting: { reason: "CrashLoopBackOff" } } })] },
+            {
+              phase: "Running",
+              containerStatuses: [container({ state: { waiting: { reason: "CrashLoopBackOff" } } })],
+            },
             { name: "z-crash" },
           ),
         ),

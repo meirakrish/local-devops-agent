@@ -91,7 +91,13 @@ export function fallbackTriage(issues: Issue[], maxProblems: number): Problem[] 
     if (used.has(issue.id)) continue;
     const group = candidates.filter((i) => !used.has(i.id) && groupKey(i) === groupKey(issue));
     group.forEach((i) => used.add(i.id));
-    problems.push(makeProblem(issue, group.filter((i) => i !== issue), "fallback: rule-based grouping"));
+    problems.push(
+      makeProblem(
+        issue,
+        group.filter((i) => i !== issue),
+        "fallback: rule-based grouping",
+      ),
+    );
     if (problems.length >= maxProblems) break;
   }
   return problems;
@@ -186,7 +192,8 @@ export async function triage(
     const problems = buildProblems(result.problems, issues, maxProblems);
     if (problems.length > 0) {
       const completed = addMissedCritical(problems, issues, maxProblems);
-      if (completed.length > problems.length) log(`triage: added ${completed.length - problems.length} critical problem(s) the LLM left out`);
+      if (completed.length > problems.length)
+        log(`triage: added ${completed.length - problems.length} critical problem(s) the LLM left out`);
       return completed;
     }
     log("triage: LLM returned no usable problems, using fallback");

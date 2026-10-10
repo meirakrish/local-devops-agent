@@ -21,7 +21,13 @@ describe("raw path guard", () => {
   it("allows only the health, version and metrics endpoints", () => {
     expect(checkRawPath("/readyz?verbose")).toBe("/readyz?verbose");
     expect(checkRawPath("/version")).toBe("/version");
-    for (const bad of ["/api/v1/secrets", "/readyz/../api/v1/secrets", "https://evil.example/readyz", "/metricsX", "/"]) {
+    for (const bad of [
+      "/api/v1/secrets",
+      "/readyz/../api/v1/secrets",
+      "https://evil.example/readyz",
+      "/metricsX",
+      "/",
+    ]) {
       expect(() => checkRawPath(bad)).toThrow(RawPathNotAllowedError);
     }
   });
@@ -36,7 +42,9 @@ describe("parsers", () => {
   });
 
   it("parses failing checks and their reason", () => {
-    const checks = parseHealthChecks("[+]ping ok\n[-]etcd failed: reason withheld\n[-]informer-sync failed\nreadyz check failed\n");
+    const checks = parseHealthChecks(
+      "[+]ping ok\n[-]etcd failed: reason withheld\n[-]informer-sync failed\nreadyz check failed\n",
+    );
     expect(checks).toEqual([
       { name: "ping", ok: true, reason: undefined },
       { name: "etcd", ok: false, reason: "reason withheld" },
@@ -65,7 +73,9 @@ describe("parsers", () => {
   });
 
   it("reads the etcd quota flag and versions", () => {
-    expect(etcdQuotaFromArgs(["etcd", "--data-dir=/var/lib/etcd", "--quota-backend-bytes=8589934592"])).toBe(8589934592);
+    expect(etcdQuotaFromArgs(["etcd", "--data-dir=/var/lib/etcd", "--quota-backend-bytes=8589934592"])).toBe(
+      8589934592,
+    );
     expect(etcdQuotaFromArgs(["etcd"])).toBeUndefined();
     expect(parseMinorVersion("v1.30.4-eks-a737599")).toEqual({ major: 1, minor: 30 });
     expect(parseMinorVersion("garbage")).toBeUndefined();
@@ -98,7 +108,13 @@ describe("control plane rules", () => {
 
   it("grades certificate expiry", () => {
     const expiring = (days: number) =>
-      controlPlaneIssues({ ...healthy, certificate: { ...healthy.certificate!, notAfter: new Date(NOW.getTime() + days * 86_400_000).toISOString() } }, NOW);
+      controlPlaneIssues(
+        {
+          ...healthy,
+          certificate: { ...healthy.certificate!, notAfter: new Date(NOW.getTime() + days * 86_400_000).toISOString() },
+        },
+        NOW,
+      );
     expect(expiring(60)).toEqual([]);
     expect(expiring(20)[0]?.severity).toBe("warning");
     expect(expiring(3)[0]?.severity).toBe("critical");
@@ -106,7 +122,8 @@ describe("control plane rules", () => {
   });
 
   it("grades etcd size against the quota and says when the quota is assumed", () => {
-    const withSize = (bytes: number) => controlPlaneIssues({ ...healthy, etcd: { ...healthy.etcd!, dbSizeBytes: bytes } }, NOW);
+    const withSize = (bytes: number) =>
+      controlPlaneIssues({ ...healthy, etcd: { ...healthy.etcd!, dbSizeBytes: bytes } }, NOW);
     expect(withSize(1.0 * 1024 ** 3)).toEqual([]);
     const warn = withSize(1.5 * 1024 ** 3)[0];
     expect(warn?.severity).toBe("warning");
@@ -117,7 +134,16 @@ describe("control plane rules", () => {
 
   it("warns about very large object counts", () => {
     const issues = controlPlaneIssues(
-      { ...healthy, etcd: { ...healthy.etcd!, objectCounts: [{ resource: "events", count: 250_000 }, { resource: "pods", count: 40 }] } },
+      {
+        ...healthy,
+        etcd: {
+          ...healthy.etcd!,
+          objectCounts: [
+            { resource: "events", count: 250_000 },
+            { resource: "pods", count: 40 },
+          ],
+        },
+      },
       NOW,
     );
     expect(issues.map((i) => i.id)).toEqual(["controlplane/etcd:objects-events"]);
@@ -142,13 +168,21 @@ describe("node capacity rules", () => {
   });
 
   it("flags a stale kubelet heartbeat", () => {
-    const [issue] = nodeCapacityIssues({ ...node, heartbeat: new Date(NOW.getTime() - 300_000).toISOString() }, NOW, "v1.37.0");
+    const [issue] = nodeCapacityIssues(
+      { ...node, heartbeat: new Date(NOW.getTime() - 300_000).toISOString() },
+      NOW,
+      "v1.37.0",
+    );
     expect(issue?.category).toBe("node-heartbeat");
     expect(issue?.title).toContain("300s");
   });
 
   it("flags nodes whose requests are nearly at allocatable", () => {
-    const [issue] = nodeCapacityIssues({ ...node, requested: { cpu: 3.8, memory: 2 * 1024 ** 3, pods: 105 } }, NOW, "v1.37.0");
+    const [issue] = nodeCapacityIssues(
+      { ...node, requested: { cpu: 3.8, memory: 2 * 1024 ** 3, pods: 105 } },
+      NOW,
+      "v1.37.0",
+    );
     expect(issue?.category).toBe("node-capacity");
     expect(issue?.title).toBe("Node worker-1 is nearly full (cpu 95%, pods 95% requested)");
     expect(issue?.evidence[0]).toBe("cpu: 3.8 requested of 4 allocatable");
@@ -156,8 +190,12 @@ describe("node capacity rules", () => {
 
   it("flags unsupported version skew in both directions", () => {
     expect(nodeCapacityIssues({ ...node, kubeletVersion: "v1.34.2" }, NOW, "v1.37.0")).toEqual([]); // 3 behind: supported
-    expect(nodeCapacityIssues({ ...node, kubeletVersion: "v1.33.0" }, NOW, "v1.37.0")[0]?.title).toContain("4 minor versions behind");
-    expect(nodeCapacityIssues({ ...node, kubeletVersion: "v1.38.0" }, NOW, "v1.37.0")[0]?.title).toContain("newer than the API server");
+    expect(nodeCapacityIssues({ ...node, kubeletVersion: "v1.33.0" }, NOW, "v1.37.0")[0]?.title).toContain(
+      "4 minor versions behind",
+    );
+    expect(nodeCapacityIssues({ ...node, kubeletVersion: "v1.38.0" }, NOW, "v1.37.0")[0]?.title).toContain(
+      "newer than the API server",
+    );
   });
 });
 

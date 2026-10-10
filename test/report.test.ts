@@ -15,9 +15,7 @@ const overview: ClusterOverview = {
   services: [],
   dns: {},
   podCreateFailures: [],
-  warningEvents: [
-    { involvedKind: "Node", involvedName: "n1", reason: "Rebooted", message: "a | b", count: 1 },
-  ],
+  warningEvents: [{ involvedKind: "Node", involvedName: "n1", reason: "Rebooted", message: "a | b", count: 1 }],
   controlPlane: { notVisible: [] },
   webhooks: [],
   errors: ["list nodes: forbidden (check RBAC permissions)"],
@@ -53,13 +51,26 @@ describe("report", () => {
 
 describe("report: workload, service and DNS rows", () => {
   it("counts healthy workloads, Services without endpoints and DNS endpoints", () => {
-    const svc = { namespace: "shop", name: "web", type: "ClusterIP", selector: { app: "web" }, readyEndpoints: 0, notReadyEndpoints: 1, pods: [], podLabelValues: {} };
+    const svc = {
+      namespace: "shop",
+      name: "web",
+      type: "ClusterIP",
+      selector: { app: "web" },
+      readyEndpoints: 0,
+      notReadyEndpoints: 1,
+      pods: [],
+      podLabelValues: {},
+    };
     const md = renderMarkdownReport({
       overview: {
         ...overview,
-        workloads: [{ kind: "DaemonSet", namespace: "kube-system", name: "kube-proxy", desired: 2, ready: 1, updated: 2 }],
+        workloads: [
+          { kind: "DaemonSet", namespace: "kube-system", name: "kube-proxy", desired: 2, ready: 1, updated: 2 },
+        ],
         services: [svc, { ...svc, name: "api", readyEndpoints: 2, notReadyEndpoints: 0 }],
-        dns: { service: { ...svc, namespace: "kube-system", name: "kube-dns", readyEndpoints: 2, notReadyEndpoints: 0 } },
+        dns: {
+          service: { ...svc, namespace: "kube-system", name: "kube-dns", readyEndpoints: 2, notReadyEndpoints: 0 },
+        },
       },
       issues: [],
     });
@@ -69,7 +80,10 @@ describe("report: workload, service and DNS rows", () => {
   });
 
   it("says when cluster DNS could not be checked", () => {
-    const md = renderMarkdownReport({ overview: { ...overview, dns: { notVisible: "no Service kube-system/kube-dns" } }, issues: [] });
+    const md = renderMarkdownReport({
+      overview: { ...overview, dns: { notVisible: "no Service kube-system/kube-dns" } },
+      issues: [],
+    });
     expect(md).toContain("| Cluster DNS | not visible |");
     expect(md).toContain("- Not checked: cluster DNS: no Service kube-system/kube-dns");
   });

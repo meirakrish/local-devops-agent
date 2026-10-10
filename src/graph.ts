@@ -161,10 +161,7 @@ export function buildGraph(deps: GraphDeps) {
     .addEdge(START, "scan")
     .addEdge(START, "checkLlm")
     .addEdge(["scan", "checkLlm"], "triage")
-    .addConditionalEdges("triage", (s) => (s.problems.length > 0 ? "investigate" : "report"), [
-      "investigate",
-      "report",
-    ])
+    .addConditionalEdges("triage", (s) => (s.problems.length > 0 ? "investigate" : "report"), ["investigate", "report"])
     .addEdge("investigate", "report")
     .addEdge("report", END)
     .compile();

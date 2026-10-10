@@ -42,8 +42,7 @@ function containerFindings(c: ContainerSummary, restartThreshold: number): PodFi
 
   // A crashlooping container cycles waiting(CrashLoopBackOff) -> running -> terminated(Error),
   // so a scan can catch it in the terminated phase too.
-  const crashedAfterRestarts =
-    c.state === "terminated" && !c.init && c.restarts > 0 && (c.exitCode ?? 0) !== 0;
+  const crashedAfterRestarts = c.state === "terminated" && !c.init && c.restarts > 0 && (c.exitCode ?? 0) !== 0;
 
   if ((c.state === "waiting" && c.reason === "CrashLoopBackOff") || crashedAfterRestarts) {
     const last = c.lastTerminationReason
@@ -128,9 +127,7 @@ export function podIssues(pod: PodSummary, opts: PodRuleOptions): Issue[] {
 
   const grace = opts.gracePeriodMinutes ?? 5;
   const oldEnough = minutesSince(pod.createdAt, opts.now) >= grace;
-  const findings: PodFinding[] = pod.containers.flatMap((c) =>
-    containerFindings(c, opts.restartThreshold),
-  );
+  const findings: PodFinding[] = pod.containers.flatMap((c) => containerFindings(c, opts.restartThreshold));
 
   if (pod.phase === "Pending" && pod.unschedulable) {
     const message = pod.unschedulable.message ?? pod.unschedulable.reason ?? "unknown reason";
@@ -168,12 +165,7 @@ export function podIssues(pod: PodSummary, opts: PodRuleOptions): Issue[] {
     });
   }
 
-  if (
-    pod.phase === "Running" &&
-    oldEnough &&
-    findings.length === 0 &&
-    pod.readyContainers < pod.totalContainers
-  ) {
+  if (pod.phase === "Running" && oldEnough && findings.length === 0 && pod.readyContainers < pod.totalContainers) {
     findings.push({
       severity: "warning",
       category: "not-ready",

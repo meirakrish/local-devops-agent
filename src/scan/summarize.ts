@@ -44,9 +44,7 @@ export function summarizeNode(node: V1Node): NodeSummary {
     readyMessage: readyCond?.status === "True" ? undefined : readyCond?.message,
     roles: roles.length > 0 ? roles : ["worker"],
     kubeletVersion: node.status?.nodeInfo?.kubeletVersion,
-    pressures: conditions
-      .filter((c) => PRESSURE_CONDITIONS.includes(c.type) && c.status === "True")
-      .map((c) => c.type),
+    pressures: conditions.filter((c) => PRESSURE_CONDITIONS.includes(c.type) && c.status === "True").map((c) => c.type),
     unschedulable: node.spec?.unschedulable === true,
     allocatable: { cpu: alloc["cpu"], memory: alloc["memory"], pods: alloc["pods"] },
   };
@@ -75,8 +73,7 @@ function summarizeContainer(cs: V1ContainerStatus, init: boolean): ContainerSumm
  */
 export function podRequests(containers: V1Container[], initContainers: V1Container[] = []) {
   const total = (resource: "cpu" | "memory") => {
-    const values = (list: V1Container[]) =>
-      list.map((c) => parseQuantity(c.resources?.requests?.[resource]));
+    const values = (list: V1Container[]) => list.map((c) => parseQuantity(c.resources?.requests?.[resource]));
     const app = values(containers);
     const init = values(initContainers);
     if ([...app, ...init].every((v) => v === undefined)) return undefined;
@@ -147,10 +144,7 @@ export function summarizePod(pod: V1Pod): PodSummary {
     restarts: containers.reduce((sum, c) => sum + c.restarts, 0),
     containers,
     requests: podRequests(pod.spec?.containers ?? [], pod.spec?.initContainers ?? []),
-    unschedulable:
-      scheduled?.status === "False"
-        ? { reason: scheduled.reason, message: scheduled.message }
-        : undefined,
+    unschedulable: scheduled?.status === "False" ? { reason: scheduled.reason, message: scheduled.message } : undefined,
   };
 }
 
@@ -219,7 +213,9 @@ export function summarizeService(svc: V1Service, slices: V1EndpointSlice[], pods
   const podLabelValues = Object.fromEntries(
     Object.keys(selector).map((k) => [
       k,
-      [...new Set(live.map((p) => p.metadata?.labels?.[k]).filter((v): v is string => v !== undefined))].sort().slice(0, 10),
+      [...new Set(live.map((p) => p.metadata?.labels?.[k]).filter((v): v is string => v !== undefined))]
+        .sort()
+        .slice(0, 10),
     ]),
   );
 
@@ -248,9 +244,7 @@ export function summarizeService(svc: V1Service, slices: V1EndpointSlice[], pods
 
 /** Best-effort "last seen" time; different event sources fill different fields. */
 export function eventLastSeen(e: CoreV1Event): string | undefined {
-  return toIso(
-    e.series?.lastObservedTime ?? e.lastTimestamp ?? e.eventTime ?? e.metadata?.creationTimestamp,
-  );
+  return toIso(e.series?.lastObservedTime ?? e.lastTimestamp ?? e.eventTime ?? e.metadata?.creationTimestamp);
 }
 
 export function summarizeEvent(e: CoreV1Event): EventSummary {

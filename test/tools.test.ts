@@ -115,9 +115,7 @@ describe("k8s tools", () => {
 
   it("get_logs includes the previous run automatically for a restarted container", async () => {
     const logCalls: { previous?: boolean }[] = [];
-    const out = String(
-      await getTool(fakeK8s(logCalls), "k8s_get_logs").invoke({ namespace: "shop", pod: "web-1" }),
-    );
+    const out = String(await getTool(fakeK8s(logCalls), "k8s_get_logs").invoke({ namespace: "shop", pod: "web-1" }));
     expect(logCalls.map((c) => c.previous)).toEqual([true, false]);
     expect(out).toContain("=== previous run of app");
     expect(out).toContain("FATAL: DATABASE_URL is not set");
@@ -147,9 +145,7 @@ describe("k8s tools", () => {
         ],
       },
     });
-    const out = String(
-      await getTool(k8s, "k8s_get_logs").invoke({ namespace: "shop", pod: "web-1", previous: true }),
-    );
+    const out = String(await getTool(k8s, "k8s_get_logs").invoke({ namespace: "shop", pod: "web-1", previous: true }));
     expect(out).toContain("unable to retrieve container logs");
     expect(out).toContain("current run of app, already exited with code 1");
     expect(out).toContain("previous run's logs are not available");
@@ -190,7 +186,9 @@ describe("service and workload tools", () => {
     spec: { containers: [{ name: "nginx", ports: [{ containerPort: 80, name: "http" }] }] },
     status: {
       phase: "Running",
-      containerStatuses: [{ name: "nginx", image: "nginx", imageID: "", ready: true, restartCount: 0, state: { running: {} } }],
+      containerStatuses: [
+        { name: "nginx", image: "nginx", imageID: "", ready: true, restartCount: 0, state: { running: {} } },
+      ],
     },
   };
 
@@ -207,7 +205,12 @@ describe("service and workload tools", () => {
   }
 
   it("get_service shows the label values pods have when the selector matches none", async () => {
-    const out = String(await getTool(serviceK8s({ app: "fronted" }, 80), "k8s_get_service").invoke({ namespace: "shop", name: "frontend" }));
+    const out = String(
+      await getTool(serviceK8s({ app: "fronted" }, 80), "k8s_get_service").invoke({
+        namespace: "shop",
+        name: "frontend",
+      }),
+    );
     expect(out).toContain("Selector: app=fronted");
     expect(out).toContain("Endpoints: 0 ready, 0 not ready");
     expect(out).toContain("Pods matching the selector: (none)");
@@ -215,10 +218,20 @@ describe("service and workload tools", () => {
   });
 
   it("get_service notes a targetPort that no container declares", async () => {
-    const out = String(await getTool(serviceK8s({ app: "frontend" }, 8080), "k8s_get_service").invoke({ namespace: "shop", name: "frontend" }));
+    const out = String(
+      await getTool(serviceK8s({ app: "frontend" }, 8080), "k8s_get_service").invoke({
+        namespace: "shop",
+        name: "frontend",
+      }),
+    );
     expect(out).toContain("- shop/frontend-1 Running ready=1/1");
     expect(out).toContain("Note: targetPort 8080 of port 80 is not a declared container port");
-    const named = String(await getTool(serviceK8s({ app: "frontend" }, "http"), "k8s_get_service").invoke({ namespace: "shop", name: "frontend" }));
+    const named = String(
+      await getTool(serviceK8s({ app: "frontend" }, "http"), "k8s_get_service").invoke({
+        namespace: "shop",
+        name: "frontend",
+      }),
+    );
     expect(named).not.toContain("Note:");
   });
 
@@ -227,8 +240,18 @@ describe("service and workload tools", () => {
     const apps = {
       readNamespacedDaemonSet: async () => ({
         metadata: { name: "log-agent", namespace: "ops" },
-        spec: { selector: { matchLabels: { app: "log-agent" } }, template: { spec: { containers: [{ name: "agent", image: "agent:1" }] } } },
-        status: { desiredNumberScheduled: 2, currentNumberScheduled: 2, numberReady: 1, updatedNumberScheduled: 2, numberAvailable: 1, numberMisscheduled: 0 },
+        spec: {
+          selector: { matchLabels: { app: "log-agent" } },
+          template: { spec: { containers: [{ name: "agent", image: "agent:1" }] } },
+        },
+        status: {
+          desiredNumberScheduled: 2,
+          currentNumberScheduled: 2,
+          numberReady: 1,
+          updatedNumberScheduled: 2,
+          numberAvailable: 1,
+          numberMisscheduled: 0,
+        },
       }),
     };
     const core = {
@@ -237,14 +260,28 @@ describe("service and workload tools", () => {
         eventQueries.push(args);
         return {
           items: [
-            { metadata: {}, involvedObject: { kind: "DaemonSet", name: "log-agent", namespace: "ops" }, reason: "FailedCreate", message: "violates PodSecurity", count: 2 },
-            { metadata: {}, involvedObject: { kind: "DaemonSet", name: "other", namespace: "ops" }, reason: "FailedCreate", message: "unrelated", count: 1 },
+            {
+              metadata: {},
+              involvedObject: { kind: "DaemonSet", name: "log-agent", namespace: "ops" },
+              reason: "FailedCreate",
+              message: "violates PodSecurity",
+              count: 2,
+            },
+            {
+              metadata: {},
+              involvedObject: { kind: "DaemonSet", name: "other", namespace: "ops" },
+              reason: "FailedCreate",
+              message: "unrelated",
+              count: 1,
+            },
           ],
         };
       },
     };
     const k8s = { context: "test", core, apps } as unknown as K8sClients;
-    const out = String(await getTool(k8s, "k8s_get_workload").invoke({ kind: "DaemonSet", namespace: "ops", name: "log-agent" }));
+    const out = String(
+      await getTool(k8s, "k8s_get_workload").invoke({ kind: "DaemonSet", namespace: "ops", name: "log-agent" }),
+    );
     expect(out).toContain("DaemonSet ops/log-agent");
     expect(out).toContain("Pods: desired=2 current=2 ready=1");
     expect(out).toContain("DaemonSet/log-agent FailedCreate (x2): violates PodSecurity");
