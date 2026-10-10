@@ -40,8 +40,10 @@ $ pnpm demo:check --verbose
   not just by prompt instructions (see [Safety](#safety)).
 - **Works without the LLM:** if Ollama is down, or with `--no-llm`, you still get the
   rule-based report.
-- **Cron/CI friendly:** exits with code `2` when critical issues are found, writes a JSON
-  report, and with `--compare` shows what is new, escalated or resolved since the last run.
+- **Cron/CI friendly:** exits with code `2` when critical issues are found (or, with
+  `--fail-on new`, only new ones), writes a JSON report, shows what is new, escalated or
+  resolved since the last run (`--compare`), and checks several clusters in one run
+  (`--context`).
 - **One-command demo:** a kind cluster with deliberately broken workloads to try it on.
 
 ## Quickstart (about 5 minutes)
@@ -106,8 +108,8 @@ flowchart TD
         direction TB
         agent["agent<br/>chooses tool calls"] -->|"tool calls, budget left"| tools["tools<br/>run read-only tools"]
         tools -->|"budget left"| agent
-        agent -->|"no more tool calls"| conclude["conclude<br/>root cause, evidence,<br/>fix, confidence"]
-        tools -->|"budget used up"| conclude
+        agent -->|"no more tool calls"| conclude["conclude<br/>root cause, evidence, fix;<br/>confidence and fix checks in code"]
+        tools -->|"budget used up,<br/>or 2nd repeated call"| conclude
     end
 ```
 
@@ -232,6 +234,30 @@ several failure modes, and each fix moved responsibility from the prompt into co
 - **Mistakes go back to the model as messages.** Invalid arguments, unknown tools,
   repeated calls and API errors become tool messages the model can react to. They never
   crash the run.
+- **Repeated calls are free, but bounded.** The model often repeats a call it already
+  made (in one run, 3 of 6 steps went to the same `k8s_get_workload` call). A repeat is
+  not run and does not use a step. The reply says the result is already in the
+  conversation, lists the tools not used yet, and warns that the next repeat ends the
+  investigation. The second repeat goes straight to the conclusion, so repeats cost at
+  most two LLM turns and never the budget for real calls.
+- **Confidence is computed, not self-reported.** The model rates almost every finding
+  "high", so its rating is only an upper bound
+  ([`src/agent/confidence.ts`](src/agent/confidence.ts)). Each evidence point is checked
+  against the tool output of the investigation: at least half of its words must appear
+  within a few neighbouring lines, and every number in it must appear somewhere (this
+  catches a misread "1000m CPU" or an invented "80% utilization"). No evidence found, or
+  no tool data at all, means low. Medium when fewer than half of the evidence points are
+  found, when the root cause only restates the rule's own finding, or when the loop hit
+  the step limit. The report says why, for example
+  `Confidence: medium (root cause only restates the rule's finding; the model said high)`.
+- **Suspicious fix steps are marked, not dropped.** Concrete values in a fix (image
+  references, `kind/name`, namespaces, quantities like `64Mi`, env var values) that
+  appear nowhere in the tool output or the issues are marked
+  `_(unverified: ... does not appear in the cluster data)_`
+  ([`src/agent/fix-check.ts`](src/agent/fix-check.ts)). `kubectl delete`, `drain`,
+  `--force`, `--grace-period=0` and `--replicas=0` are marked destructive, and
+  `rollout undo` gets a note that it changes the cluster. Only values in a recognizable
+  form are checked, so generic advice and placeholders like `<your-image>` are not marked.
 - **Bounded output and context.** Tool output is truncated, keeping the head and the
   tail, since errors are usually at the end. Env var values are never shown, and the
   context window (`NUM_CTX`) is set explicitly. A prompt that does not fit is rejected
@@ -245,11 +271,15 @@ several failure modes, and each fix moved responsibility from the prompt into co
 
 ```text
 src/
-  cli.ts                CLI entry point: flags, output file, exit codes
+  cli.ts                CLI entry point: flags, contexts, output files, exit codes
+  cli-support.ts        Context list, {context} paths and the --fail-on decision
   config.ts             .env loading and validation (zod)
   graph.ts              Main LangGraph: scan, checkLlm, triage, investigate, report
   agent/triage.ts       LLM problem selection, plus a deterministic fallback
   agent/investigate.ts  Tool-calling loop (subgraph) and structured conclusion
+  agent/confidence.ts   Confidence computed from the evidence (model rating = upper bound)
+  agent/fix-check.ts    Marks fix steps with unverified values or destructive commands
+  agent/grounding.ts    Word-overlap matching of claims against tool output
   k8s/client.ts         Read-only Kubernetes client
   k8s/raw.ts            GET-only reader for /readyz, /livez, /version and /metrics
   k8s/errors.ts         Kubernetes API error helpers
@@ -331,7 +361,7 @@ change them:
 | --- | --- | --- |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama server URL |
 | `MODEL` | `qwen2.5:7b-instruct` | Model used for triage and investigation |
-| `KUBECONFIG` | _(empty)_ | Kubeconfig path; empty uses `$KUBECONFIG` or `~/.kube/config` |
+| `KUBECONFIG` | _(empty)_ | Kubeconfig path, or several separated by `:` (merged like kubectl); empty uses `$KUBECONFIG` or `~/.kube/config` |
 | `MAX_PROBLEMS` | `5` | Max problems the LLM investigates per run |
 | `MAX_STEPS_PER_PROBLEM` | `6` | Max tool calls per investigated problem |
 | `NUM_CTX` | `16384` | Ollama context window in tokens (see below) |
@@ -366,6 +396,8 @@ pnpm check
 | `-f, --format <format>` | Report format on stdout: `markdown` (default) or `json` |
 | `-o, --output <file>` | Also save the report to a file: JSON if the name ends in `.json`, markdown otherwise. Can be given more than once |
 | `-c, --compare <file>` | Compare with a previous JSON report and mark issues as new, escalated or resolved |
+| `--fail-on <when>` | Exit with `2` on any critical issue (`critical`, the default), or only on critical issues that are new or escalated since the `--compare` report (`new`) |
+| `--context <names>` | Check these kube contexts instead of the current one: comma-separated or repeated. With several, `--output` and `--compare` paths must contain `{context}` |
 | `-v, --verbose` | Log each step and every tool call to stderr |
 | `--no-llm` | Skip LLM triage and investigation (fast, rule-based report only) |
 | `-h, --help` | Show help |
@@ -376,8 +408,11 @@ captures only the report.
 | Exit code | Meaning |
 | --- | --- |
 | `0` | Healthy, or warnings only |
-| `2` | Critical issues found |
+| `2` | Critical issues found (with `--fail-on new`: new or escalated critical issues) |
 | `1` | The check itself failed (bad config, cluster unreachable, unknown namespace) |
+
+With several contexts, the exit code is `2` if any context meets `--fail-on`, otherwise `1`
+if any context could not be checked, otherwise `0`.
 
 ### Running on a schedule
 
@@ -396,8 +431,31 @@ with and says so in its notes.
 
 Issues are matched by a stable key, not by pod name: when a crashlooping pod is replaced by
 another crashlooping pod of the same workload, the issue stays "ongoing". Reports of a
-different kube context or `--namespace` are not compared. The exit code does not depend on
-the comparison; it still reflects all current issues.
+different kube context or `--namespace` are not compared.
+
+By default the exit code still reflects all current issues, so a cron job keeps alerting
+every hour while one known problem stays broken. With `--fail-on new` it exits with `2` only
+when a critical issue is new or escalated since the compared report. When there is nothing
+to compare with (the first run, or a report of another context), every critical issue
+counts as new, so an outage is never hidden:
+
+```cron
+0 * * * * cd /path/to/local-devops-agent && mkdir -p reports && pnpm -s check --fail-on new --compare reports/latest.json --output reports/latest.json --output "reports/$(date +\%F-\%H).md" > /dev/null 2>> reports/cron.log || logger "cluster check failed or found new critical issues"
+```
+
+To check several clusters, list their contexts with `--context`. They run one after
+another, each with its own report: stdout gets the markdown reports separated by `---` (or
+a JSON array with `--format json`), and `{context}` in a path becomes the context name,
+with characters like `:` and `/` replaced by `_`:
+
+```bash
+pnpm -s check --context staging,prod --fail-on new --compare "reports/{context}.json" --output "reports/{context}.json"
+```
+
+A context that cannot be checked (unreachable, unknown namespace) gets an error section in
+the output and does not stop the others. Its files are not overwritten, so the next
+`--compare` still has its last good report. `KUBECONFIG` may list several files separated by
+`:`, as with kubectl.
 
 Cron runs with a minimal `PATH`, so `pnpm` may not be found if Node was installed with
 nvm. Add a `PATH=...` line at the top of the crontab that includes the directory from
@@ -406,7 +464,9 @@ nvm. Add a `PATH=...` line at the top of the crontab that includes the directory
 In CI, run `pnpm -s check --no-llm` to fail a job on critical issues without needing a
 GPU. The rule-based report needs only cluster access. Add `--format json` (or
 `--output report.json`) for a machine-readable report: status, issue counts, the summary
-numbers, every issue with its evidence and key, the LLM findings, and scan notes.
+numbers, every issue with its evidence and key, the LLM findings (with the computed
+`confidence`, its `confidenceReason`, the `modelConfidence` and any `fixFlags`), and scan
+notes.
 
 ## Example report
 
@@ -480,7 +540,11 @@ _Confidence: high · 6 tool call(s)_
 
 All five root causes in this run are correct, but the details are not always right: the
 webhook finding's third evidence point is about other workloads in the namespace, not the
-webhook. See [Limitations](#limitations).
+webhook. This excerpt predates computed confidence; current reports give the reason
+after the level, for example
+`_Confidence: high (4 of 4 evidence point(s) found in tool output) · 3 tool call(s)_`,
+and mark fix steps such as `Increase the memory limit to at least 128Mi`
+with `` _(unverified: `128Mi` does not appear in the cluster data)_ ``. See [Limitations](#limitations).
 
 ## Demo cluster
 
@@ -555,9 +619,17 @@ so treat reports as containing cluster data.
 - **A 7B model makes mistakes.** In testing, it found the right root cause for each demo
   problem once the guardrails above were in place, but suggested fixes can be generic,
   contain invalid commands, or invent values (it once proposed replacing a missing image
-  tag with another made-up tag). Treat root causes as leads to verify.
-- **Confidence is self-reported.** The model rates almost every finding "high", including
-  wrong ones.
+  tag with another made-up tag). Fix steps with invented values or destructive commands
+  are marked, but a fix can still be wrong in ways the checks cannot see. Treat root
+  causes as leads to verify.
+- **Confidence is a heuristic.** It checks that the evidence comes from the cluster data,
+  not that the reasoning is right: a wrong conclusion built from real log lines can still
+  rate high (for example, a correct quote of a Service's selector used to argue the
+  wrong cause). Word overlap can also miss a loose paraphrase and rate a correct finding
+  lower. A "low" or "medium" with its reason is a reliable warning; "high" is not proof.
+- **Value checks are literal.** A suggested `500m` or `128Mi` is marked unverified even
+  when it is a sensible choice, because it is the model's number, not the cluster's. A
+  value that happens to appear elsewhere in the data is not marked.
 - **A larger model helps.** Setting `MODEL=qwen2.5:14b-instruct` (or another
   tool-calling model) should improve the fixes, at the cost of speed and VRAM.
 - **Coverage:** the rules cover the control plane and its components (including leader

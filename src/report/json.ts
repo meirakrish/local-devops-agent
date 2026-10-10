@@ -1,4 +1,4 @@
-import type { Confidence } from "../agent/types.js";
+import type { Confidence, FixFlag } from "../agent/types.js";
 import { addUsage, emptyUsage, type LlmUsage } from "../llm/model.js";
 import type { Issue, Severity } from "../scan/types.js";
 import { changeCounts, issueKey, type IssueChange, type PreviousIssue } from "./compare.js";
@@ -25,8 +25,17 @@ export interface JsonFinding {
   rootCause?: string;
   evidence: string[];
   suggestedFix: string[];
+  /** Computed from the evidence; the model's own rating is only an upper bound. */
   confidence?: Confidence;
+  /** Why `confidence` has its value. Added in schema version 1; absent in older reports. */
+  confidenceReason?: string;
+  /** The model's own rating. Added in schema version 1; absent in older reports. */
+  modelConfidence?: Confidence;
+  /** Notes on fix steps (unverified values, destructive commands); `step` indexes suggestedFix. */
+  fixFlags?: FixFlag[];
   toolCalls: number;
+  /** Repeated calls answered without running. Added in schema version 1; absent in older reports. */
+  repeatedCalls?: number;
   /** Set when the investigation failed. */
   error?: string;
 }
@@ -162,10 +171,20 @@ export function buildJsonReport({
       primaryIssueId: f.problem.primary.id,
       relatedIssueIds: f.problem.related.map((i) => i.id),
       severity: f.problem.severity,
-      ...(f.error ? { error: f.error } : { summary: f.summary, rootCause: f.rootCause, confidence: f.confidence }),
+      ...(f.error
+        ? { error: f.error }
+        : {
+            summary: f.summary,
+            rootCause: f.rootCause,
+            confidence: f.confidence,
+            ...(f.confidenceReason ? { confidenceReason: f.confidenceReason } : {}),
+            ...(f.modelConfidence ? { modelConfidence: f.modelConfidence } : {}),
+            ...(f.fixFlags?.length ? { fixFlags: f.fixFlags } : {}),
+          }),
       evidence: f.error ? [] : f.evidence,
       suggestedFix: f.error ? [] : f.suggestedFix,
       toolCalls: f.toolCalls,
+      ...(f.repeatedCalls ? { repeatedCalls: f.repeatedCalls } : {}),
     })),
     comparison: comparison
       ? { previousScannedAt: comparison.previousScannedAt, ...changeCounts(comparison), resolved: comparison.resolved }

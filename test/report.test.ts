@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.js";
 import { buildJsonReport } from "../src/report/json.js";
-import { overallStatus, renderMarkdownReport } from "../src/report/markdown.js";
+import type { Finding } from "../src/agent/types.js";
+import { fixStepNotes, overallStatus, renderMarkdownReport } from "../src/report/markdown.js";
 import { recentEvents } from "../src/scan/scan.js";
 import type { ClusterOverview, Issue } from "../src/scan/types.js";
 
@@ -131,6 +132,58 @@ describe("report: cluster-level rows", () => {
     expect(md).toContain("| API server health checks | not visible |");
     expect(md).toContain("| etcd database | not visible |");
     expect(md).toContain("- Not checked: etcd size and object counts: /metrics forbidden");
+  });
+});
+
+describe("report: checked findings", () => {
+  const finding: Finding = {
+    problem: { primary: crash, related: [], reason: "", severity: "critical" },
+    summary: "web crashes on start",
+    rootCause: "DATABASE_URL is not set",
+    evidence: ["FATAL: DATABASE_URL is not set"],
+    suggestedFix: [
+      "kubectl set image deployment/web app=nginx:1.25.9",
+      "kubectl delete pod web",
+      "Add DATABASE_URL to the deployment env",
+    ],
+    confidence: "medium",
+    confidenceReason: "evidence not found in tool output; the model said high",
+    modelConfidence: "high",
+    fixFlags: [
+      { step: 0, kind: "unverified", value: "nginx:1.25.9", message: "does not appear in the cluster data" },
+      { step: 0, kind: "unverified", value: "app", message: "does not appear in the cluster data" },
+      { step: 1, kind: "destructive", value: "kubectl delete", message: "deletes resources" },
+    ],
+    toolCalls: 3,
+    repeatedCalls: 1,
+  };
+
+  it("shows why the confidence is what it is, and notes next to flagged fix steps", () => {
+    const md = renderMarkdownReport({ overview, issues: [crash], findings: [finding] });
+    expect(md).toContain(
+      "_Confidence: medium (evidence not found in tool output; the model said high) · 3 tool call(s) · 1 repeated call(s) not run_",
+    );
+    expect(md).toContain(
+      "1. kubectl set image deployment/web app=nginx:1.25.9 _(unverified: `nginx:1.25.9`, `app` do not appear in the cluster data)_",
+    );
+    expect(md).toContain("2. kubectl delete pod web _(destructive: `kubectl delete` deletes resources)_");
+    expect(md).toContain("3. Add DATABASE_URL to the deployment env\n");
+  });
+
+  it("formats single values and rollback notes", () => {
+    expect(
+      fixStepNotes([{ step: 0, kind: "unverified", value: "64Mi", message: "does not appear in the cluster data" }]),
+    ).toBe("_(unverified: `64Mi` does not appear in the cluster data)_");
+    expect(
+      fixStepNotes([
+        {
+          step: 0,
+          kind: "changes-cluster",
+          value: "kubectl rollout undo",
+          message: "rolls back to the previous revision",
+        },
+      ]),
+    ).toBe("_(changes the cluster: `kubectl rollout undo` rolls back to the previous revision)_");
   });
 });
 

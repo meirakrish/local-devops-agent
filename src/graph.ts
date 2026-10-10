@@ -135,7 +135,7 @@ export function buildGraph(deps: GraphDeps) {
       log(
         finding.error
           ? `  failed: ${finding.error}`
-          : `  done: ${finding.toolCalls} tool call(s), confidence ${finding.confidence} (${Date.now() - started}ms${tokensLog(finding.usage)})`,
+          : `  done: ${finding.toolCalls} tool call(s)${finding.repeatedCalls ? `, ${finding.repeatedCalls} repeat(s) not run` : ""}, confidence ${finding.confidence} (model: ${finding.modelConfidence ?? "?"}; ${finding.confidenceReason ?? ""})${finding.fixFlags?.length ? `, ${finding.fixFlags.length} fix flag(s)` : ""} (${Date.now() - started}ms${tokensLog(finding.usage)})`,
       );
       findings.push(finding);
     }

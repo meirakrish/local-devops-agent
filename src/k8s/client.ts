@@ -9,6 +9,7 @@ import {
   KubeConfig,
   StorageV1Api,
 } from "@kubernetes/client-node";
+import { delimiter } from "node:path";
 import { createRawReader, type RawReader } from "./raw.js";
 
 /**
@@ -72,12 +73,35 @@ export interface K8sClients {
   raw: RawReader;
 }
 
-export function createK8sClients(kubeconfigPath?: string): K8sClients {
+/**
+ * Loads the kubeconfig. Like kubectl, KUBECONFIG may list several files separated by ":"
+ * (";" on Windows); they are merged, and the first file's current context wins.
+ */
+function loadKubeConfig(kubeconfigPath?: string): KubeConfig {
   const kc = new KubeConfig();
-  if (kubeconfigPath) {
-    kc.loadFromFile(kubeconfigPath);
+  const [first, ...rest] = (kubeconfigPath ?? "").split(delimiter).filter(Boolean);
+  if (first) {
+    kc.loadFromFile(first);
+    for (const file of rest) {
+      const more = new KubeConfig();
+      more.loadFromFile(file);
+      kc.mergeConfig(more, true);
+    }
   } else {
     kc.loadFromDefault(); // $KUBECONFIG, then ~/.kube/config, then in-cluster
+  }
+  return kc;
+}
+
+/** Clients for `context`, or for the kubeconfig's current context when omitted. */
+export function createK8sClients(kubeconfigPath?: string, context?: string): K8sClients {
+  const kc = loadKubeConfig(kubeconfigPath);
+  if (context) {
+    if (!kc.getContextObject(context)) {
+      const known = kc.getContexts().map((c) => c.name);
+      throw new Error(`unknown kube context "${context}". Contexts in the kubeconfig: ${known.join(", ") || "(none)"}`);
+    }
+    kc.setCurrentContext(context);
   }
   return {
     context: kc.getCurrentContext(),
