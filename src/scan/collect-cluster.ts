@@ -7,8 +7,8 @@ import {
   etcdStorageFromMetrics,
   parseHealthChecks,
 } from "./cluster.js";
-import { eventLastSeen, podRequests } from "./summarize.js";
-import type { ControlPlanePod, ControlPlaneSummary, NodeSummary, WebhookSummary } from "./types.js";
+import { eventLastSeen, podRequests, summarizeService } from "./summarize.js";
+import type { ControlPlanePod, ControlPlaneSummary, DnsSummary, NodeSummary, WebhookSummary } from "./types.js";
 
 /** Why a raw endpoint could not be read, phrased for the report. */
 function rawProblem(status: number): string {
@@ -245,4 +245,26 @@ export async function collectWebhooks(k8s: K8sClients): Promise<WebhookSummary[]
       return { ...base, service: { namespace: svc.namespace, name: svc.name }, ...(await checkService(svc.namespace, svc.name)) };
     }),
   );
+}
+
+/**
+ * Cluster DNS: the kube-dns Service in kube-system, its endpoints and pods. CoreDNS keeps
+ * the historical name kube-dns, so this works for CoreDNS and kube-dns alike.
+ */
+export async function collectDns(k8s: K8sClients): Promise<DnsSummary> {
+  const namespace = "kube-system";
+  const name = "kube-dns";
+  try {
+    const svc = await k8s.core.readNamespacedService({ namespace, name });
+    const selector = Object.entries(svc.spec?.selector ?? {}).map(([k, v]) => `${k}=${v}`).join(",");
+    const [slices, pods] = await Promise.all([
+      k8s.discovery.listNamespacedEndpointSlice({ namespace, labelSelector: `kubernetes.io/service-name=${name}` }),
+      selector ? k8s.core.listNamespacedPod({ namespace, labelSelector: selector }) : Promise.resolve({ items: [] }),
+    ]);
+    const service = summarizeService(svc, slices.items, pods.items);
+    return service ? { service } : { notVisible: `Service ${namespace}/${name} has no selector` };
+  } catch (err) {
+    if ((err as { code?: number }).code === 404) return { notVisible: `no Service ${namespace}/${name}` };
+    return { notVisible: k8sErrorMessage(err) };
+  }
 }

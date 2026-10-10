@@ -3,7 +3,7 @@ import { tool } from "@langchain/core/tools";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { investigate, problemPrompt, seedCall } from "../src/agent/investigate.js";
-import { buildProblems, fallbackTriage, triage } from "../src/agent/triage.js";
+import { addMissedCritical, buildProblems, fallbackTriage, triage } from "../src/agent/triage.js";
 import type { Problem } from "../src/agent/types.js";
 import type { LlmClient } from "../src/llm/model.js";
 import type { ClusterOverview, Issue } from "../src/scan/types.js";
@@ -33,6 +33,10 @@ const overview: ClusterOverview = {
   nodes: [],
   pods: [],
   deployments: [],
+  workloads: [],
+  services: [],
+  dns: {},
+  podCreateFailures: [],
   warningEvents: [],
   controlPlane: { notVisible: [] },
   webhooks: [],
@@ -112,10 +116,12 @@ describe("triage", () => {
     const apiserver = cp("kube-apiserver", "controlplane-probe-failures");
     // The LLM picks the scheduler and forgets the rest; code merges them and re-ranks.
     const { llm } = fakeLlm([], { problems: [{ issueId: scheduler.id, relatedIssueIds: [], reason: "restarts" }] });
-    const [problem, ...rest] = await triage(llm, overview, [scheduler, cm, apiserver, payPod], 5);
+    const problems = await triage(llm, overview, [scheduler, cm, apiserver, payPod], 5);
+    const problem = problems.find((p) => p.primary.resource.namespace === "kube-system");
     expect(problem?.primary.id).toBe(apiserver.id);
     expect(problem?.related.map((i) => i.id).sort()).toEqual([cm.id, scheduler.id].sort());
-    expect(rest).toEqual([]);
+    // The critical image-pull issue the LLM skipped is added as its own problem.
+    expect(problems.map((p) => p.primary.id)).toEqual([payPod.id, apiserver.id]);
     // etcd outranks the API server when both are involved.
     const etcd = cp("etcd", "controlplane-pod-down", "critical");
     expect(fallbackTriage([apiserver, etcd, scheduler], 5)[0]?.primary.id).toBe(etcd.id);
@@ -128,8 +134,25 @@ describe("triage", () => {
   it("uses the LLM's picks when valid", async () => {
     const { llm } = fakeLlm([], { problems: [{ issueId: payPod.id, relatedIssueIds: [], reason: "bad image" }] });
     const problems = await triage(llm, overview, ALL, 5);
-    expect(problems.map((p) => p.primary.id)).toEqual([payPod.id]);
+    expect(problems[0]?.primary.id).toBe(payPod.id);
     expect(problems[0]?.reason).toBe("bad image");
+  });
+
+  it("adds critical problems the LLM left out, while there is room", async () => {
+    const { llm } = fakeLlm([], { problems: [{ issueId: payPod.id, relatedIssueIds: [], reason: "bad image" }] });
+    const problems = await triage(llm, overview, ALL, 5);
+    expect(problems.map((p) => p.primary.id)).toEqual([payPod.id, webPod1.id]);
+    expect(problems[1]?.reason).toBe("added: critical issue not chosen by the LLM");
+    expect(problems[1]?.related.map((i) => i.id).sort()).toEqual([webDeploy.id, webPod2.id].sort());
+
+    const full = await triage(fakeLlm([], { problems: [{ issueId: payPod.id, relatedIssueIds: [], reason: "" }] }).llm, overview, ALL, 1);
+    expect(full.map((p) => p.primary.id)).toEqual([payPod.id]);
+  });
+
+  it("leaves skipped warnings to the LLM's judgement", () => {
+    const warning = issue("pod/shop/api-5f6d7c8b9-abcde:high-restarts", "Pod", "api-5f6d7c8b9-abcde", "warning");
+    const picked = buildProblems([{ issueId: payPod.id }], [payPod, warning], 5);
+    expect(addMissedCritical(picked, [payPod, warning], 5)).toEqual(picked);
   });
 
   it("falls back when the LLM fails or returns nothing", async () => {
@@ -269,6 +292,22 @@ describe("investigate loop", () => {
       args: { section: "webhooks" },
     });
     expect(seedCall({ ...webDeploy, resource: { kind: "ControlPlane", name: "etcd" } })?.args).toEqual({ section: "etcd" });
+    expect(seedCall(webDeploy)).toEqual({ name: "k8s_get_workload", args: { kind: "Deployment", namespace: "shop", name: "web" } });
+    expect(seedCall({ ...webDeploy, resource: { kind: "DaemonSet", namespace: "kube-system", name: "kube-proxy" } })).toEqual({
+      name: "k8s_get_workload",
+      args: { kind: "DaemonSet", namespace: "kube-system", name: "kube-proxy" },
+    });
+    expect(seedCall({ ...webDeploy, resource: { kind: "Service", namespace: "shop", name: "web" } })).toEqual({
+      name: "k8s_get_service",
+      args: { namespace: "shop", name: "web" },
+    });
+  });
+
+  it("seeds a ReplicaSet's FailedCreate with its Deployment, and a Job's with its events", () => {
+    const rs = { ...issue("replicaset/shop/web-7db8d69f68:create-failed", "ReplicaSet", "web-7db8d69f68"), category: "pod-create-failed", workload: "shop/web" };
+    expect(seedCall(rs)).toEqual({ name: "k8s_get_workload", args: { kind: "Deployment", namespace: "shop", name: "web" } });
+    const job = { ...issue("job/shop/backup:create-failed", "Job", "backup"), category: "pod-create-failed", workload: "shop/backup" };
+    expect(seedCall(job)).toEqual({ name: "k8s_list_events", args: { namespace: "shop", objectName: "backup", objectKind: "Job" } });
   });
 
   it("reports a failed investigation instead of throwing", async () => {
@@ -276,5 +315,32 @@ describe("investigate loop", () => {
     const finding = await investigate(problem, { llm, tools: [getLogs], maxSteps: 5 });
     expect(finding.error).toContain("ran out of replies");
     expect(finding.confidence).toBe("low");
+  });
+});
+
+describe("triage grouping by workload", () => {
+  const svc: Issue = { ...issue("service/shop/web:no-ready-endpoints", "Service", "web"), workload: "shop/web" };
+  const sts = { ...issue("statefulset/shop/db:unavailable", "StatefulSet", "db"), workload: "shop/db" };
+  const stsPod = { ...issue("pod/shop/db-0:crashloop", "Pod", "db-0"), workload: "shop/db" };
+  const rs = { ...issue("replicaset/shop/api-5f6d7c8b9:create-failed", "ReplicaSet", "api-5f6d7c8b9"), category: "pod-create-failed", workload: "shop/api" };
+  const apiDeploy = { ...issue("deployment/shop/api:unavailable", "Deployment", "api"), workload: "shop/api" };
+
+  it("merges a Service, its Deployment and pods into one problem led by a pod", () => {
+    const problems = fallbackTriage([svc, webDeploy, webPod1], 5);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]?.primary).toBe(webPod1);
+    expect(problems[0]?.related.map((i) => i.id).sort()).toEqual([svc.id, webDeploy.id].sort());
+  });
+
+  it("groups StatefulSet pods with their StatefulSet, which pod names alone cannot do", () => {
+    const problems = fallbackTriage([sts, stsPod], 5);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]?.primary).toBe(stsPod);
+  });
+
+  it("leads with the FailedCreate issue when a Deployment has no pods", () => {
+    const problems = fallbackTriage([apiDeploy, rs], 5);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]?.primary).toBe(rs);
   });
 });

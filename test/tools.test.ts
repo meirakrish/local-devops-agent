@@ -91,14 +91,15 @@ function getTool(k8s: K8sClients, name: string) {
 }
 
 describe("k8s tools", () => {
-  it("exposes exactly the seven read-only tools", () => {
+  it("exposes exactly the eight read-only tools", () => {
     expect(createK8sTools(fakeK8s(), { maxChars: 4000 }).map((t) => t.name)).toEqual([
       "k8s_list_nodes",
       "k8s_list_pods",
       "k8s_describe_pod",
       "k8s_get_logs",
       "k8s_list_events",
-      "k8s_get_deployment",
+      "k8s_get_workload",
+      "k8s_get_service",
       "k8s_cluster_health",
     ]);
   });
@@ -180,5 +181,74 @@ describe("k8s tools", () => {
     await expect(
       getTool(fakeK8s(), "k8s_describe_pod").invoke({ namespace: "shop", name: "shop/web-1" }),
     ).rejects.toThrow(/without a "namespace\/" prefix/);
+  });
+});
+
+describe("service and workload tools", () => {
+  const frontendPod: V1Pod = {
+    metadata: { name: "frontend-1", namespace: "shop", labels: { app: "frontend" } },
+    spec: { containers: [{ name: "nginx", ports: [{ containerPort: 80, name: "http" }] }] },
+    status: {
+      phase: "Running",
+      containerStatuses: [{ name: "nginx", image: "nginx", imageID: "", ready: true, restartCount: 0, state: { running: {} } }],
+    },
+  };
+
+  function serviceK8s(selector: Record<string, string>, targetPort: number | string): K8sClients {
+    const core = {
+      readNamespacedService: async () => ({
+        metadata: { name: "frontend", namespace: "shop" },
+        spec: { type: "ClusterIP", clusterIP: "10.96.0.10", selector, ports: [{ port: 80, targetPort }] },
+      }),
+      listNamespacedPod: async () => ({ items: [frontendPod] }),
+    };
+    const discovery = { listNamespacedEndpointSlice: async () => ({ items: [] }) };
+    return { context: "test", core, discovery, apps: {} } as unknown as K8sClients;
+  }
+
+  it("get_service shows the label values pods have when the selector matches none", async () => {
+    const out = String(await getTool(serviceK8s({ app: "fronted" }, 80), "k8s_get_service").invoke({ namespace: "shop", name: "frontend" }));
+    expect(out).toContain("Selector: app=fronted");
+    expect(out).toContain("Endpoints: 0 ready, 0 not ready");
+    expect(out).toContain("Pods matching the selector: (none)");
+    expect(out).toContain("Label values on running pods in shop: app: frontend");
+  });
+
+  it("get_service notes a targetPort that no container declares", async () => {
+    const out = String(await getTool(serviceK8s({ app: "frontend" }, 8080), "k8s_get_service").invoke({ namespace: "shop", name: "frontend" }));
+    expect(out).toContain("- shop/frontend-1 Running ready=1/1");
+    expect(out).toContain("Note: targetPort 8080 of port 80 is not a declared container port");
+    const named = String(await getTool(serviceK8s({ app: "frontend" }, "http"), "k8s_get_service").invoke({ namespace: "shop", name: "frontend" }));
+    expect(named).not.toContain("Note:");
+  });
+
+  it("get_workload shows a DaemonSet with its pods and controller events", async () => {
+    const eventQueries: unknown[] = [];
+    const apps = {
+      readNamespacedDaemonSet: async () => ({
+        metadata: { name: "log-agent", namespace: "ops" },
+        spec: { selector: { matchLabels: { app: "log-agent" } }, template: { spec: { containers: [{ name: "agent", image: "agent:1" }] } } },
+        status: { desiredNumberScheduled: 2, currentNumberScheduled: 2, numberReady: 1, updatedNumberScheduled: 2, numberAvailable: 1, numberMisscheduled: 0 },
+      }),
+    };
+    const core = {
+      listNamespacedPod: async () => ({ items: [] }),
+      listNamespacedEvent: async (args: unknown) => {
+        eventQueries.push(args);
+        return {
+          items: [
+            { metadata: {}, involvedObject: { kind: "DaemonSet", name: "log-agent", namespace: "ops" }, reason: "FailedCreate", message: "violates PodSecurity", count: 2 },
+            { metadata: {}, involvedObject: { kind: "DaemonSet", name: "other", namespace: "ops" }, reason: "FailedCreate", message: "unrelated", count: 1 },
+          ],
+        };
+      },
+    };
+    const k8s = { context: "test", core, apps } as unknown as K8sClients;
+    const out = String(await getTool(k8s, "k8s_get_workload").invoke({ kind: "DaemonSet", namespace: "ops", name: "log-agent" }));
+    expect(out).toContain("DaemonSet ops/log-agent");
+    expect(out).toContain("Pods: desired=2 current=2 ready=1");
+    expect(out).toContain("DaemonSet/log-agent FailedCreate (x2): violates PodSecurity");
+    expect(out).not.toContain("unrelated");
+    expect(eventQueries).toEqual([{ namespace: "ops", fieldSelector: "type=Warning" }]);
   });
 });

@@ -9,6 +9,7 @@ import type {
 } from "./types.js";
 import { controlPlaneIssues, controlPlanePodIssues, nodeCapacityIssues, webhookIssues } from "./cluster-rules.js";
 import { formatCpu, formatMemory, parseQuantity } from "./quantity.js";
+import { dnsIssues, podCreateFailureIssues, serviceIssues, workloadIssues } from "./workload-rules.js";
 
 /**
  * Deterministic, rule-based problem detection. In milestone 1 this is the whole
@@ -258,12 +259,14 @@ export function podIssues(pod: PodSummary, opts: RuleOptions): Issue[] {
       title: `Pod ${pod.namespace}/${pod.name}: ${primary.category}`,
       evidence: findings.map((f) => f.evidence),
       hint: primary.hint,
+      workload: pod.workload ? `${pod.namespace}/${pod.workload}` : undefined,
     },
   ];
 }
 
 export function deploymentIssues(d: DeploymentSummary): Issue[] {
   const resource = { kind: "Deployment", namespace: d.namespace, name: d.name };
+  const workload = `${d.namespace}/${d.name}`;
   const progressing = d.conditions.find((c) => c.type === "Progressing");
   const issues: Issue[] = [];
 
@@ -276,18 +279,27 @@ export function deploymentIssues(d: DeploymentSummary): Issue[] {
       title: `Deployment ${d.namespace}/${d.name} rollout exceeded its progress deadline`,
       evidence: [progressing.message ?? "Progressing=False (ProgressDeadlineExceeded)"],
       hint: "Inspect the new ReplicaSet's pods; consider `kubectl rollout undo` after finding the cause.",
+      workload,
     });
   }
 
   if (d.desired > 0 && d.ready < d.desired) {
+    // ReplicaFailure=True: the API server rejected its pods, so there are no pods to look at.
+    const replicaFailure = d.conditions.find((c) => c.type === "ReplicaFailure" && c.status === "True");
     issues.push({
       id: `deployment/${d.namespace}/${d.name}:unavailable`,
       severity: d.ready === 0 ? "critical" : "warning",
       category: "replicas-unavailable",
       resource,
       title: `Deployment ${d.namespace}/${d.name} has ${d.ready}/${d.desired} replicas ready`,
-      evidence: [`desired=${d.desired} ready=${d.ready} available=${d.available} updated=${d.updated}`],
-      hint: "See the pod issues for this deployment for the underlying cause.",
+      evidence: [
+        `desired=${d.desired} ready=${d.ready} available=${d.available} updated=${d.updated}`,
+        ...(replicaFailure ? [`ReplicaFailure (${replicaFailure.reason ?? "?"}): ${replicaFailure.message ?? ""}`] : []),
+      ],
+      hint: replicaFailure
+        ? "Its pods cannot be created; the ReplicaSet's FailedCreate events say why (quota, Pod Security, admission webhook)."
+        : "See the pod issues for this deployment for the underlying cause.",
+      workload,
     });
   }
   return issues;
@@ -300,6 +312,19 @@ export function detectIssues(overview: ClusterOverview, opts: RuleOptions): Issu
   const covered = new Set(cpPodIssues.map((i) => i.resource.name));
   const coveredByControlPlane = (i: Issue) =>
     i.resource.kind === "Pod" && i.resource.namespace === "kube-system" && covered.has(i.resource.name);
+
+  // Services behind a webhook or cluster DNS get their own, more specific rules.
+  const coveredServices = new Set([
+    ...overview.webhooks.flatMap((w) => (w.service ? [`${w.service.namespace}/${w.service.name}`] : [])),
+    ...(overview.dns.service ? [`${overview.dns.service.namespace}/${overview.dns.service.name}`] : []),
+  ]);
+  // A FailedCreate event outlives the failure; skip it once its workload is fully ready.
+  const fullyReady = new Set(
+    [...overview.deployments, ...overview.workloads]
+      .filter((w) => w.ready >= w.desired)
+      .map((w) => `${w.namespace}/${w.name}`),
+  );
+
   const issues = [
     ...controlPlaneIssues(overview.controlPlane, opts.now),
     ...cpPodIssues,
@@ -310,6 +335,12 @@ export function detectIssues(overview: ClusterOverview, opts: RuleOptions): Issu
       .flatMap((p) => podIssues(p, { ...opts, nodes: opts.nodes ?? overview.nodes }))
       .filter((i) => !coveredByControlPlane(i)),
     ...overview.deployments.flatMap(deploymentIssues),
+    ...overview.workloads.flatMap(workloadIssues),
+    ...overview.services
+      .filter((s) => !coveredServices.has(`${s.namespace}/${s.name}`))
+      .flatMap((s) => serviceIssues(s, opts.now, opts.gracePeriodMinutes)),
+    ...dnsIssues(overview.dns),
+    ...podCreateFailureIssues(overview.podCreateFailures).filter((i) => !i.workload || !fullyReady.has(i.workload)),
   ];
   return issues.sort(
     (a, b) => compareSeverity(a.severity, b.severity) || a.id.localeCompare(b.id),

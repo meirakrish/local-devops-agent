@@ -11,6 +11,10 @@ const overview: ClusterOverview = {
   nodes: [{ name: "n1", ready: true, roles: ["worker"], pressures: [], unschedulable: false, allocatable: {} }],
   pods: [],
   deployments: [],
+  workloads: [],
+  services: [],
+  dns: {},
+  podCreateFailures: [],
   warningEvents: [
     { involvedKind: "Node", involvedName: "n1", reason: "Rebooted", message: "a | b", count: 1 },
   ],
@@ -44,6 +48,30 @@ describe("report", () => {
     expect(md).toContain("| Node n1 |"); // cluster-scoped: no namespace prefix
     expect(md).toContain("a \\| b");
     expect(md).toContain("Scan error: list nodes: forbidden");
+  });
+});
+
+describe("report: workload, service and DNS rows", () => {
+  it("counts healthy workloads, Services without endpoints and DNS endpoints", () => {
+    const svc = { namespace: "shop", name: "web", type: "ClusterIP", selector: { app: "web" }, readyEndpoints: 0, notReadyEndpoints: 1, pods: [], podLabelValues: {} };
+    const md = renderMarkdownReport({
+      overview: {
+        ...overview,
+        workloads: [{ kind: "DaemonSet", namespace: "kube-system", name: "kube-proxy", desired: 2, ready: 1, updated: 2 }],
+        services: [svc, { ...svc, name: "api", readyEndpoints: 2, notReadyEndpoints: 0 }],
+        dns: { service: { ...svc, namespace: "kube-system", name: "kube-dns", readyEndpoints: 2, notReadyEndpoints: 0 } },
+      },
+      issues: [],
+    });
+    expect(md).toContain("| DaemonSets and StatefulSets fully ready | 0/1 |");
+    expect(md).toContain("| Services without ready endpoints | 1 of 2 |");
+    expect(md).toContain("| Cluster DNS | 2/2 endpoints ready |");
+  });
+
+  it("says when cluster DNS could not be checked", () => {
+    const md = renderMarkdownReport({ overview: { ...overview, dns: { notVisible: "no Service kube-system/kube-dns" } }, issues: [] });
+    expect(md).toContain("| Cluster DNS | not visible |");
+    expect(md).toContain("- Not checked: cluster DNS: no Service kube-system/kube-dns");
   });
 });
 

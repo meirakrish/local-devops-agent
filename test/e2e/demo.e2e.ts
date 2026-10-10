@@ -42,7 +42,7 @@ describe("demo cluster scan", () => {
     expect(overview.nodes).toHaveLength(2);
     expect(overview.nodes.every((n) => n.ready)).toBe(true);
     expect(overview.deployments.map((d) => d.name).sort()).toEqual(
-      ["batch", "cache", "frontend", "payments", "web"],
+      ["batch", "cache", "frontend", "metrics-agent", "payments", "web"],
     );
   });
 
@@ -73,7 +73,31 @@ describe("demo cluster scan", () => {
       .filter((i) => i.resource.kind === "Deployment" && i.category === "replicas-unavailable")
       .map((i) => i.resource.name)
       .sort();
-    expect(unavailable).toEqual(["batch", "cache", "payments", "web"]);
+    expect(unavailable).toEqual(["batch", "cache", "metrics-agent", "payments", "web"]);
+  });
+
+  it("explains that metrics-agent's pods are rejected by Pod Security", () => {
+    const failed = issues.find((i) => i.category === "pod-create-failed");
+    expect(failed?.resource.kind).toBe("ReplicaSet");
+    expect(failed?.resource.name).toMatch(/^metrics-agent-/);
+    expect(failed?.title).toContain("rejected by Pod Security admission");
+    expect(failed?.workload).toBe(`${NAMESPACE}/metrics-agent`);
+  });
+
+  it("flags the web Service with no ready endpoints and ties it to the web Deployment", () => {
+    const svc = issues.find((i) => i.id === `service/${NAMESPACE}/web:no-ready-endpoints`);
+    expect(svc?.severity).toBe("critical");
+    expect(svc?.workload).toBe(`${NAMESPACE}/web`);
+  });
+
+  it("flags the storefront selector typo and shows the real label values", () => {
+    const svc = issues.find((i) => i.id === `service/${NAMESPACE}/storefront:no-pods`);
+    expect(svc?.severity).toBe("warning");
+    expect(svc?.evidence[1]).toContain("frontend");
+  });
+
+  it("does not flag the webhook's Service twice (the webhook rule covers it)", () => {
+    expect(issues.filter((i) => i.resource.kind === "Service" && i.resource.name === "policy-webhook")).toEqual([]);
   });
 });
 
@@ -101,6 +125,12 @@ describe("demo cluster: cluster-level checks", () => {
     // Restarts and probe failures depend on the cluster's recent history, so they are
     // covered by unit tests rather than asserted here.
     expect(issues.filter((i) => i.category === "controlplane-pod-down")).toEqual([]);
+  });
+
+  it("checks cluster DNS even with --namespace and finds it healthy", () => {
+    expect(overview.dns.service?.name).toBe("kube-dns");
+    expect(overview.dns.service?.readyEndpoints).toBeGreaterThan(0);
+    expect(issues.filter((i) => i.category.startsWith("dns-"))).toEqual([]);
   });
 
   it("flags the demo webhook whose service has no endpoints as critical", () => {

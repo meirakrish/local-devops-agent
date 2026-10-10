@@ -47,6 +47,8 @@ export interface PodSummary {
   message?: string;
   nodeName?: string;
   owner?: { kind: string; name: string };
+  /** Owning workload: the Deployment of a ReplicaSet pod, else the owner (StatefulSet, DaemonSet, Job). */
+  workload?: string;
   createdAt?: string;
   readyContainers: number;
   totalContainers: number;
@@ -73,6 +75,55 @@ export interface DeploymentSummary {
   available: number;
   updated: number;
   conditions: DeploymentCondition[];
+}
+
+/** A DaemonSet or StatefulSet (Deployments have their own summary with conditions). */
+export interface WorkloadSummary {
+  kind: "DaemonSet" | "StatefulSet";
+  namespace: string;
+  name: string;
+  /** DaemonSet: nodes that should run a pod. StatefulSet: spec.replicas. */
+  desired: number;
+  ready: number;
+  updated: number;
+  /** StatefulSet revisions; they differ while a rollout is in progress (or stuck). */
+  currentRevision?: string;
+  updateRevision?: string;
+}
+
+/** A pod selected by a Service, as far as the Service checks need it. */
+export interface ServicePod {
+  name: string;
+  ready: boolean;
+  phase: string;
+  /** Waiting/terminated reason of a container that is not running, e.g. CrashLoopBackOff. */
+  reason?: string;
+  createdAt?: string;
+  /** Owning workload name (Deployment, StatefulSet, DaemonSet or Job). */
+  workload?: string;
+}
+
+export interface ServiceSummary {
+  namespace: string;
+  name: string;
+  type: string;
+  selector: Record<string, string>;
+  readyEndpoints: number;
+  notReadyEndpoints: number;
+  /** Non-terminated pods in the namespace that match the selector. */
+  pods: ServicePod[];
+  /**
+   * For each selector key, the values that pods in the namespace actually carry. Shows a
+   * selector typo ("app=fronted" vs pods with "app=frontend") without the model comparing.
+   */
+  podLabelValues: Record<string, string[]>;
+}
+
+/** Cluster DNS: the kube-dns Service in kube-system (CoreDNS in most clusters). */
+export interface DnsSummary {
+  service?: ServiceSummary;
+  /** Why DNS could not be checked, e.g. no kube-dns Service or forbidden. */
+  notVisible?: string;
 }
 
 export interface EventSummary {
@@ -144,7 +195,18 @@ export interface ClusterOverview {
   nodes: NodeSummary[];
   pods: PodSummary[];
   deployments: DeploymentSummary[];
+  /** DaemonSets and StatefulSets. */
+  workloads: WorkloadSummary[];
+  /** Services with a selector (others have manually managed endpoints and are skipped). */
+  services: ServiceSummary[];
+  dns: DnsSummary;
   warningEvents: EventSummary[];
+  /**
+   * FailedCreate events of pod controllers (ReplicaSet, StatefulSet, DaemonSet, Job) in
+   * the event window. Collected separately from `warningEvents`, which is capped, because
+   * a controller that cannot create pods leaves no pod for the other rules to see.
+   */
+  podCreateFailures: EventSummary[];
   controlPlane: ControlPlaneSummary;
   webhooks: WebhookSummary[];
   /** Partial failures (e.g. RBAC forbids listing nodes); the scan continues. */
@@ -163,4 +225,9 @@ export interface Issue {
   evidence: string[];
   /** Rule-based next step; the LLM investigation (milestone 2) goes deeper. */
   hint?: string;
+  /**
+   * "namespace/name" of the workload (Deployment, StatefulSet, DaemonSet, Job) this issue
+   * belongs to. Triage groups issues of one workload into one problem.
+   */
+  workload?: string;
 }

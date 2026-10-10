@@ -1,13 +1,16 @@
 import type { K8sClients } from "../k8s/client.js";
 import { k8sErrorMessage } from "../k8s/errors.js";
-import { addNodeUsage, collectControlPlane, collectWebhooks } from "./collect-cluster.js";
+import { addNodeUsage, collectControlPlane, collectDns, collectWebhooks } from "./collect-cluster.js";
 import {
+  summarizeDaemonSet,
   summarizeDeployment,
   summarizeEvent,
   summarizeNode,
   summarizePod,
+  summarizeService,
+  summarizeStatefulSet,
 } from "./summarize.js";
-import type { ClusterOverview, EventSummary } from "./types.js";
+import type { ClusterOverview, EventSummary, ServiceSummary } from "./types.js";
 
 export interface ScanOptions {
   namespace?: string;
@@ -28,6 +31,14 @@ export function recentEvents(
     .filter((e) => !e.lastSeen || new Date(e.lastSeen).getTime() >= cutoff)
     .sort((a, b) => (b.lastSeen ?? "").localeCompare(a.lastSeen ?? ""))
     .slice(0, max);
+}
+
+/** Controllers whose FailedCreate events mean pods could not be created at all. */
+const POD_CONTROLLERS = new Set(["ReplicaSet", "StatefulSet", "DaemonSet", "Job", "ReplicationController"]);
+
+export function podCreateFailures(events: EventSummary[], now: Date, windowMinutes: number): EventSummary[] {
+  const failed = events.filter((e) => e.reason === "FailedCreate" && POD_CONTROLLERS.has(e.involvedKind ?? ""));
+  return recentEvents(failed, now, windowMinutes, Number.POSITIVE_INFINITY);
 }
 
 /**
@@ -51,7 +62,20 @@ export async function scanCluster(k8s: K8sClients, opts: ScanOptions): Promise<C
 
   const warningOnly = { fieldSelector: "type=Warning" };
   // Cluster-level checks (control plane, etcd, webhooks) run regardless of --namespace.
-  const [nodes, namespaces, pods, deployments, events, controlPlane, webhooks] = await Promise.allSettled([
+  const [
+    nodes,
+    namespaces,
+    pods,
+    deployments,
+    events,
+    controlPlane,
+    webhooks,
+    daemonSets,
+    statefulSets,
+    services,
+    endpointSlices,
+    dns,
+  ] = await Promise.allSettled([
     k8s.core.listNode(),
     ns ? Promise.resolve({ items: [{ metadata: { name: ns } }] }) : k8s.core.listNamespace(),
     ns ? k8s.core.listNamespacedPod({ namespace: ns }) : k8s.core.listPodForAllNamespaces(),
@@ -63,6 +87,14 @@ export async function scanCluster(k8s: K8sClients, opts: ScanOptions): Promise<C
       : k8s.core.listEventForAllNamespaces(warningOnly),
     collectControlPlane(k8s, opts.eventWindowMinutes, now),
     collectWebhooks(k8s),
+    ns ? k8s.apps.listNamespacedDaemonSet({ namespace: ns }) : k8s.apps.listDaemonSetForAllNamespaces(),
+    ns ? k8s.apps.listNamespacedStatefulSet({ namespace: ns }) : k8s.apps.listStatefulSetForAllNamespaces(),
+    ns ? k8s.core.listNamespacedService({ namespace: ns }) : k8s.core.listServiceForAllNamespaces(),
+    ns
+      ? k8s.discovery.listNamespacedEndpointSlice({ namespace: ns })
+      : k8s.discovery.listEndpointSliceForAllNamespaces(),
+    // Cluster DNS is cluster-level, so it is checked regardless of --namespace.
+    collectDns(k8s),
   ]);
 
   function items<T>(label: string, result: PromiseSettledResult<{ items: T[] }>): T[] {
@@ -73,7 +105,8 @@ export async function scanCluster(k8s: K8sClients, opts: ScanOptions): Promise<C
 
   // Node usage needs the pods of every namespace, even when --namespace limits the scan.
   const nodeSummaries = items("nodes", nodes).map(summarizeNode);
-  let allPods = items("pods", pods);
+  const scopedPods = items("pods", pods);
+  let allPods = scopedPods;
   if (ns) {
     try {
       allPods = (await k8s.core.listPodForAllNamespaces()).items;
@@ -86,6 +119,16 @@ export async function scanCluster(k8s: K8sClients, opts: ScanOptions): Promise<C
 
   if (webhooks.status === "rejected") errors.push(`list admission webhooks: ${k8sErrorMessage(webhooks.reason)}`);
 
+  // Without endpoint slices or pods every Service would look broken, so skip the check.
+  const slices = items("endpoint slices", endpointSlices);
+  const serviceSummaries =
+    endpointSlices.status === "fulfilled" && pods.status === "fulfilled"
+      ? items("services", services)
+          .map((svc) => summarizeService(svc, slices, scopedPods))
+          .filter((s): s is ServiceSummary => s !== undefined)
+      : [];
+  const allEvents = items("events", events).map(summarizeEvent);
+
   return {
     context: k8s.context,
     scannedAt: now.toISOString(),
@@ -95,14 +138,16 @@ export async function scanCluster(k8s: K8sClients, opts: ScanOptions): Promise<C
       .filter(Boolean)
       .sort(),
     nodes: nodeSummaries,
-    pods: items("pods", pods).map(summarizePod),
+    pods: scopedPods.map(summarizePod),
     deployments: items("deployments", deployments).map(summarizeDeployment),
-    warningEvents: recentEvents(
-      items("events", events).map(summarizeEvent),
-      now,
-      opts.eventWindowMinutes,
-      opts.maxEvents ?? 50,
-    ),
+    workloads: [
+      ...items("daemonsets", daemonSets).map(summarizeDaemonSet),
+      ...items("statefulsets", statefulSets).map(summarizeStatefulSet),
+    ],
+    services: serviceSummaries,
+    dns: dns.status === "fulfilled" ? dns.value : { notVisible: k8sErrorMessage(dns.reason) },
+    warningEvents: recentEvents(allEvents, now, opts.eventWindowMinutes, opts.maxEvents ?? 50),
+    podCreateFailures: podCreateFailures(allEvents, now, opts.eventWindowMinutes),
     controlPlane:
       controlPlane.status === "fulfilled"
         ? controlPlane.value

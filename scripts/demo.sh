@@ -102,13 +102,15 @@ wait_for_failures() {
   info "Waiting for the workloads to reach their broken state (up to ${WAIT_SECONDS}s)"
   local deadline=$((SECONDS + WAIT_SECONDS))
   declare -A reached=()
-  local names=(web payments cache batch frontend webhook)
+  local names=(web payments cache batch metrics-agent frontend storefront webhook)
   declare -A labels=(
     [web]="web: CrashLoopBackOff (missing DATABASE_URL)"
     [payments]="payments: ImagePullBackOff (image tag does not exist)"
     [cache]="cache: OOMKilled (32Mi memory limit)"
     [batch]="batch: Unschedulable (requests 1000 CPUs)"
+    [metrics-agent]="metrics-agent: pods rejected by Pod Security (hostNetwork)"
     [frontend]="frontend: healthy (2/2 ready)"
+    [storefront]="storefront: Service selector matches no pods (typo)"
     [webhook]="agent-demo-policy: webhook with no ready endpoints (failurePolicy=Fail)"
   )
 
@@ -121,6 +123,8 @@ wait_for_failures() {
         payments) [[ "$(pods_of payments '{.items[*].status.containerStatuses[*].state.waiting.reason}')" =~ ImagePull|ErrImage ]] && hit=1 ;;
         cache) [[ "$(pods_of cache '{.items[*].status.containerStatuses[*].lastState.terminated.reason} {.items[*].status.containerStatuses[*].state.terminated.reason}')" =~ OOMKilled ]] && hit=1 ;;
         batch) [[ "$(pods_of batch '{.items[*].status.conditions[?(@.type=="PodScheduled")].reason}')" =~ Unschedulable ]] && hit=1 ;;
+        metrics-agent) [[ "$(kubectl get events -n "$NAMESPACE" --field-selector reason=FailedCreate -o 'jsonpath={.items[*].involvedObject.name}' 2>/dev/null)" =~ metrics-agent ]] && hit=1 ;;
+        storefront) kubectl get service storefront -n "$NAMESPACE" >/dev/null 2>&1 && hit=1 ;;
         frontend) [[ "$(kubectl get deployment frontend -n "$NAMESPACE" -o 'jsonpath={.status.readyReplicas}' 2>/dev/null)" == "2" ]] && hit=1 ;;
         webhook) kubectl get validatingwebhookconfiguration agent-demo-policy >/dev/null 2>&1 &&
           kubectl get service policy-webhook -n "$NAMESPACE" >/dev/null 2>&1 && hit=1 ;;
