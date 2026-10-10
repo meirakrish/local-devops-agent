@@ -4,7 +4,7 @@ import { triage } from "./agent/triage.js";
 import type { Finding, Problem } from "./agent/types.js";
 import type { Config } from "./config.js";
 import type { K8sClients } from "./k8s/client.js";
-import type { LlmClient } from "./llm/model.js";
+import type { LlmClient, LlmUsage } from "./llm/model.js";
 import { checkOllama, type OllamaStatus } from "./llm/ollama.js";
 import { renderMarkdownReport } from "./report/markdown.js";
 import { detectIssues } from "./scan/rules.js";
@@ -22,6 +22,8 @@ export const HealthCheckState = Annotation.Root({
   ollama: Annotation<OllamaStatus>(),
   problems: Annotation<Problem[]>(),
   findings: Annotation<Finding[]>(),
+  /** Tokens used by triage, if the LLM client reports them. */
+  triageUsage: Annotation<LlmUsage | undefined>(),
   /** Why the LLM steps were skipped, if they were. */
   llmSkipped: Annotation<string | undefined>(),
   // Note: state keys and node names share a namespace, so this cannot be "report".
@@ -37,6 +39,11 @@ export interface GraphDeps {
   /** Omit to run without the LLM (rule-based report only). */
   llm?: LlmClient;
   log?: (message: string) => void;
+}
+
+function tokensLog(usage: LlmUsage | undefined): string {
+  if (!usage || usage.calls === 0) return "";
+  return `, ${usage.promptTokens} prompt + ${usage.outputTokens} output tokens, largest prompt ${usage.peakPromptTokens}`;
 }
 
 /**
@@ -93,12 +100,14 @@ export function buildGraph(deps: GraphDeps) {
     if (state.issues.length === 0) return skip("no issues found");
 
     const started = Date.now();
+    deps.llm.takeUsage?.();
     const problems = await triage(deps.llm, state.overview, state.issues, deps.config.maxProblems, log);
-    log(`triage: ${problems.length} problem(s) to investigate (${Date.now() - started}ms)`);
+    const triageUsage = deps.llm.takeUsage?.();
+    log(`triage: ${problems.length} problem(s) to investigate (${Date.now() - started}ms${tokensLog(triageUsage)})`);
     for (const p of problems) {
       log(`  - ${p.primary.id}${p.related.length > 0 ? ` (+${p.related.length} related)` : ""}`);
     }
-    return { problems, llmSkipped: undefined };
+    return { problems, triageUsage, llmSkipped: undefined };
   }
 
   async function investigateNode(state: HealthCheckStateType): Promise<Partial<HealthCheckStateType>> {
@@ -121,7 +130,7 @@ export function buildGraph(deps: GraphDeps) {
       log(
         finding.error
           ? `  failed: ${finding.error}`
-          : `  done: ${finding.toolCalls} tool call(s), confidence ${finding.confidence} (${Date.now() - started}ms)`,
+          : `  done: ${finding.toolCalls} tool call(s), confidence ${finding.confidence} (${Date.now() - started}ms${tokensLog(finding.usage)})`,
       );
       findings.push(finding);
     }
@@ -136,6 +145,8 @@ export function buildGraph(deps: GraphDeps) {
         issues: state.issues,
         ollama: state.ollama,
         findings: state.findings,
+        triageUsage: state.triageUsage,
+        numCtx: deps.config.numCtx,
         llmSkipped: state.llmSkipped,
       }),
     };
