@@ -34,9 +34,7 @@ export class ReadOnlyViolationError extends Error {
 }
 
 export function isReadOnlyOperation(name: string): boolean {
-  return ALLOWED_PREFIXES.some(
-    (prefix) => name.startsWith(prefix) && /^[A-Z]/.test(name.slice(prefix.length)),
-  );
+  return ALLOWED_PREFIXES.some((prefix) => name.startsWith(prefix) && /^[A-Z]/.test(name.slice(prefix.length)));
 }
 
 export function readOnly<T extends object>(api: T, apiName: string): ReadOnlyApi<T> {

@@ -1,13 +1,13 @@
 import type { CoreV1Event, V1Pod } from "@kubernetes/client-node";
 import type { K8sClients } from "../k8s/client.js";
-import { k8sErrorMessage } from "../k8s/errors.js";
+import { isNotFound, k8sErrorMessage } from "../k8s/errors.js";
 import {
   ETCD_DEFAULT_QUOTA_BYTES,
   etcdQuotaFromArgs,
   etcdStorageFromMetrics,
   parseHealthChecks,
-} from "./cluster.js";
-import { eventLastSeen, podRequests, summarizeService } from "./summarize.js";
+} from "./apiserver-parse.js";
+import { eventLastSeen, formatLabels, isEndpointReady, podRequests, summarizeService } from "./summarize.js";
 import type { ControlPlanePod, ControlPlaneSummary, DnsSummary, NodeSummary, WebhookSummary } from "./types.js";
 
 /** Why a raw endpoint could not be read, phrased for the report. */
@@ -45,7 +45,9 @@ export function summarizeControlPlanePods(
         return e.involvedObject.name === name && seen !== undefined && Date.parse(seen) >= cutoff;
       });
       const latest = [...recent].sort((a, b) => (eventLastSeen(b) ?? "").localeCompare(eventLastSeen(a) ?? ""))[0];
-      const kinds = [...new Set(recent.map((e) => /^(\w+) probe failed/.exec(e.message ?? "")?.[1]).filter((k): k is string => !!k))];
+      const kinds = [
+        ...new Set(recent.map((e) => /^(\w+) probe failed/.exec(e.message ?? "")?.[1]).filter((k): k is string => !!k)),
+      ];
 
       return {
         name,
@@ -56,7 +58,11 @@ export function summarizeControlPlanePods(
         stateReason: current?.waiting?.reason ?? current?.terminated?.reason,
         restarts: statuses.reduce((sum, c) => sum + (c.restartCount ?? 0), 0),
         lastRestart: restarted
-          ? { finishedAt: new Date(restarted.finishedAt!).toISOString(), reason: restarted.reason, exitCode: restarted.exitCode }
+          ? {
+              finishedAt: new Date(restarted.finishedAt!).toISOString(),
+              reason: restarted.reason,
+              exitCode: restarted.exitCode,
+            }
           : undefined,
         probeFailures: latest
           ? {
@@ -78,7 +84,7 @@ export function summarizeControlPlanePods(
  */
 export async function collectControlPlane(
   k8s: K8sClients,
-  windowMinutes = 60,
+  windowMinutes: number,
   now: Date = new Date(),
 ): Promise<ControlPlaneSummary> {
   const notVisible: string[] = [];
@@ -116,7 +122,9 @@ export async function collectControlPlane(
     }
     summary.certificate = version.value.peerCertificate;
   } else {
-    notVisible.push(`API server version: ${version.status === "fulfilled" ? rawProblem(version.value.status) : k8sErrorMessage(version.reason)}`);
+    notVisible.push(
+      `API server version: ${version.status === "fulfilled" ? rawProblem(version.value.status) : k8sErrorMessage(version.reason)}`,
+    );
   }
   if (!summary.certificate && version.status === "fulfilled") {
     notVisible.push("API server certificate: not available (plain HTTP or a proxy in between)");
@@ -128,7 +136,9 @@ export async function collectControlPlane(
     if (checks.length > 0) summary.readyz = checks;
     else notVisible.push("API server health checks: unexpected /readyz output");
   } else {
-    notVisible.push(`API server health checks: ${readyz.status === "fulfilled" ? rawProblem(readyz.value.status) : k8sErrorMessage(readyz.reason)}`);
+    notVisible.push(
+      `API server health checks: ${readyz.status === "fulfilled" ? rawProblem(readyz.value.status) : k8sErrorMessage(readyz.reason)}`,
+    );
   }
 
   if (metrics.status === "fulfilled" && metrics.value.status === 200) {
@@ -150,7 +160,9 @@ export async function collectControlPlane(
       notVisible.push("etcd size: not exposed by this API server (managed control plane?)");
     }
   } else {
-    notVisible.push(`etcd size and object counts: /metrics ${metrics.status === "fulfilled" ? rawProblem(metrics.value.status) : k8sErrorMessage(metrics.reason)}`);
+    notVisible.push(
+      `etcd size and object counts: /metrics ${metrics.status === "fulfilled" ? rawProblem(metrics.value.status) : k8sErrorMessage(metrics.reason)}`,
+    );
   }
   return summary;
 }
@@ -198,8 +210,12 @@ export async function collectWebhooks(k8s: K8sClients): Promise<WebhookSummary[]
     k8s.admission.listMutatingWebhookConfiguration(),
   ]);
   const entries = [
-    ...validating.items.flatMap((c) => (c.webhooks ?? []).map((w) => ({ kind: "Validating" as const, config: c.metadata?.name ?? "?", w }))),
-    ...mutating.items.flatMap((c) => (c.webhooks ?? []).map((w) => ({ kind: "Mutating" as const, config: c.metadata?.name ?? "?", w }))),
+    ...validating.items.flatMap((c) =>
+      (c.webhooks ?? []).map((w) => ({ kind: "Validating" as const, config: c.metadata?.name ?? "?", w })),
+    ),
+    ...mutating.items.flatMap((c) =>
+      (c.webhooks ?? []).map((w) => ({ kind: "Mutating" as const, config: c.metadata?.name ?? "?", w })),
+    ),
   ];
 
   // Several webhooks often share one Service; check each Service once.
@@ -213,7 +229,7 @@ export async function collectWebhooks(k8s: K8sClients): Promise<WebhookSummary[]
           try {
             await k8s.core.readNamespacedService({ namespace, name });
           } catch (err) {
-            if ((err as { code?: number }).code === 404) {
+            if (isNotFound(err)) {
               return { status: "service-missing" as const, detail: `Service ${key} does not exist` };
             }
             return { status: "unknown" as const, detail: `Service ${key}: ${k8sErrorMessage(err)}` };
@@ -223,8 +239,7 @@ export async function collectWebhooks(k8s: K8sClients): Promise<WebhookSummary[]
               namespace,
               labelSelector: `kubernetes.io/service-name=${name}`,
             });
-            // An endpoint without a "ready" condition counts as ready (API convention).
-            const ready = slices.items.flatMap((s) => s.endpoints ?? []).filter((e) => e.conditions?.ready !== false);
+            const ready = slices.items.flatMap((s) => s.endpoints ?? []).filter(isEndpointReady);
             return ready.length > 0
               ? { status: "ok" as const, detail: `${ready.length} ready endpoint(s)` }
               : { status: "no-ready-endpoints" as const, detail: `Service ${key} has no ready endpoints` };
@@ -242,7 +257,11 @@ export async function collectWebhooks(k8s: K8sClients): Promise<WebhookSummary[]
       const svc = w.clientConfig.service;
       const base = { kind, configName: config, name: w.name, failurePolicy: w.failurePolicy ?? "Fail" };
       if (!svc) return { ...base, status: "external" as const, detail: "URL-based webhook; reachability not checked" };
-      return { ...base, service: { namespace: svc.namespace, name: svc.name }, ...(await checkService(svc.namespace, svc.name)) };
+      return {
+        ...base,
+        service: { namespace: svc.namespace, name: svc.name },
+        ...(await checkService(svc.namespace, svc.name)),
+      };
     }),
   );
 }
@@ -256,7 +275,7 @@ export async function collectDns(k8s: K8sClients): Promise<DnsSummary> {
   const name = "kube-dns";
   try {
     const svc = await k8s.core.readNamespacedService({ namespace, name });
-    const selector = Object.entries(svc.spec?.selector ?? {}).map(([k, v]) => `${k}=${v}`).join(",");
+    const selector = formatLabels(svc.spec?.selector ?? {});
     const [slices, pods] = await Promise.all([
       k8s.discovery.listNamespacedEndpointSlice({ namespace, labelSelector: `kubernetes.io/service-name=${name}` }),
       selector ? k8s.core.listNamespacedPod({ namespace, labelSelector: selector }) : Promise.resolve({ items: [] }),
@@ -264,7 +283,7 @@ export async function collectDns(k8s: K8sClients): Promise<DnsSummary> {
     const service = summarizeService(svc, slices.items, pods.items);
     return service ? { service } : { notVisible: `Service ${namespace}/${name} has no selector` };
   } catch (err) {
-    if ((err as { code?: number }).code === 404) return { notVisible: `no Service ${namespace}/${name}` };
+    if (isNotFound(err)) return { notVisible: `no Service ${namespace}/${name}` };
     return { notVisible: k8sErrorMessage(err) };
   }
 }

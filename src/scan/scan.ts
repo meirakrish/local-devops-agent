@@ -2,6 +2,7 @@ import type { K8sClients } from "../k8s/client.js";
 import { k8sErrorMessage } from "../k8s/errors.js";
 import { addNodeUsage, collectControlPlane, collectDns, collectWebhooks } from "./collect-cluster.js";
 import {
+  byNewest,
   summarizeDaemonSet,
   summarizeDeployment,
   summarizeEvent,
@@ -20,16 +21,11 @@ export interface ScanOptions {
 }
 
 /** Keeps warning events inside the time window, newest first. */
-export function recentEvents(
-  events: EventSummary[],
-  now: Date,
-  windowMinutes: number,
-  max: number,
-): EventSummary[] {
+export function recentEvents(events: EventSummary[], now: Date, windowMinutes: number, max: number): EventSummary[] {
   const cutoff = now.getTime() - windowMinutes * 60_000;
   return events
     .filter((e) => !e.lastSeen || new Date(e.lastSeen).getTime() >= cutoff)
-    .sort((a, b) => (b.lastSeen ?? "").localeCompare(a.lastSeen ?? ""))
+    .sort(byNewest)
     .slice(0, max);
 }
 
@@ -79,9 +75,7 @@ export async function scanCluster(k8s: K8sClients, opts: ScanOptions): Promise<C
     k8s.core.listNode(),
     ns ? Promise.resolve({ items: [{ metadata: { name: ns } }] }) : k8s.core.listNamespace(),
     ns ? k8s.core.listNamespacedPod({ namespace: ns }) : k8s.core.listPodForAllNamespaces(),
-    ns
-      ? k8s.apps.listNamespacedDeployment({ namespace: ns })
-      : k8s.apps.listDeploymentForAllNamespaces(),
+    ns ? k8s.apps.listNamespacedDeployment({ namespace: ns }) : k8s.apps.listDeploymentForAllNamespaces(),
     ns
       ? k8s.core.listNamespacedEvent({ namespace: ns, ...warningOnly })
       : k8s.core.listEventForAllNamespaces(warningOnly),

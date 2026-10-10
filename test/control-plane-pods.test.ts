@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { renderMarkdownReport } from "../src/report/markdown.js";
 import { summarizeControlPlanePods } from "../src/scan/collect-cluster.js";
 import { controlPlanePodIssues } from "../src/scan/cluster-rules.js";
-import { detectIssues } from "../src/scan/rules.js";
+import { detectIssues } from "../src/scan/detect.js";
 import { summarizePod } from "../src/scan/summarize.js";
 import type { ClusterOverview, ControlPlanePod } from "../src/scan/types.js";
 
@@ -102,7 +102,11 @@ describe("controlPlanePodIssues", () => {
   });
 
   it("ignores restarts older than the window", () => {
-    const old = { ...base, restarts: 5, lastRestart: { finishedAt: ago(600).toISOString(), reason: "Error", exitCode: 1 } };
+    const old = {
+      ...base,
+      restarts: 5,
+      lastRestart: { finishedAt: ago(600).toISOString(), reason: "Error", exitCode: 1 },
+    };
     expect(controlPlanePodIssues([old], NOW, 60)).toEqual([]);
   });
 
@@ -111,7 +115,12 @@ describe("controlPlanePodIssues", () => {
       ...base,
       component: "kube-apiserver",
       name: "kube-apiserver-cp-1",
-      probeFailures: { count, lastSeen: ago(5).toISOString(), kinds: ["Readiness"], lastMessage: "Readiness probe failed: HTTP probe failed with statuscode: 500" },
+      probeFailures: {
+        count,
+        lastSeen: ago(5).toISOString(),
+        kinds: ["Readiness"],
+        lastMessage: "Readiness probe failed: HTTP probe failed with statuscode: 500",
+      },
     });
     expect(controlPlanePodIssues([probes(1)], NOW, 60)).toEqual([]);
     const [issue] = controlPlanePodIssues([probes(48)], NOW, 60);
@@ -159,15 +168,18 @@ describe("control-plane pods in detectIssues and the report", () => {
   };
 
   it("reports a crashing control-plane pod once, from the control-plane rule", () => {
-    const issues = detectIssues(overview, { restartThreshold: 5, now: NOW });
+    const issues = detectIssues(overview, { restartThreshold: 5, now: NOW, windowMinutes: 60 });
     expect(issues.map((i) => i.category)).toEqual(["controlplane-pod-down"]);
     expect(issues[0]?.evidence[0]).toContain("CrashLoopBackOff");
   });
 
   it("shows a summary row, or 'not visible' on managed clusters", () => {
-    const issues = detectIssues(overview, { restartThreshold: 5, now: NOW });
+    const issues = detectIssues(overview, { restartThreshold: 5, now: NOW, windowMinutes: 60 });
     expect(renderMarkdownReport({ overview, issues })).toContain("| Control-plane pods | 0/1 ready |");
-    const managed = { ...overview, controlPlane: { notVisible: ["control-plane pods: none found in kube-system (managed control plane?)"] } };
+    const managed = {
+      ...overview,
+      controlPlane: { notVisible: ["control-plane pods: none found in kube-system (managed control plane?)"] },
+    };
     expect(renderMarkdownReport({ overview: managed, issues: [] })).toContain("| Control-plane pods | not visible |");
   });
 });

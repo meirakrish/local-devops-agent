@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 import { createK8sClients } from "../../src/k8s/client.js";
-import { detectIssues } from "../../src/scan/rules.js";
+import { detectIssues } from "../../src/scan/detect.js";
 import { scanCluster } from "../../src/scan/scan.js";
 import type { ClusterOverview, Issue } from "../../src/scan/types.js";
 
@@ -32,7 +32,7 @@ beforeAll(async () => {
     eventWindowMinutes: 60,
     now,
   });
-  issues = detectIssues(overview, { restartThreshold: 5, now });
+  issues = detectIssues(overview, { restartThreshold: 5, now, windowMinutes: 60 });
 });
 
 describe("demo cluster scan", () => {
@@ -41,9 +41,14 @@ describe("demo cluster scan", () => {
     expect(overview.errors).toEqual([]);
     expect(overview.nodes).toHaveLength(2);
     expect(overview.nodes.every((n) => n.ready)).toBe(true);
-    expect(overview.deployments.map((d) => d.name).sort()).toEqual(
-      ["batch", "cache", "frontend", "metrics-agent", "payments", "web"],
-    );
+    expect(overview.deployments.map((d) => d.name).sort()).toEqual([
+      "batch",
+      "cache",
+      "frontend",
+      "metrics-agent",
+      "payments",
+      "web",
+    ]);
   });
 
   it("detects the crashloop in web", () => {
@@ -120,7 +125,12 @@ describe("demo cluster: cluster-level checks", () => {
 
   it("finds the four control-plane components and sees that they are running", () => {
     const pods = overview.controlPlane.pods ?? [];
-    expect(pods.map((p) => p.component)).toEqual(["etcd", "kube-apiserver", "kube-controller-manager", "kube-scheduler"]);
+    expect(pods.map((p) => p.component)).toEqual([
+      "etcd",
+      "kube-apiserver",
+      "kube-controller-manager",
+      "kube-scheduler",
+    ]);
     expect(pods.every((p) => p.ready)).toBe(true);
     // Restarts and probe failures depend on the cluster's recent history, so they are
     // covered by unit tests rather than asserted here.

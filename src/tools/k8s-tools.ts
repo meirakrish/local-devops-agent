@@ -1,9 +1,11 @@
-import type { V1Container, V1LabelSelector, V1Pod } from "@kubernetes/client-node";
+import type { V1Container, V1LabelSelector } from "@kubernetes/client-node";
 import { tool, type StructuredToolInterface } from "@langchain/core/tools";
 import { z } from "zod";
 import type { K8sClients } from "../k8s/client.js";
-import { k8sErrorMessage } from "../k8s/errors.js";
+import { isNotFound, k8sErrorMessage } from "../k8s/errors.js";
 import {
+  byNewest,
+  formatLabels,
   summarizeDaemonSet,
   summarizeDeployment,
   summarizeEvent,
@@ -13,8 +15,9 @@ import {
   summarizeStatefulSet,
 } from "../scan/summarize.js";
 import { addNodeUsage, collectControlPlane, collectWebhooks } from "../scan/collect-cluster.js";
-import { formatCpu, formatMemory, parseQuantity } from "../scan/quantity.js";
-import type { EventSummary, NodeSummary, PodSummary } from "../scan/types.js";
+import { formatBytes } from "../scan/quantity.js";
+import type { EventSummary, PodSummary } from "../scan/types.js";
+import { describePodText, eventLine, nodeLine, podLine } from "./format.js";
 import { truncateMiddle } from "./truncate.js";
 
 /**
@@ -31,7 +34,7 @@ type WorkloadKind = (typeof WORKLOAD_KINDS)[number];
 export interface ToolOptions {
   maxChars: number;
   /** Window for "recent" control-plane restarts and probe failures (EVENT_WINDOW_MINUTES). */
-  windowMinutes?: number;
+  windowMinutes: number;
   defaultTailLines?: number;
   maxListItems?: number;
 }
@@ -44,138 +47,19 @@ const NAME_PATTERN = /^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$/;
 const k8sName = (what: string) =>
   z
     .string()
-    .regex(NAME_PATTERN, `${what} must be a bare Kubernetes name such as "web-7db8d69f68-4f2n7", without a "namespace/" prefix`)
+    .regex(
+      NAME_PATTERN,
+      `${what} must be a bare Kubernetes name such as "web-7db8d69f68-4f2n7", without a "namespace/" prefix`,
+    )
     .describe(`Exact ${what}`);
 const namespaceField = z
   .string()
   .regex(NAME_PATTERN, 'namespace must be a bare namespace name such as "default"')
   .describe("Namespace");
 
-function podLine(p: PodSummary): string {
-  const problem = p.containers.find((c) => c.reason && c.state !== "running");
-  const parts = [
-    `${p.namespace}/${p.name}`,
-    p.phase,
-    `ready=${p.readyContainers}/${p.totalContainers}`,
-    `restarts=${p.restarts}`,
-  ];
-  if (problem?.reason) parts.push(`reason=${problem.reason}`);
-  if (p.reason) parts.push(`podReason=${p.reason}`);
-  if (p.unschedulable) parts.push("unschedulable");
-  if (p.nodeName) parts.push(`node=${p.nodeName}`);
-  return parts.join(" ");
-}
-
-function nodeLine(n: NodeSummary, now: Date): string {
-  const usage = (used: number, total: string | undefined, fmt: (v: number) => string) => {
-    const t = parseQuantity(total);
-    return t ? `${fmt(used)}/${fmt(t)} (${Math.round((used / t) * 100)}%)` : `${fmt(used)}/?`;
-  };
-  return [
-    n.name,
-    n.ready ? "Ready" : `NotReady${n.readyMessage ? ` (${n.readyMessage})` : ""}`,
-    `roles=${n.roles.join(",")}`,
-    `kubelet=${n.kubeletVersion ?? "?"}`,
-    n.heartbeat ? `heartbeat=${Math.round((now.getTime() - Date.parse(n.heartbeat)) / 1000)}s ago` : "heartbeat=unknown",
-    `pressure=${n.pressures.join(",") || "none"}`,
-    n.unschedulable ? "cordoned" : "",
-    n.requested
-      ? `requested cpu=${usage(n.requested.cpu, n.allocatable.cpu, formatCpu)} memory=${usage(n.requested.memory, n.allocatable.memory, formatMemory)} pods=${usage(n.requested.pods, n.allocatable.pods, String)}`
-      : `allocatable(cpu=${n.allocatable.cpu ?? "?"},memory=${n.allocatable.memory ?? "?"},pods=${n.allocatable.pods ?? "?"})`,
-  ]
-    .filter(Boolean)
-    .join(" ");
-}
-
-function eventLine(e: EventSummary): string {
-  const obj = `${e.involvedKind ?? "?"}/${e.involvedName ?? "?"}`;
-  return `- ${e.lastSeen ?? "?"} ${obj} ${e.reason ?? ""} (x${e.count}): ${e.message ?? ""}`.trim();
-}
-
 function isProblemPod(p: PodSummary): boolean {
   if (p.phase === "Succeeded") return false;
   return p.phase !== "Running" || p.readyContainers < p.totalContainers || p.restarts > 0;
-}
-
-function formatResources(c: V1Container): string | undefined {
-  const r = c.resources;
-  if (!r?.requests && !r?.limits) return undefined;
-  const fmt = (m?: Record<string, string>) =>
-    m ? Object.entries(m).map(([k, v]) => `${k}=${v}`).join(",") : "none";
-  return `requests(${fmt(r.requests)}) limits(${fmt(r.limits)})`;
-}
-
-/** Env var names and their source only; values may be secrets and are never shown. */
-function formatEnv(c: V1Container): string | undefined {
-  const names = (c.env ?? []).map((e) => {
-    const from = e.valueFrom?.secretKeyRef
-      ? ` (from secret ${e.valueFrom.secretKeyRef.name})`
-      : e.valueFrom?.configMapKeyRef
-        ? ` (from configmap ${e.valueFrom.configMapKeyRef.name})`
-        : "";
-    return `${e.name}${from}`;
-  });
-  for (const src of c.envFrom ?? []) {
-    if (src.secretRef) names.push(`<all keys of secret ${src.secretRef.name}>`);
-    if (src.configMapRef) names.push(`<all keys of configmap ${src.configMapRef.name}>`);
-  }
-  return names.length > 0 ? names.join(", ") : "(none)";
-}
-
-function formatProbe(name: string, c: V1Container): string | undefined {
-  const p = name === "liveness" ? c.livenessProbe : name === "readiness" ? c.readinessProbe : c.startupProbe;
-  if (!p) return undefined;
-  const how = p.httpGet
-    ? `http GET ${p.httpGet.path ?? "/"} port ${p.httpGet.port}`
-    : p.tcpSocket
-      ? `tcp port ${p.tcpSocket.port}`
-      : p.exec
-        ? `exec ${(p.exec.command ?? []).join(" ")}`
-        : "other";
-  return `${name}: ${how} (delay=${p.initialDelaySeconds ?? 0}s period=${p.periodSeconds ?? 10}s failureThreshold=${p.failureThreshold ?? 3})`;
-}
-
-export function describePodText(pod: V1Pod, events: EventSummary[]): string {
-  const s = summarizePod(pod);
-  const lines = [
-    `Pod ${s.namespace}/${s.name}`,
-    `Phase: ${s.phase}${s.reason ? ` (${s.reason})` : ""}  Node: ${s.nodeName ?? "<none>"}  Owner: ${s.owner ? `${s.owner.kind}/${s.owner.name}` : "<none>"}`,
-  ];
-  if (s.message) lines.push(`Message: ${s.message}`);
-  const conds = (pod.status?.conditions ?? []).map(
-    (c) => `${c.type}=${c.status}${c.reason ? ` (${c.reason})` : ""}${c.status === "False" && c.message ? `: ${c.message}` : ""}`,
-  );
-  if (conds.length > 0) lines.push(`Conditions: ${conds.join("; ")}`);
-  if (pod.spec?.nodeSelector) lines.push(`NodeSelector: ${JSON.stringify(pod.spec.nodeSelector)}`);
-
-  const specs = [
-    ...(pod.spec?.initContainers ?? []).map((c) => ({ c, init: true })),
-    ...(pod.spec?.containers ?? []).map((c) => ({ c, init: false })),
-  ];
-  lines.push("Containers:");
-  for (const { c, init } of specs) {
-    const st = s.containers.find((x) => x.name === c.name && x.init === init);
-    lines.push(`- ${init ? "[init] " : ""}${c.name} image=${c.image ?? "?"} ready=${st?.ready ?? false} restarts=${st?.restarts ?? 0}`);
-    if (st) {
-      lines.push(`  state: ${st.state}${st.reason ? ` ${st.reason}` : ""}${st.exitCode !== undefined ? ` exitCode=${st.exitCode}` : ""}${st.message ? `: ${st.message}` : ""}`);
-      if (st.lastTerminationReason) {
-        lines.push(`  last termination: ${st.lastTerminationReason} exitCode=${st.lastExitCode ?? "?"}`);
-      }
-    }
-    if (c.command || c.args) lines.push(`  command: ${[...(c.command ?? []), ...(c.args ?? [])].join(" ").replace(/\s+/g, " ").slice(0, 300)}`);
-    const res = formatResources(c);
-    if (res) lines.push(`  resources: ${res}`);
-    lines.push(`  env: ${formatEnv(c)}`);
-    for (const probe of ["liveness", "readiness", "startup"]) {
-      const text = formatProbe(probe, c);
-      if (text) lines.push(`  ${text}`);
-    }
-  }
-
-  lines.push("Events (newest first):");
-  if (events.length === 0) lines.push("- (none)");
-  for (const e of events) lines.push(eventLine(e));
-  return lines.join("\n");
 }
 
 /** The log text the kubelet returns when a run's logs are gone, or our own placeholders. */
@@ -189,7 +73,7 @@ async function missingNamespaceHint(k8s: K8sClients, namespace: string): Promise
     await k8s.core.readNamespace({ name: namespace });
     return undefined;
   } catch (err) {
-    if ((err as { code?: number }).code !== 404) return undefined;
+    if (!isNotFound(err)) return undefined;
     const names = (await k8s.core.listNamespace().catch(() => ({ items: [] }))).items
       .map((n) => n.metadata?.name)
       .filter(Boolean);
@@ -206,7 +90,7 @@ function safe<A extends object>(k8s: K8sClients, maxChars: number, fn: (args: A)
     try {
       return truncateMiddle(await fn(args), maxChars);
     } catch (err) {
-      if ((err as { code?: number }).code === 404) {
+      if (isNotFound(err)) {
         const target = args as { namespace?: string; name?: string; pod?: string };
         const hint = target.namespace ? await missingNamespaceHint(k8s, target.namespace) : undefined;
         if (hint) return `Error: ${hint}`;
@@ -218,6 +102,10 @@ function safe<A extends object>(k8s: K8sClients, maxChars: number, fn: (args: A)
   };
 }
 
+/**
+ * Builds the eight read-only tools the investigate loop may call. Each tool returns text,
+ * truncated to `opts.maxChars`; API errors come back as "Error: ..." text, not exceptions.
+ */
 export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredToolInterface[] {
   const maxItems = opts.maxListItems ?? 60;
   const defaultTail = opts.defaultTailLines ?? 50;
@@ -227,10 +115,7 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
       namespace,
       fieldSelector: `involvedObject.kind=Pod,involvedObject.name=${name}`,
     });
-    return list.items
-      .map(summarizeEvent)
-      .sort((a, b) => (b.lastSeen ?? "").localeCompare(a.lastSeen ?? ""))
-      .slice(0, 15);
+    return list.items.map(summarizeEvent).sort(byNewest).slice(0, 15);
   }
 
   const listNodes = tool(
@@ -268,10 +153,7 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
       description: "List pods with phase, ready containers, restart count and waiting reason.",
       schema: z.object({
         namespace: namespaceField.optional().describe("Namespace to list; omit for all namespaces"),
-        onlyProblems: z
-          .boolean()
-          .optional()
-          .describe("If true, only pods that are not Running+Ready or have restarts"),
+        onlyProblems: z.boolean().optional().describe("If true, only pods that are not Running+Ready or have restarts"),
       }),
     },
   );
@@ -325,7 +207,9 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
             appContainers[0] ??
             summary.containers[0];
           if (summary.containers.length > 1 && target) {
-            notes.push(`(container not specified; showing "${target.name}" of ${summary.containers.map((c) => c.name).join(", ")})`);
+            notes.push(
+              `(container not specified; showing "${target.name}" of ${summary.containers.map((c) => c.name).join(", ")})`,
+            );
           }
         }
         if (!target) return "Pod has no container statuses yet (it may not be scheduled).";
@@ -359,10 +243,12 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
         // Between restarts the crashed run is the *current* one (state: terminated) and the
         // run before it may already be garbage-collected, so fall back to the current run.
         if (previous !== true || previousUnavailable) {
-          const exited =
-            target.state === "terminated" ? `, already exited with code ${target.exitCode ?? "?"}` : "";
+          const exited = target.state === "terminated" ? `, already exited with code ${target.exitCode ?? "?"}` : "";
           const why = previous === true ? " (previous run's logs are not available)" : "";
-          sections.push(`=== current run of ${target.name}${exited} (last ${lines} lines)${why} ===`, await read(false));
+          sections.push(
+            `=== current run of ${target.name}${exited} (last ${lines} lines)${why} ===`,
+            await read(false),
+          );
         }
         return sections.join("\n");
       },
@@ -375,7 +261,12 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
         namespace: namespaceField,
         pod: k8sName("pod name"),
         container: z.string().optional().describe("Container name; omit to pick the failing container"),
-        tailLines: z.number().int().positive().optional().describe(`Number of lines (default ${defaultTail}, max ${MAX_TAIL_LINES})`),
+        tailLines: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe(`Number of lines (default ${defaultTail}, max ${MAX_TAIL_LINES})`),
         previous: z
           .boolean()
           .optional()
@@ -388,7 +279,15 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
     safe(
       k8s,
       opts.maxChars,
-      async ({ namespace, objectName, objectKind }: { namespace?: string; objectName?: string; objectKind?: string }) => {
+      async ({
+        namespace,
+        objectName,
+        objectKind,
+      }: {
+        namespace?: string;
+        objectName?: string;
+        objectKind?: string;
+      }) => {
         const selectors = ["type=Warning"];
         if (objectName) selectors.push(`involvedObject.name=${objectName}`);
         if (objectKind) selectors.push(`involvedObject.kind=${objectKind}`);
@@ -396,10 +295,7 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
         const list = namespace
           ? await k8s.core.listNamespacedEvent({ namespace, fieldSelector })
           : await k8s.core.listEventForAllNamespaces({ fieldSelector });
-        const events = list.items
-          .map(summarizeEvent)
-          .sort((a, b) => (b.lastSeen ?? "").localeCompare(a.lastSeen ?? ""))
-          .slice(0, maxItems);
+        const events = list.items.map(summarizeEvent).sort(byNewest).slice(0, maxItems);
         if (events.length > 0) return events.map(eventLine).join("\n");
         const hint = namespace ? await missingNamespaceHint(k8s, namespace) : undefined;
         return hint ? `Error: ${hint}` : "No warning events found.";
@@ -426,63 +322,69 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
           (e.involvedKind === kind && e.involvedName === name) ||
           (kind === "Deployment" && e.involvedKind === "ReplicaSet" && (e.involvedName ?? "").startsWith(`${name}-`)),
       )
-      .sort((a, b) => (b.lastSeen ?? "").localeCompare(a.lastSeen ?? ""))
+      .sort(byNewest)
       .slice(0, 10);
   }
 
   async function podsOf(namespace: string, selector: V1LabelSelector | undefined): Promise<string[]> {
     const matchLabels = selector?.matchLabels;
     if (!matchLabels) return [];
-    const labelSelector = Object.entries(matchLabels).map(([k, v]) => `${k}=${v}`).join(",");
+    const labelSelector = formatLabels(matchLabels);
     const pods = (await k8s.core.listNamespacedPod({ namespace, labelSelector })).items.map(summarizePod);
     return ["Pods:", ...(pods.length > 0 ? pods.map((p) => `- ${podLine(p)}`) : ["- (none)"])];
   }
 
   const getWorkload = tool(
-    safe(k8s, opts.maxChars, async ({ kind = "Deployment", namespace, name }: { kind?: WorkloadKind; namespace: string; name: string }) => {
-      const images = (containers: V1Container[] | undefined) =>
-        `Images: ${(containers ?? []).map((c) => `${c.name}=${c.image}`).join(", ")}`;
-      const lines: string[] = [];
-      let selector: V1LabelSelector | undefined;
-      if (kind === "Deployment") {
-        const d = await k8s.apps.readNamespacedDeployment({ namespace, name });
-        const s = summarizeDeployment(d);
-        selector = d.spec?.selector;
-        lines.push(
-          `Deployment ${s.namespace}/${s.name}`,
-          `Replicas: desired=${s.desired} ready=${s.ready} available=${s.available} updated=${s.updated}`,
-          `Strategy: ${d.spec?.strategy?.type ?? "RollingUpdate"}  Generation: ${d.metadata?.generation ?? "?"} observed=${d.status?.observedGeneration ?? "?"}`,
-          images(d.spec?.template.spec?.containers),
-          "Conditions:",
-          ...s.conditions.map((c) => `- ${c.type}=${c.status}${c.reason ? ` (${c.reason})` : ""}${c.message ? `: ${c.message}` : ""}`),
-        );
-      } else if (kind === "StatefulSet") {
-        const st = await k8s.apps.readNamespacedStatefulSet({ namespace, name });
-        const s = summarizeStatefulSet(st);
-        selector = st.spec?.selector;
-        lines.push(
-          `StatefulSet ${s.namespace}/${s.name}`,
-          `Replicas: desired=${s.desired} ready=${s.ready} updated=${s.updated}`,
-          `Revisions: current=${s.currentRevision ?? "?"} update=${s.updateRevision ?? "?"}  Pod management: ${st.spec?.podManagementPolicy ?? "OrderedReady"}`,
-          images(st.spec?.template.spec?.containers),
-          `Volume claim templates: ${(st.spec?.volumeClaimTemplates ?? []).map((v) => v.metadata?.name).join(", ") || "(none)"}`,
-        );
-      } else {
-        const ds = await k8s.apps.readNamespacedDaemonSet({ namespace, name });
-        const s = summarizeDaemonSet(ds);
-        selector = ds.spec?.selector;
-        lines.push(
-          `DaemonSet ${s.namespace}/${s.name}`,
-          `Pods: desired=${s.desired} current=${ds.status?.currentNumberScheduled ?? 0} ready=${s.ready} updated=${s.updated} available=${ds.status?.numberAvailable ?? 0} misscheduled=${ds.status?.numberMisscheduled ?? 0}`,
-          images(ds.spec?.template.spec?.containers),
-          `NodeSelector: ${JSON.stringify(ds.spec?.template.spec?.nodeSelector ?? {})}  Tolerations: ${(ds.spec?.template.spec?.tolerations ?? []).map((t) => t.key ?? (t.operator === "Exists" ? "<all>" : "?")).join(", ") || "(none)"}`,
-        );
-      }
-      lines.push(...(await podsOf(namespace, selector)));
-      const events = await controllerEvents(kind, namespace, name);
-      if (events.length > 0) lines.push("Controller warning events (newest first):", ...events.map(eventLine));
-      return lines.join("\n");
-    }),
+    safe(
+      k8s,
+      opts.maxChars,
+      async ({ kind = "Deployment", namespace, name }: { kind?: WorkloadKind; namespace: string; name: string }) => {
+        const images = (containers: V1Container[] | undefined) =>
+          `Images: ${(containers ?? []).map((c) => `${c.name}=${c.image}`).join(", ")}`;
+        const lines: string[] = [];
+        let selector: V1LabelSelector | undefined;
+        if (kind === "Deployment") {
+          const d = await k8s.apps.readNamespacedDeployment({ namespace, name });
+          const s = summarizeDeployment(d);
+          selector = d.spec?.selector;
+          lines.push(
+            `Deployment ${s.namespace}/${s.name}`,
+            `Replicas: desired=${s.desired} ready=${s.ready} available=${s.available} updated=${s.updated}`,
+            `Strategy: ${d.spec?.strategy?.type ?? "RollingUpdate"}  Generation: ${d.metadata?.generation ?? "?"} observed=${d.status?.observedGeneration ?? "?"}`,
+            images(d.spec?.template.spec?.containers),
+            "Conditions:",
+            ...s.conditions.map(
+              (c) => `- ${c.type}=${c.status}${c.reason ? ` (${c.reason})` : ""}${c.message ? `: ${c.message}` : ""}`,
+            ),
+          );
+        } else if (kind === "StatefulSet") {
+          const st = await k8s.apps.readNamespacedStatefulSet({ namespace, name });
+          const s = summarizeStatefulSet(st);
+          selector = st.spec?.selector;
+          lines.push(
+            `StatefulSet ${s.namespace}/${s.name}`,
+            `Replicas: desired=${s.desired} ready=${s.ready} updated=${s.updated}`,
+            `Revisions: current=${s.currentRevision ?? "?"} update=${s.updateRevision ?? "?"}  Pod management: ${st.spec?.podManagementPolicy ?? "OrderedReady"}`,
+            images(st.spec?.template.spec?.containers),
+            `Volume claim templates: ${(st.spec?.volumeClaimTemplates ?? []).map((v) => v.metadata?.name).join(", ") || "(none)"}`,
+          );
+        } else {
+          const ds = await k8s.apps.readNamespacedDaemonSet({ namespace, name });
+          const s = summarizeDaemonSet(ds);
+          selector = ds.spec?.selector;
+          lines.push(
+            `DaemonSet ${s.namespace}/${s.name}`,
+            `Pods: desired=${s.desired} current=${ds.status?.currentNumberScheduled ?? 0} ready=${s.ready} updated=${s.updated} available=${ds.status?.numberAvailable ?? 0} misscheduled=${ds.status?.numberMisscheduled ?? 0}`,
+            images(ds.spec?.template.spec?.containers),
+            `NodeSelector: ${JSON.stringify(ds.spec?.template.spec?.nodeSelector ?? {})}  Tolerations: ${(ds.spec?.template.spec?.tolerations ?? []).map((t) => t.key ?? (t.operator === "Exists" ? "<all>" : "?")).join(", ") || "(none)"}`,
+          );
+        }
+        lines.push(...(await podsOf(namespace, selector)));
+        const events = await controllerEvents(kind, namespace, name);
+        if (events.length > 0) lines.push("Controller warning events (newest first):", ...events.map(eventLine));
+        return lines.join("\n");
+      },
+    ),
     {
       name: "k8s_get_workload",
       description:
@@ -502,7 +404,9 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
         k8s.discovery.listNamespacedEndpointSlice({ namespace, labelSelector: `kubernetes.io/service-name=${name}` }),
         k8s.core.listNamespacedPod({ namespace }),
       ]);
-      const ports = (svc.spec?.ports ?? []).map((p) => `${p.name ? `${p.name}:` : ""}${p.port}->${p.targetPort ?? p.port}/${p.protocol ?? "TCP"}`);
+      const ports = (svc.spec?.ports ?? []).map(
+        (p) => `${p.name ? `${p.name}:` : ""}${p.port}->${p.targetPort ?? p.port}/${p.protocol ?? "TCP"}`,
+      );
       const lines = [
         `Service ${namespace}/${name} type=${svc.spec?.type ?? "ClusterIP"} clusterIP=${svc.spec?.clusterIP ?? "?"}`,
         `Ports: ${ports.join(", ") || "(none)"}`,
@@ -510,15 +414,22 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
       const endpoints = slices.items.flatMap((s) => s.endpoints ?? []);
       const endpointLines = endpoints
         .slice(0, 20)
-        .map((e) => `- ${e.targetRef?.name ?? e.addresses.join(",")} ${e.conditions?.ready === false ? "NOT READY" : "ready"}`);
+        .map(
+          (e) =>
+            `- ${e.targetRef?.name ?? e.addresses.join(",")} ${e.conditions?.ready === false ? "NOT READY" : "ready"}`,
+        );
 
       const s = summarizeService(svc, slices.items, pods.items);
       if (!s) {
-        lines.push("No selector: endpoints are managed manually (or this is an ExternalName Service).", `Endpoints: ${endpoints.length}`, ...endpointLines);
+        lines.push(
+          "No selector: endpoints are managed manually (or this is an ExternalName Service).",
+          `Endpoints: ${endpoints.length}`,
+          ...endpointLines,
+        );
         return lines.join("\n");
       }
       lines.push(
-        `Selector: ${Object.entries(s.selector).map(([k, v]) => `${k}=${v}`).join(",")}`,
+        `Selector: ${formatLabels(s.selector)}`,
         `Endpoints: ${s.readyEndpoints} ready, ${s.notReadyEndpoints} not ready`,
         ...endpointLines,
       );
@@ -526,7 +437,9 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
       if (matching.length === 0) {
         lines.push(
           "Pods matching the selector: (none)",
-          `Label values on running pods in ${namespace}: ${Object.entries(s.podLabelValues).map(([k, vs]) => `${k}: ${vs.join(", ") || "(no pod has this label)"}`).join("; ")}`,
+          `Label values on running pods in ${namespace}: ${Object.entries(s.podLabelValues)
+            .map(([k, vs]) => `${k}: ${vs.join(", ") || "(no pod has this label)"}`)
+            .join("; ")}`,
         );
         return lines.join("\n");
       }
@@ -534,7 +447,9 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
       // A targetPort the pods do not declare is a common cause of refused connections.
       const declared = matching[0]!.spec?.containers.flatMap((c) => c.ports ?? []) ?? [];
       if (declared.length > 0) {
-        lines.push(`Container ports (first pod): ${declared.map((p) => `${p.containerPort}${p.name ? `(${p.name})` : ""}`).join(", ")}`);
+        lines.push(
+          `Container ports (first pod): ${declared.map((p) => `${p.containerPort}${p.name ? `(${p.name})` : ""}`).join(", ")}`,
+        );
         for (const p of svc.spec?.ports ?? []) {
           const target = p.targetPort ?? p.port;
           const found = declared.some((d) => d.containerPort === target || d.name === target);
@@ -559,7 +474,7 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
       const want = (s: HealthSection) => section === "all" || section === s;
       const problems: string[] = [];
       const [cp, webhooks] = await Promise.all([
-        collectControlPlane(k8s, opts.windowMinutes ?? 60),
+        collectControlPlane(k8s, opts.windowMinutes),
         want("webhooks")
           ? collectWebhooks(k8s).catch((err: unknown) => {
               problems.push(`admission webhooks: ${k8sErrorMessage(err)}`);
@@ -571,7 +486,8 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
       const lines: string[] = [];
       if (want("control-plane")) {
         lines.push(`API server version: ${cp.serverVersion ?? "unknown"}`);
-        if (cp.certificate) lines.push(`API server certificate: ${cp.certificate.subject}, valid until ${cp.certificate.notAfter}`);
+        if (cp.certificate)
+          lines.push(`API server certificate: ${cp.certificate.subject}, valid until ${cp.certificate.notAfter}`);
         if (cp.readyz) {
           const failing = cp.readyz.filter((c) => !c.ok);
           lines.push(
@@ -580,14 +496,22 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
           );
         }
         if (cp.pods) {
-          lines.push(`Control-plane pods (restarts and probe failures within the last ${opts.windowMinutes ?? 60} min):`);
+          lines.push(`Control-plane pods (restarts and probe failures within the last ${opts.windowMinutes} min):`);
           for (const p of cp.pods) {
-            const parts = [`- ${p.component} (${p.name})`, p.ready ? "ready" : `NOT READY${p.stateReason ? ` (${p.stateReason})` : ""}`, `restarts=${p.restarts}`];
+            const parts = [
+              `- ${p.component} (${p.name})`,
+              p.ready ? "ready" : `NOT READY${p.stateReason ? ` (${p.stateReason})` : ""}`,
+              `restarts=${p.restarts}`,
+            ];
             if (p.lastRestart) {
-              parts.push(`last restart ${p.lastRestart.finishedAt}${p.lastRestart.reason ? ` ${p.lastRestart.reason}` : ""}${p.lastRestart.exitCode !== undefined ? ` exit ${p.lastRestart.exitCode}` : ""}`);
+              parts.push(
+                `last restart ${p.lastRestart.finishedAt}${p.lastRestart.reason ? ` ${p.lastRestart.reason}` : ""}${p.lastRestart.exitCode !== undefined ? ` exit ${p.lastRestart.exitCode}` : ""}`,
+              );
             }
             if (p.probeFailures) {
-              parts.push(`probe failures (up to)=${p.probeFailures.count} last ${p.probeFailures.lastSeen}: ${p.probeFailures.lastMessage}`);
+              parts.push(
+                `probe failures (up to)=${p.probeFailures.count} last ${p.probeFailures.lastSeen}: ${p.probeFailures.lastMessage}`,
+              );
             }
             lines.push(parts.join(" "));
           }
@@ -595,19 +519,29 @@ export function createK8sTools(k8s: K8sClients, opts: ToolOptions): StructuredTo
       }
       if (want("etcd")) {
         const etcdCheck = cp.readyz?.find((c) => c.name === "etcd");
-        if (etcdCheck) lines.push(`etcd health check (/readyz): ${etcdCheck.ok ? "ok" : `FAILING${etcdCheck.reason ? `: ${etcdCheck.reason}` : ""}`}`);
+        if (etcdCheck)
+          lines.push(
+            `etcd health check (/readyz): ${etcdCheck.ok ? "ok" : `FAILING${etcdCheck.reason ? `: ${etcdCheck.reason}` : ""}`}`,
+          );
         if (cp.etcd) {
           const size = cp.etcd.dbSizeBytes;
           lines.push(
-            `etcd database: ${size !== undefined ? `${formatMemory(size)} of ${formatMemory(cp.etcd.quotaBytes)} quota (${Math.round((size / cp.etcd.quotaBytes) * 100)}%)` : "size not exposed"}${cp.etcd.quotaSource === "default" ? ", default quota assumed" : ""}`,
-            `etcd largest object counts: ${cp.etcd.objectCounts.slice(0, 8).map((o) => `${o.resource}=${o.count}`).join(", ") || "unknown"}`,
+            `etcd database: ${size !== undefined ? `${formatBytes(size)} of ${formatBytes(cp.etcd.quotaBytes)} quota (${Math.round((size / cp.etcd.quotaBytes) * 100)}%)` : "size not exposed"}${cp.etcd.quotaSource === "default" ? ", default quota assumed" : ""}`,
+            `etcd largest object counts: ${
+              cp.etcd.objectCounts
+                .slice(0, 8)
+                .map((o) => `${o.resource}=${o.count}`)
+                .join(", ") || "unknown"
+            }`,
           );
         }
       }
       if (want("webhooks")) {
         lines.push(`Admission webhooks: ${webhooks.length}`);
         for (const w of webhooks) {
-          lines.push(`- ${w.kind} ${w.configName}/${w.name} failurePolicy=${w.failurePolicy} status=${w.status}${w.detail ? ` (${w.detail})` : ""}`);
+          lines.push(
+            `- ${w.kind} ${w.configName}/${w.name} failurePolicy=${w.failurePolicy} status=${w.status}${w.detail ? ` (${w.detail})` : ""}`,
+          );
         }
       }
       for (const n of [...cp.notVisible, ...problems]) lines.push(`Not visible: ${n}`);

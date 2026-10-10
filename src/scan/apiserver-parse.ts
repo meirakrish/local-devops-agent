@@ -69,7 +69,11 @@ export interface EtcdStorage {
 
 // The object-count metric was renamed in recent Kubernetes versions; accept both.
 const OBJECT_COUNT_METRICS = ["apiserver_resource_objects", "apiserver_storage_objects"];
-const DB_SIZE_METRICS = ["apiserver_storage_size_bytes", "apiserver_storage_db_total_size_in_bytes", "etcd_db_total_size_in_bytes"];
+const DB_SIZE_METRICS = [
+  "apiserver_storage_size_bytes",
+  "apiserver_storage_db_total_size_in_bytes",
+  "etcd_db_total_size_in_bytes",
+];
 
 export function etcdStorageFromMetrics(body: string): EtcdStorage {
   const samples = parseMetrics(body, [...DB_SIZE_METRICS, ...OBJECT_COUNT_METRICS]);

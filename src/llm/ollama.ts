@@ -16,11 +16,7 @@ function normalizeModelName(name: string): string {
  * Checks that the Ollama server answers and that the configured model is pulled.
  * Uses GET /api/tags, which is cheap and does not load the model into memory.
  */
-export async function checkOllama(
-  url: string,
-  model: string,
-  timeoutMs = 3000,
-): Promise<OllamaStatus> {
+export async function checkOllama(url: string, model: string, timeoutMs = 3000): Promise<OllamaStatus> {
   const base: OllamaStatus = { url, model, reachable: false, modelAvailable: false, installedModels: [] };
   try {
     const res = await fetch(`${url}/api/tags`, { signal: AbortSignal.timeout(timeoutMs) });

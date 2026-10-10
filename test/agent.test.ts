@@ -19,10 +19,20 @@ function issue(id: string, kind: string, name: string, severity: Issue["severity
   };
 }
 
-const webPod1 = issue("pod/shop/web-7db8d69f68-4f2n7:crashloop", "Pod", "web-7db8d69f68-4f2n7");
-const webPod2 = issue("pod/shop/web-7db8d69f68-q5rls:crashloop", "Pod", "web-7db8d69f68-q5rls");
-const webDeploy = issue("deployment/shop/web:unavailable", "Deployment", "web");
-const payPod = issue("pod/shop/payments-9877b44c9-hql6z:image-pull", "Pod", "payments-9877b44c9-hql6z");
+// Like the rules, pod and Deployment issues record their workload, which triage groups by.
+const webPod1 = {
+  ...issue("pod/shop/web-7db8d69f68-4f2n7:crashloop", "Pod", "web-7db8d69f68-4f2n7"),
+  workload: "shop/web",
+};
+const webPod2 = {
+  ...issue("pod/shop/web-7db8d69f68-q5rls:crashloop", "Pod", "web-7db8d69f68-q5rls"),
+  workload: "shop/web",
+};
+const webDeploy = { ...issue("deployment/shop/web:unavailable", "Deployment", "web"), workload: "shop/web" };
+const payPod = {
+  ...issue("pod/shop/payments-9877b44c9-hql6z:image-pull", "Pod", "payments-9877b44c9-hql6z"),
+  workload: "shop/payments",
+};
 const cordoned = issue("node/n1:cordoned", "Node", "n1", "info");
 const ALL = [webDeploy, webPod1, webPod2, payPod, cordoned];
 
@@ -145,7 +155,12 @@ describe("triage", () => {
     expect(problems[1]?.reason).toBe("added: critical issue not chosen by the LLM");
     expect(problems[1]?.related.map((i) => i.id).sort()).toEqual([webDeploy.id, webPod2.id].sort());
 
-    const full = await triage(fakeLlm([], { problems: [{ issueId: payPod.id, relatedIssueIds: [], reason: "" }] }).llm, overview, ALL, 1);
+    const full = await triage(
+      fakeLlm([], { problems: [{ issueId: payPod.id, relatedIssueIds: [], reason: "" }] }).llm,
+      overview,
+      ALL,
+      1,
+    );
     expect(full.map((p) => p.primary.id)).toEqual([payPod.id]);
   });
 
@@ -219,7 +234,10 @@ describe("investigate loop", () => {
     ]);
     const finding = await investigate(problem, { llm, tools: [getLogs], maxSteps: 10 });
     expect(calls).toHaveLength(1); // the repeat was not executed
-    const toolReplies = seen.at(-1)!.filter((m) => m instanceof ToolMessage).map((m) => String(m.content));
+    const toolReplies = seen
+      .at(-1)!
+      .filter((m) => m instanceof ToolMessage)
+      .map((m) => String(m.content));
     expect(toolReplies[0]).toContain('unknown tool "k8s_delete_pod"');
     expect(toolReplies[2]).toContain("already made this exact call");
     expect(finding.toolCalls).toBe(3);
@@ -232,7 +250,11 @@ describe("investigate loop", () => {
         calls.push(args);
         return "ok";
       },
-      { name: "k8s_get_logs", description: "logs", schema: z.object({ pod: z.string(), container: z.string().optional() }) },
+      {
+        name: "k8s_get_logs",
+        description: "logs",
+        schema: z.object({ pod: z.string(), container: z.string().optional() }),
+      },
     );
     const { llm } = fakeLlm([call("k8s_get_logs", { pod: "a", container: null }, "c1"), new AIMessage("done")]);
     await investigate(problem, { llm, tools: [optional], maxSteps: 5 });
@@ -261,10 +283,18 @@ describe("investigate loop", () => {
 
   it("points cluster-level problems at the relevant k8s_cluster_health section", () => {
     const prompt = (i: Issue) => problemPrompt({ primary: i, related: [], reason: "", severity: i.severity }, 6);
-    expect(prompt({ ...webDeploy, resource: { kind: "ValidatingWebhookConfiguration", name: "policy" } })).toContain('section="webhooks"');
+    expect(prompt({ ...webDeploy, resource: { kind: "ValidatingWebhookConfiguration", name: "policy" } })).toContain(
+      'section="webhooks"',
+    );
     expect(prompt({ ...webDeploy, resource: { kind: "ControlPlane", name: "etcd" } })).toContain('section="etcd"');
-    expect(prompt({ ...webDeploy, resource: { kind: "ControlPlane", name: "kube-apiserver" } })).toContain('section="control-plane"');
-    const cpPod = { ...webPod1, category: "controlplane-restart", resource: { kind: "Pod", namespace: "kube-system", name: "kube-scheduler-cp" } };
+    expect(prompt({ ...webDeploy, resource: { kind: "ControlPlane", name: "kube-apiserver" } })).toContain(
+      'section="control-plane"',
+    );
+    const cpPod = {
+      ...webPod1,
+      category: "controlplane-restart",
+      resource: { kind: "Pod", namespace: "kube-system", name: "kube-scheduler-cp" },
+    };
     expect(prompt(cpPod)).toContain('pod="kube-scheduler-cp"');
     expect(prompt(cpPod)).toContain('section="control-plane"');
   });
@@ -282,7 +312,11 @@ describe("investigate loop", () => {
         described.push(args);
         return "state: waiting CrashLoopBackOff";
       },
-      { name: "k8s_describe_pod", description: "describe", schema: z.object({ namespace: z.string(), name: z.string() }) },
+      {
+        name: "k8s_describe_pod",
+        description: "describe",
+        schema: z.object({ namespace: z.string(), name: z.string() }),
+      },
     );
     const { llm, seen } = fakeLlm([
       call("k8s_describe_pod", { namespace: "shop", name: "web-7db8d69f68-4f2n7" }, "c1"), // repeat of the seed
@@ -295,14 +329,24 @@ describe("investigate loop", () => {
   });
 
   it("chooses seed calls by resource kind", () => {
-    expect(seedCall(webPod1)).toEqual({ name: "k8s_describe_pod", args: { namespace: "shop", name: "web-7db8d69f68-4f2n7" } });
+    expect(seedCall(webPod1)).toEqual({
+      name: "k8s_describe_pod",
+      args: { namespace: "shop", name: "web-7db8d69f68-4f2n7" },
+    });
     expect(seedCall({ ...webDeploy, resource: { kind: "ValidatingWebhookConfiguration", name: "p" } })).toEqual({
       name: "k8s_cluster_health",
       args: { section: "webhooks" },
     });
-    expect(seedCall({ ...webDeploy, resource: { kind: "ControlPlane", name: "etcd" } })?.args).toEqual({ section: "etcd" });
-    expect(seedCall(webDeploy)).toEqual({ name: "k8s_get_workload", args: { kind: "Deployment", namespace: "shop", name: "web" } });
-    expect(seedCall({ ...webDeploy, resource: { kind: "DaemonSet", namespace: "kube-system", name: "kube-proxy" } })).toEqual({
+    expect(seedCall({ ...webDeploy, resource: { kind: "ControlPlane", name: "etcd" } })?.args).toEqual({
+      section: "etcd",
+    });
+    expect(seedCall(webDeploy)).toEqual({
+      name: "k8s_get_workload",
+      args: { kind: "Deployment", namespace: "shop", name: "web" },
+    });
+    expect(
+      seedCall({ ...webDeploy, resource: { kind: "DaemonSet", namespace: "kube-system", name: "kube-proxy" } }),
+    ).toEqual({
       name: "k8s_get_workload",
       args: { kind: "DaemonSet", namespace: "kube-system", name: "kube-proxy" },
     });
@@ -313,10 +357,24 @@ describe("investigate loop", () => {
   });
 
   it("seeds a ReplicaSet's FailedCreate with its Deployment, and a Job's with its events", () => {
-    const rs = { ...issue("replicaset/shop/web-7db8d69f68:create-failed", "ReplicaSet", "web-7db8d69f68"), category: "pod-create-failed", workload: "shop/web" };
-    expect(seedCall(rs)).toEqual({ name: "k8s_get_workload", args: { kind: "Deployment", namespace: "shop", name: "web" } });
-    const job = { ...issue("job/shop/backup:create-failed", "Job", "backup"), category: "pod-create-failed", workload: "shop/backup" };
-    expect(seedCall(job)).toEqual({ name: "k8s_list_events", args: { namespace: "shop", objectName: "backup", objectKind: "Job" } });
+    const rs = {
+      ...issue("replicaset/shop/web-7db8d69f68:create-failed", "ReplicaSet", "web-7db8d69f68"),
+      category: "pod-create-failed",
+      workload: "shop/web",
+    };
+    expect(seedCall(rs)).toEqual({
+      name: "k8s_get_workload",
+      args: { kind: "Deployment", namespace: "shop", name: "web" },
+    });
+    const job = {
+      ...issue("job/shop/backup:create-failed", "Job", "backup"),
+      category: "pod-create-failed",
+      workload: "shop/backup",
+    };
+    expect(seedCall(job)).toEqual({
+      name: "k8s_list_events",
+      args: { namespace: "shop", objectName: "backup", objectKind: "Job" },
+    });
   });
 
   it("reports a failed investigation instead of throwing", async () => {
@@ -331,7 +389,11 @@ describe("triage grouping by workload", () => {
   const svc: Issue = { ...issue("service/shop/web:no-ready-endpoints", "Service", "web"), workload: "shop/web" };
   const sts = { ...issue("statefulset/shop/db:unavailable", "StatefulSet", "db"), workload: "shop/db" };
   const stsPod = { ...issue("pod/shop/db-0:crashloop", "Pod", "db-0"), workload: "shop/db" };
-  const rs = { ...issue("replicaset/shop/api-5f6d7c8b9:create-failed", "ReplicaSet", "api-5f6d7c8b9"), category: "pod-create-failed", workload: "shop/api" };
+  const rs = {
+    ...issue("replicaset/shop/api-5f6d7c8b9:create-failed", "ReplicaSet", "api-5f6d7c8b9"),
+    category: "pod-create-failed",
+    workload: "shop/api",
+  };
   const apiDeploy = { ...issue("deployment/shop/api:unavailable", "Deployment", "api"), workload: "shop/api" };
 
   it("merges a Service, its Deployment and pods into one problem led by a pod", () => {

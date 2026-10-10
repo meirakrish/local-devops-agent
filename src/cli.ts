@@ -2,6 +2,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { loadConfig } from "./config.js";
+import { errorMessage } from "./errors.js";
 import { buildGraph } from "./graph.js";
 import { createK8sClients } from "./k8s/client.js";
 import { createOllamaLlm } from "./llm/model.js";
@@ -73,7 +74,7 @@ main().then(
     process.exitCode = code;
   },
   (err: unknown) => {
-    console.error(`Health check failed: ${err instanceof Error ? err.message : String(err)}`);
+    console.error(`Health check failed: ${errorMessage(err)}`);
     process.exitCode = EXIT_ERROR;
   },
 );

@@ -1,5 +1,5 @@
 import type { PeerCertificate } from "../k8s/raw.js";
-import type { HealthCheck } from "./cluster.js";
+import type { HealthCheck } from "./apiserver-parse.js";
 
 /**
  * Compact summaries of cluster objects. Raw Kubernetes objects are large; these
@@ -223,7 +223,7 @@ export interface Issue {
   resource: { kind: string; namespace?: string; name: string };
   title: string;
   evidence: string[];
-  /** Rule-based next step; the LLM investigation (milestone 2) goes deeper. */
+  /** Rule-based next step; shown in the report and passed to the LLM investigation. */
   hint?: string;
   /**
    * "namespace/name" of the workload (Deployment, StatefulSet, DaemonSet, Job) this issue

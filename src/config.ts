@@ -16,9 +16,13 @@ const ConfigSchema = z.object({
 export interface Config {
   ollamaUrl: string;
   model: string;
+  /** Undefined uses $KUBECONFIG, then ~/.kube/config. */
   kubeconfigPath?: string;
+  /** Max tool calls per investigated problem. */
   maxStepsPerProblem: number;
+  /** Containers restarting at least this often are flagged. */
   restartThreshold: number;
+  /** How far back warning events, restarts and probe failures count as recent. */
   eventWindowMinutes: number;
   /** Max problems the LLM investigates per run. */
   maxProblems: number;
@@ -30,9 +34,7 @@ export interface Config {
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   // Empty values in .env (e.g. `KUBECONFIG=`) mean "not set", so defaults apply.
-  const nonEmpty = Object.fromEntries(
-    Object.entries(env).filter(([, v]) => v !== undefined && v.trim() !== ""),
-  );
+  const nonEmpty = Object.fromEntries(Object.entries(env).filter(([, v]) => v !== undefined && v.trim() !== ""));
   const parsed = ConfigSchema.safeParse(nonEmpty);
   if (!parsed.success) {
     throw new Error(`Invalid configuration:\n${z.prettifyError(parsed.error)}`);

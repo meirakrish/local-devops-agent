@@ -109,7 +109,7 @@ flowchart TD
 
 | Step | Uses the LLM | What it does |
 | --- | --- | --- |
-| **scan** | no | Lists nodes, namespaces, pods, deployments and recent warning events in parallel, summarizes them, and runs the rules. A failed call is recorded and the scan continues. |
+| **scan** | no | Lists nodes, pods, workloads, Services, recent warning events, webhooks and control-plane health in parallel, summarizes them, and runs the rules. A failed call is recorded and the scan continues. |
 | **checkLlm** | no | Checks that Ollama is reachable and the model is pulled. Runs in parallel with the scan. |
 | **triage** | yes | Picks up to `MAX_PROBLEMS` problems and merges issues with one root cause (for example, a Deployment and its crashing pods). |
 | **investigate** | yes | For each problem, a tool-calling loop of at most `MAX_STEPS_PER_PROBLEM` calls, then a structured conclusion. |
@@ -230,14 +230,20 @@ src/
   agent/investigate.ts  Tool-calling loop (subgraph) and structured conclusion
   k8s/client.ts         Read-only Kubernetes client
   k8s/raw.ts            GET-only reader for /readyz, /livez, /version and /metrics
-  llm/model.ts          LlmClient interface and Ollama implementation
+  k8s/errors.ts         Kubernetes API error helpers
+  llm/model.ts          LlmClient interface, Ollama implementation, token usage
   llm/ollama.ts         Ollama connection check
   tools/k8s-tools.ts    The eight read-only tools
+  tools/format.ts       Compact text for pods, nodes and events in tool output
   tools/truncate.ts     Output truncation
-  scan/                 Cluster overview, summaries, quantities and rules
-                        (rules.ts: pods, Deployments and nodes; workload-rules.ts: DaemonSets,
-                        StatefulSets, Services, cluster DNS, pod creation failures;
-                        cluster-rules.ts: control plane, etcd, webhooks)
+  scan/scan.ts          Cluster overview: lists everything in parallel
+  scan/collect-cluster.ts  Control plane, etcd, node usage, webhooks and DNS collection
+  scan/summarize.ts     Raw Kubernetes objects to compact summaries (scan/types.ts)
+  scan/apiserver-parse.ts  Parsers for /readyz, /metrics and versions
+  scan/detect.ts        Runs every rule over the overview
+  scan/*-rules.ts       The rules: pod-, node-, workload- (Deployments, StatefulSets,
+                        DaemonSets, Services, DNS, pod creation) and cluster-rules
+                        (control plane, etcd, webhooks)
   report/markdown.ts    Markdown report renderer
 test/                   Unit tests (fake cluster and scripted fake LLM; no Ollama needed)
 test/e2e/               End-to-end tests against the demo cluster
@@ -511,8 +517,9 @@ so treat reports as containing cluster data.
 - **A larger model helps.** Setting `MODEL=qwen2.5:14b-instruct` (or another
   tool-calling model) should improve the fixes, at the cost of speed and VRAM.
 - **Coverage:** the rules cover the control plane and its components, etcd, nodes,
-  admission webhooks, pods, deployments and events. StatefulSets, DaemonSets, Jobs,
-  Services, PVCs, APIServices and CoreDNS are not checked yet.
+  admission webhooks, pods, Deployments, StatefulSets, DaemonSets, Services, cluster DNS
+  and pod creation failures. Failed Jobs, PersistentVolumeClaims and aggregated
+  APIServices are not checked yet.
 - **Control-plane pods must be visible.** Restart and probe checks need the static pods in
   `kube-system` (kubeadm, kind, minikube). Managed control planes hide them, and the
   report says "not visible". Probe-failure counts come from aggregated events, so they
@@ -531,6 +538,7 @@ so treat reports as containing cluster data.
 | `pnpm test` | Unit tests (vitest; no cluster or Ollama needed) |
 | `pnpm test:e2e` | End-to-end tests against the demo cluster (`pnpm demo:up` first) |
 | `pnpm typecheck` | Type-check `src/` and `test/` |
+| `pnpm format` | Format the code with Prettier (`pnpm format:check` only reports) |
 | `pnpm build` | Compile `src/` to `dist/` |
 
 The unit tests feed the rules fake broken pods, nodes and deployments, run the tools
